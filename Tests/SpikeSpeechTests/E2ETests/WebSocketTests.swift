@@ -339,4 +339,105 @@ final class WebSocketTests: XCTestCase {
         client.disconnect()
         server.stop()
     }
+
+    /// RFC 6455 準拠の PureSHA1 ハンドシェイクダイジェスト検証
+    func testPureSHA1Compliance() {
+        // RFC 6455 Section 1.3 公式テストベクター
+        let clientKey = "dGhlIHNhbXBsZSBub25jZQ=="
+        let magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        let combined = clientKey + magicGUID
+        let digest = PureSHA1.hash(data: Data(combined.utf8))
+        let base64Accept = digest.base64EncodedString()
+
+        XCTAssertEqual(base64Accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "RFC 6455 仕様通りの Sec-WebSocket-Accept が算出されること")
+    }
+
+    /// クロスプラットフォーム時刻測定の単調増加性検証
+    func testPlatformTimeMonotonicity() {
+        let t1 = PlatformTime.uptimeNanoseconds()
+        Thread.sleep(forTimeInterval: 0.01)
+        let t2 = PlatformTime.uptimeNanoseconds()
+        XCTAssertTrue(t1 <= t2, "モノトニック時刻は時間が経過するにつれて単調増加すること")
+    }
+
+    /// POSIXWebServer の HTTP GET 静的配信検証
+    func testPOSIXWebServerHTTPGet() throws {
+        let testPort: UInt16 = 18090
+        let posixServer = POSIXWebServer(port: testPort, host: "127.0.0.1")
+        try posixServer.start()
+
+        let expectation = self.expectation(description: "POSIXWebServer HTTP GET /")
+        let url = URL(string: "http://127.0.0.1:\(testPort)/")!
+
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            XCTAssertNil(error, "POSIXWebServer HTTP GET でエラーが発生してはならない")
+            guard let httpResponse = response as? HTTPURLResponse else {
+                XCTFail("レスポンスが HTTPURLResponse ではない")
+                expectation.fulfill()
+                return
+            }
+
+            XCTAssertEqual(httpResponse.statusCode, 200, "ステータスコードは 200 OK であること")
+            guard let data = data, let bodyString = String(data: data, encoding: .utf8) else {
+                XCTFail("レスポンスボディが空")
+                expectation.fulfill()
+                return
+            }
+            XCTAssertTrue(bodyString.contains("SpikeSpeech Web"), "HTML に SpikeSpeech Web が含まれること")
+            expectation.fulfill()
+        }
+        task.resume()
+
+        wait(for: [expectation], timeout: 5.0)
+        posixServer.stop()
+    }
+
+    /// POSIXWebServer の WebSocket ストリーミング音声合成 E2E 検証
+    func testPOSIXWebServerWebSocketStreaming() throws {
+        let testPort: UInt16 = 18091
+        let posixServer = POSIXWebServer(port: testPort, host: "127.0.0.1")
+        try posixServer.start()
+
+        let client = SpikeSpeechWebClient(host: "127.0.0.1", port: testPort)
+        let expStart = self.expectation(description: "POSIX WebSocket Start")
+        let expFirstChunk = self.expectation(description: "POSIX WebSocket First Chunk")
+        let expDone = self.expectation(description: "POSIX WebSocket Done")
+
+        var receivedAudioBytes = 0
+        var gotFirstChunk = false
+
+        client.onStart = { evt in
+            XCTAssertEqual(evt.format, "pcm_f32")
+            expStart.fulfill()
+        }
+
+        client.onAudioChunk = { data in
+            receivedAudioBytes += data.count
+            if gotFirstChunk != true {
+                gotFirstChunk = true
+                expFirstChunk.fulfill()
+            }
+        }
+
+        client.onDone = { evt in
+            XCTAssertTrue(0 < evt.samples)
+            expDone.fulfill()
+        }
+
+        client.onError = { msg in
+            XCTFail("POSIXWebServer WebSocket エラー: \(msg)")
+        }
+
+        client.connect()
+        Thread.sleep(forTimeInterval: 0.2)
+
+        try client.synthesize(text: "テスト音声です。", speed: 1.0, pitch: 1.0, mode: "stream")
+
+        wait(for: [expStart, expFirstChunk, expDone], timeout: 10.0)
+
+        XCTAssertTrue(0 < receivedAudioBytes, "ストリーミング PCM 音声データを受信していること")
+
+        client.disconnect()
+        posixServer.stop()
+    }
 }

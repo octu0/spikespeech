@@ -2,7 +2,7 @@ import Foundation
 
 /// 任意サンプリングレートの WAV 音声ファイル解析および 16kHz モノラル変換器
 ///
-/// JSUT コーパスなどの外部収録音声（48kHz 16-bit PCM 等）を直接読み込み、
+/// 外部収録音声（48kHz 16-bit PCM 等）を直接読み込み、
 /// 3サンプル平均アンチエイリアシング間引きによって 16kHz モノラル PCM 列を生成する。
 public final class WavAudioReader: @unchecked Sendable {
 

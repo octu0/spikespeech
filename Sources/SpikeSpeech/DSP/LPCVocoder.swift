@@ -285,13 +285,27 @@ public final class LPCVocoder: @unchecked Sendable {
             }
 
             // 有声度・無声度のサンプル単位連続補間
+            // 前フレームが無声（破裂音等）で現フレームが有声（母音等）に遷移する境界において、
+            // 有声度を160サンプルかけて徐々に補間すると母音の立ち上がりで激しい無声乱数ノイズが注入される。
+            // したがって現フレームが有声（0.5 <= effectiveVoiced）の場合は即座に有声音励起とし、無声ノイズを完全遮断する。
             let sampleVoiced: Float
-            if prevVoicedRatio <= 0.0 && effectiveVoiced <= 0.0 {
+            let sampleUnvoiced: Float
+            switch true {
+            case prevVoicedRatio <= 0.0 && effectiveVoiced <= 0.0:
                 sampleVoiced = 0.0
-            } else {
+                sampleUnvoiced = 1.0
+            case 0.5 <= effectiveVoiced && prevVoicedRatio < 0.5:
+                // 無声から有声へのアタック境界: 母音開始部でのホワイトノイズ混入を根絶するため即座に有声化
+                sampleVoiced = effectiveVoiced
+                sampleUnvoiced = 0.0
+            case effectiveVoiced < 0.5 && 0.5 <= prevVoicedRatio:
+                // 有声から無声への減衰境界: 直前の有声波形をスムーズにフェードアウト
+                sampleVoiced = oneMinusLambda * prevVoicedRatio
+                sampleUnvoiced = 1.0 - sampleVoiced
+            default:
                 sampleVoiced = (oneMinusLambda * prevVoicedRatio) + (lambda * effectiveVoiced)
+                sampleUnvoiced = 1.0 - sampleVoiced
             }
-            let sampleUnvoiced = 1.0 - sampleVoiced
 
             let rawPulse = rosenbergPulse.nextSample(f0: sampleF0, removeDC: false)
             // 声門容積速度波形に対して口唇放射微分(+6dB/oct)を適用し、声門気流微分波形を再現して母音フォルマント倍音を豊かに励振する。
@@ -303,11 +317,12 @@ public final class LPCVocoder: @unchecked Sendable {
             // 全極共鳴フィルタのQ値増幅による過大振幅とリミッター飽和を防ぐため、励起信号を適正レベルに調整する
             let excitationScale: Float = 0.85
             let voicedExcitation = radiatedPulse * excitationScale
-            // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)
+            // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)。
+            // 無声励起が過大になると母音のフォルマント共鳴を妨げ耳障りなホワイトノイズが知覚されるため、自然な子音アタックが得られる0.18に調整する。
             let rawNoise = nextRandomFloat()
             let shapedNoise = rawNoise - (0.95 * prevUnvoicedNoise)
             prevUnvoicedNoise = rawNoise
-            let unvoicedExcitation = shapedNoise * 0.25
+            let unvoicedExcitation = shapedNoise * 0.18
             let excitation = (sampleVoiced * voicedExcitation) + (sampleUnvoiced * unvoicedExcitation)
             let inputSignal = excitation * g
 
@@ -427,13 +442,27 @@ public final class LPCVocoder: @unchecked Sendable {
             }
 
             // 有声度・無声度のサンプル単位連続補間
+            // 前フレームが無声（破裂音等）で現フレームが有声（母音等）に遷移する境界において、
+            // 有声度を160サンプルかけて徐々に補間すると母音の立ち上がりで激しい無声乱数ノイズが注入される。
+            // したがって現フレームが有声（0.5 <= effectiveVoiced）の場合は即座に有声音励起とし、無声ノイズを完全遮断する。
             let sampleVoiced: Float
-            if prevVoicedRatio <= 0.0 && effectiveVoiced <= 0.0 {
+            let sampleUnvoiced: Float
+            switch true {
+            case prevVoicedRatio <= 0.0 && effectiveVoiced <= 0.0:
                 sampleVoiced = 0.0
-            } else {
+                sampleUnvoiced = 1.0
+            case 0.5 <= effectiveVoiced && prevVoicedRatio < 0.5:
+                // 無声から有声へのアタック境界: 母音開始部でのホワイトノイズ混入を根絶するため即座に有声化
+                sampleVoiced = effectiveVoiced
+                sampleUnvoiced = 0.0
+            case effectiveVoiced < 0.5 && 0.5 <= prevVoicedRatio:
+                // 有声から無声への減衰境界: 直前の有声波形をスムーズにフェードアウト
+                sampleVoiced = oneMinusLambda * prevVoicedRatio
+                sampleUnvoiced = 1.0 - sampleVoiced
+            default:
                 sampleVoiced = (oneMinusLambda * prevVoicedRatio) + (lambda * effectiveVoiced)
+                sampleUnvoiced = 1.0 - sampleVoiced
             }
-            let sampleUnvoiced = 1.0 - sampleVoiced
 
             let rawPulse = rosenbergPulse.nextSample(f0: sampleF0, removeDC: false)
             // 声門容積速度波形に対して口唇放射微分(+6dB/oct)を適用し、声門気流微分波形を再現して母音フォルマント倍音を豊かに励振する。
@@ -445,11 +474,12 @@ public final class LPCVocoder: @unchecked Sendable {
             // 全極共鳴フィルタのQ値増幅による過大振幅とリミッター飽和を防ぐため、励起信号を適正レベルに調整する
             let excitationScale: Float = 0.85
             let voicedExcitation = radiatedPulse * excitationScale
-            // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)
+            // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)。
+            // 無声励起が過大になると母音のフォルマント共鳴を妨げ耳障りなホワイトノイズが知覚されるため、自然な子音アタックが得られる0.18に調整する。
             let rawNoise = nextRandomFloat()
             let shapedNoise = rawNoise - (0.95 * prevUnvoicedNoise)
             prevUnvoicedNoise = rawNoise
-            let unvoicedExcitation = shapedNoise * 0.25
+            let unvoicedExcitation = shapedNoise * 0.18
             let excitation = (sampleVoiced * voicedExcitation) + (sampleUnvoiced * unvoicedExcitation)
             let inputSignal = excitation * g
 

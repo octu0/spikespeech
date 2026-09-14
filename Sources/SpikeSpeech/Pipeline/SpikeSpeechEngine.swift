@@ -24,7 +24,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     public init(
         weights: SpikingNetworkWeights = SpikingNetworkWeights.randomWeights(),
         sampleRate: Float = Float(AudioConfig.sampleRate),
-        residualScale: Float = 1.0
+        // 大規模コーパス（500文以上）の学習過程で生じるSNNの高周波スペクトルゆらぎやざらつきノイズがボコーダーに過大に混入するのを防ぎ、
+        // 事前フォルマントアンカー（Prior）の明瞭な母音共鳴を基盤として、子音やアクセントの質感のみを自然に付与するためデフォルト値を0.20とする。
+        residualScale: Float = 0.20
     ) {
         self.weights = weights
         self.sampleRate = sampleRate
@@ -219,9 +221,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             workspace: workspace
         )
 
-        // 各フレームに対応する音素 ID の時間軸展開マップの構築
-        // 音素ごとの標準フォルマント事前アンカーを高速参照するためにフレーム単位でマッピングする
+        // 各フレームに対応する音素 ID、音素内オフセット、および音素継続フレーム数の時間軸展開マップの構築
+        // 音素ごとの標準フォルマント事前アンカー参照および調音音声学に基づく子音閉鎖区間の厳密制御に用いる
         var framePhoneIds = [Int](repeating: 1, count: totalFrames)
+        var framePhoneOffsets = [Int](repeating: 0, count: totalFrames)
+        var framePhoneDurations = [Int](repeating: 1, count: totalFrames)
         var curFrame = 0
         var pIdx = 0
         let pCount = min(linguisticFeatures.phoneIds.count, linguisticFeatures.durations.count)
@@ -233,6 +237,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let frameIdx = curFrame + f
                 if frameIdx < totalFrames {
                     framePhoneIds[frameIdx] = Int(pId)
+                    framePhoneOffsets[frameIdx] = f
+                    framePhoneDurations[frameIdx] = d
                 }
                 f += 1
             }
@@ -285,27 +291,63 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
             var blendedPrior = currPrior
             if prevPId != pId {
-                // 音素開始境界 (先頭 1 フレーム目): 先行音素から現音素への過渡ブレンド (30% 先行 + 70% 現音素)
-                var prevPrior = [Float](repeating: 0.0, count: melChannels)
-                prevPrior.withUnsafeMutableBufferPointer { pDst in
-                    acousticPrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                // 先行音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
+                var canBlendPrev = true
+                switch prevPId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                    canBlendPrev = false
+                default:
+                    break
                 }
-                var c = 0
-                while c < melChannels {
-                    blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
-                    c += 1
+                switch pId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 12, 23, 30, 38:
+                    canBlendPrev = false
+                default:
+                    break
+                }
+
+                if canBlendPrev {
+                    var prevPrior = [Float](repeating: 0.0, count: melChannels)
+                    prevPrior.withUnsafeMutableBufferPointer { pDst in
+                        acousticPrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
+                        c += 1
+                    }
                 }
             }
             if nextPId != pId {
-                // 音素終了境界 (末尾 1 フレーム前): 現音素から後続音素への過渡ブレンド (70% 現音素 + 30% 後続)
-                var nextPrior = [Float](repeating: 0.0, count: melChannels)
-                nextPrior.withUnsafeMutableBufferPointer { pDst in
-                    acousticPrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                // 後続音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
+                var canBlendNext = true
+                switch nextPId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                    canBlendNext = false
+                default:
+                    break
                 }
-                var c = 0
-                while c < melChannels {
-                    blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
-                    c += 1
+                switch pId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 12, 23, 30, 38:
+                    canBlendNext = false
+                default:
+                    break
+                }
+
+                if canBlendNext {
+                    var nextPrior = [Float](repeating: 0.0, count: melChannels)
+                    nextPrior.withUnsafeMutableBufferPointer { pDst in
+                        acousticPrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
+                        c += 1
+                    }
                 }
             }
 
@@ -332,33 +374,20 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let pIdNext1 = framePhoneIds[smT + 1]
                 let pIdNext2 = framePhoneIds[smT + 2]
 
-                // ポーズ・無音区間の前後境界では無音フロアを鋭敏に保つため、5点近傍内に無音が含まれる場合は平滑化をバイパス
+                // ポーズ・無音・破裂音閉鎖区間の前後境界では無音フロアと急峻なアタックを鋭敏に保つため、
+                // 5点近傍内に無音・破裂音が侵入している場合は平滑化をバイパスする
                 var isPauseNear = false
-                switch pIdCurr {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                    isPauseNear = true
-                default:
-                    switch pIdPrev1 {
-                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
+                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
+                var ck = 0
+                while ck < 5 {
+                    switch checkList[ck] {
+                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                         10, 12, 23, 30, 38:
                         isPauseNear = true
                     default:
-                        switch pIdNext1 {
-                        case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                            isPauseNear = true
-                        default:
-                            switch pIdPrev2 {
-                            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                                isPauseNear = true
-                            default:
-                                switch pIdNext2 {
-                                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                                    isPauseNear = true
-                                default:
-                                    break
-                                }
-                            }
-                        }
+                        break
                     }
+                    ck += 1
                 }
 
                 if isPauseNear != true {
@@ -404,12 +433,56 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             var lpcCoeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
             let baseGain = melToLPC.convert(mel: lpcInputMel, isLogMel: true, outCoeffs: &lpcCoeffs)
             let gain = baseGain * voice.energyScale
-            // 無音・休止・促音区間（<sil>, <pau>, <pad>, Q）においてボコーダーの無声乱数励起による
-            // 背景ヒスノイズや促音での雑音漏洩を完全に防ぐため、ゲインを強制的にゼロとする。
+            // 調音生理学（音声学）に基づく子音エネルギーと閉鎖区間の厳密制御
+            // 人間の調音器官（舌・口蓋・唇）の物理的作用を模倣し、無声破裂音の閉鎖期（前半）での
+            // 無声乱数ノイズ漏洩（「こ」等の発音開始前に鳴り響く「ザー」という異音）を根絶する。
             var effectiveGain = gain
+            let pOffset = framePhoneOffsets[t]
+            let pDur = framePhoneDurations[t]
+
             switch pId {
             case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
+                // 無音・休止・促音区間（<sil>, <pau>, <pad>, Q）:
+                // 呼気・声帯振動が完全に遮断されているため絶対無音とする。
                 effectiveGain = 0.0
+
+            case 10, 12, 23, 30, 38:
+                // 無声破裂音: k (10), t (12), p (23), ky (30), py (38)
+                // 舌や口唇が気流を完全に閉塞する「閉鎖期」（最終フレーム前）は物理的に音響エネルギーがゼロである。
+                // 閉鎖期に無声乱数を注入すると母音立ち上がり前に「ザー」という異音となるため完全ミュート（0.0）とし、
+                // 気流が急激に開放される直前の最後の 1 フレーム（破裂バースト）のみシャープに適正ゲインを付与する。
+                if pOffset < (pDur - 1) {
+                    effectiveGain = 0.0
+                } else {
+                    effectiveGain = min(0.18, gain * 0.50)
+                }
+
+            case 19, 21, 22, 35, 37:
+                // 有声破裂音: g (19), d (21), b (22), gy (35), by (37)
+                // 閉鎖期は気流通過ノイズがゼロで微弱な低周波声帯振動（ボイスバー）のみ存在するため、
+                // 閉鎖期は極小ゲインとし、最後の 1 フレームで破裂バーストを付与する。
+                if pOffset < (pDur - 1) {
+                    effectiveGain = min(0.04, gain * 0.15)
+                } else {
+                    effectiveGain = min(0.18, gain * 0.50)
+                }
+
+            case 28, 29:
+                // 無声破擦音: ch (28), ts (29)
+                // 閉鎖期から摩擦期への過渡的二相構造。前半（閉鎖区間）は呼気遮断のため無音（0.0）とし、
+                // 後半（摩擦区間）のみ摩擦ノイズを発生させる。
+                let halfDur = pDur / 2
+                if pOffset < halfDur {
+                    effectiveGain = 0.0
+                } else {
+                    effectiveGain = min(0.20, gain * 0.60)
+                }
+
+            case 11, 14, 27:
+                // 無声摩擦音: s (11), h (14), sh (27)
+                // 定常的な気流摩擦音。耳障りな過大ヒスノイズの突出を防止するため適正上限でクリップする。
+                effectiveGain = min(0.22, gain * 0.65)
+
             default:
                 break
             }
@@ -511,33 +584,78 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
         }
 
-        // 出力波形が過小（-20dBFS以下）あるいは過大になった場合に、
-        // クリッピングを絶対に起こさず聴取しやすい適正音量（ピーク約 -2.5dBFS = 0.75）にノーマライズする。
-        var peak: Float = 0.0
-        var sIdx = 0
-        while sIdx < rawSamples.count {
-            let a = abs(rawSamples[sIdx])
-            if peak < a {
-                peak = a
+        // 8. 有声区間 RMS（実効値）基準のラウドネス一定化制御およびソフトリミッター
+        // 従来のピークノーマライズは、単一の破裂音スパイクで文全体が極小化したり、
+        // 穏やかな文で過大爆音化して文章ごとに音量が激しくバラつく欠陥があった。
+        // 人間の聴覚が知覚する実効エネルギー（RMS）を有声区間から算出し、
+        // どの文章・語彙でも常に一定の均一な適正音量（約 -17dBFS、RMS=0.14）に自動整流する。
+        var voicedSumSq: Float = 0.0
+        var voicedSampleCount = 0
+        var vF = 0
+        while vF < totalFrames {
+            let pId = framePhoneIds[vF]
+            var isSpeech = true
+            switch pId {
+            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
+                isSpeech = false
+            default:
+                break
             }
-            sIdx += 1
+            if isSpeech {
+                let startS = vF * frameSize
+                let endS = min(rawSamples.count, startS + frameSize)
+                var s = startS
+                while s < endS {
+                    let v = rawSamples[s]
+                    voicedSumSq += v * v
+                    voicedSampleCount += 1
+                    s += 1
+                }
+            }
+            vF += 1
         }
 
-        let targetPeak: Float = 0.75
-        var normGain: Float = 1.0
-        if 1e-4 < peak {
-            let desiredGain = targetPeak / peak
-            if desiredGain <= 50.0 {
-                normGain = desiredGain
+        var voicedRms: Float = 0.0
+        if 0 < voicedSampleCount {
+            voicedRms = sqrt(voicedSumSq / Float(voicedSampleCount))
+        }
+
+        let targetRms: Float = 0.14
+        var loudnessGain: Float = 1.0
+        if 1e-4 < voicedRms {
+            let desiredGain = targetRms / voicedRms
+            // 極端な静音音声や異常値による過大増幅（ノイズフロアの持ち上がり）を防止する安全リミット
+            if desiredGain <= 8.0 {
+                if 0.1 <= desiredGain {
+                    loudnessGain = desiredGain
+                } else {
+                    loudnessGain = 0.1
+                }
             } else {
-                normGain = 50.0
+                loudnessGain = 8.0
             }
         }
 
+        // 全サンプルへのラウドネスゲイン乗算および過大ピークに対するソフトリミッター
+        // 単発の破裂音などで 0.80 を超えるサンプルのみ滑らかな曲線で圧縮し、デジタルクリッピングをゼロにする
         var samples = [Float](repeating: 0.0, count: rawSamples.count)
-        sIdx = 0
+        var sIdx = 0
+        let kneeThreshold: Float = 0.80
+        let margin: Float = 0.15
         while sIdx < rawSamples.count {
-            samples[sIdx] = rawSamples[sIdx] * normGain
+            let amplified = rawSamples[sIdx] * loudnessGain
+            let absVal = abs(amplified)
+            if kneeThreshold < absVal {
+                let over = absVal - kneeThreshold
+                let compressed = kneeThreshold + (margin * tanh(over / margin))
+                if amplified < 0.0 {
+                    samples[sIdx] = -compressed
+                } else {
+                    samples[sIdx] = compressed
+                }
+            } else {
+                samples[sIdx] = amplified
+            }
             sIdx += 1
         }
         return samples
@@ -611,10 +729,10 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         let frameSize = AudioConfig.hopSize
         vocoder.reset()
 
-        // 各フレームに対応する音素 ID の時間軸展開マップの構築
-        // ストリーミング合成時においても音素ごとの標準フォルマント事前アンカーを正確に加算し、
-        // 単なる残差ノイズではなく明瞭な母音・子音スペクトルをボコーダーへ伝達する
+        // 各フレームに対応する音素 ID、音素内オフセット、および音素継続フレーム数の時間軸展開マップの構築
         var framePhoneIds = [Int](repeating: 1, count: totalFrames)
+        var framePhoneOffsets = [Int](repeating: 0, count: totalFrames)
+        var framePhoneDurations = [Int](repeating: 1, count: totalFrames)
         var curFrame = 0
         var pIdx = 0
         let pCount = min(linguisticFeatures.phoneIds.count, linguisticFeatures.durations.count)
@@ -626,6 +744,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let frameIdx = curFrame + f
                 if frameIdx < totalFrames {
                     framePhoneIds[frameIdx] = Int(pId)
+                    framePhoneOffsets[frameIdx] = f
+                    framePhoneDurations[frameIdx] = d
                 }
                 f += 1
             }
@@ -633,10 +753,153 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             pIdx += 1
         }
 
+        // 全フレームの合成対数 Mel スペクトログラム作業バッファ [totalFrames * melChannels]
+        var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+
+        var tMel = 0
+        while tMel < totalFrames {
+            let outDim = acousticSeq[tMel].count
+            let copyCount = min(melChannels, outDim)
+
+            var rawSnnMel = [Float](repeating: 0.0, count: melChannels)
+            rawSnnMel.withUnsafeMutableBufferPointer { melDst in
+                acousticSeq[tMel].withUnsafeBufferPointer { acSrc in
+                    melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                }
+            }
+
+            let pId = framePhoneIds[tMel]
+            let prevPId: Int
+            if 0 < tMel {
+                prevPId = framePhoneIds[tMel - 1]
+            } else {
+                prevPId = pId
+            }
+
+            let nextPId: Int
+            if tMel + 1 < totalFrames {
+                nextPId = framePhoneIds[tMel + 1]
+            } else {
+                nextPId = pId
+            }
+
+            var currPrior = [Float](repeating: 0.0, count: melChannels)
+            currPrior.withUnsafeMutableBufferPointer { pDst in
+                acousticPrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+            }
+
+            var blendedPrior = currPrior
+            if prevPId != pId {
+                var canBlendPrev = true
+                switch prevPId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                    canBlendPrev = false
+                default:
+                    break
+                }
+                switch pId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 12, 23, 30, 38:
+                    canBlendPrev = false
+                default:
+                    break
+                }
+
+                if canBlendPrev {
+                    var prevPrior = [Float](repeating: 0.0, count: melChannels)
+                    prevPrior.withUnsafeMutableBufferPointer { pDst in
+                        acousticPrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
+                        c += 1
+                    }
+                }
+            }
+            if nextPId != pId {
+                var canBlendNext = true
+                switch nextPId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                    canBlendNext = false
+                default:
+                    break
+                }
+                switch pId {
+                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                     10, 12, 23, 30, 38:
+                    canBlendNext = false
+                default:
+                    break
+                }
+
+                if canBlendNext {
+                    var nextPrior = [Float](repeating: 0.0, count: melChannels)
+                    nextPrior.withUnsafeMutableBufferPointer { pDst in
+                        acousticPrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
+                        c += 1
+                    }
+                }
+            }
+
+            let resScale = self.residualScale
+            var compC = 0
+            while compC < melChannels {
+                combinedMelSeq[tMel][compC] = blendedPrior[compC] + (resScale * rawSnnMel[compC])
+                compC += 1
+            }
+            tMel += 1
+        }
+
+        // 時間軸方向の 5 点加重平滑化フィルタ
+        var smoothedMelSeq = combinedMelSeq
+        if 4 < totalFrames {
+            var smT = 2
+            let smEnd = totalFrames - 2
+            while smT < smEnd {
+                let pIdPrev2 = framePhoneIds[smT - 2]
+                let pIdPrev1 = framePhoneIds[smT - 1]
+                let pIdCurr = framePhoneIds[smT]
+                let pIdNext1 = framePhoneIds[smT + 1]
+                let pIdNext2 = framePhoneIds[smT + 2]
+
+                var isPauseNear = false
+                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
+                var ck = 0
+                while ck < 5 {
+                    switch checkList[ck] {
+                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
+                         10, 12, 23, 30, 38:
+                        isPauseNear = true
+                    default:
+                        break
+                    }
+                    ck += 1
+                }
+
+                if isPauseNear != true {
+                    var ch = 0
+                    while ch < melChannels {
+                        smoothedMelSeq[smT][ch] = (0.06 * combinedMelSeq[smT - 2][ch]) +
+                                                  (0.24 * combinedMelSeq[smT - 1][ch]) +
+                                                  (0.40 * combinedMelSeq[smT][ch]) +
+                                                  (0.24 * combinedMelSeq[smT + 1][ch]) +
+                                                  (0.06 * combinedMelSeq[smT + 2][ch])
+                        ch += 1
+                    }
+                }
+                smT += 1
+            }
+        }
+
         var allSamples = [Float](repeating: 0.0, count: totalFrames * frameSize)
         var frameBuffer = [Float](repeating: 0.0, count: frameSize)
-        var melVec = [Float](repeating: 0.0, count: melChannels)
-        var priorVec = [Float](repeating: 0.0, count: melChannels)
         var lpcCoeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
 
         var t = 0
@@ -646,33 +909,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 break
             }
 
-            let outDim = acousticSeq[t].count
-            let copyCount = min(melChannels, outDim)
-
-            melVec.withUnsafeMutableBufferPointer { melDst in
-                acousticSeq[t].withUnsafeBufferPointer { acSrc in
-                    melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
-                }
-            }
-            if copyCount < melChannels {
-                var m = copyCount
-                while m < melChannels {
-                    melVec[m] = 0.0
-                    m += 1
-                }
-            }
-
-            // 音素フォルマント事前アンカーと SNN 残差の加算合成 (Prior + Residual)
             let pId = framePhoneIds[t]
-            priorVec.withUnsafeMutableBufferPointer { pDst in
-                acousticPrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
-            }
-            let resScale = self.residualScale
-            var compC = 0
-            while compC < melChannels {
-                melVec[compC] = priorVec[compC] + (resScale * melVec[compC])
-                compC += 1
-            }
+            let melVec = smoothedMelSeq[t]
 
             // フォルマント周波数スケーリング（声道の伸縮）
             var lpcInputMel = melVec
@@ -695,12 +933,46 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
             let baseGain = melToLPC.convert(mel: lpcInputMel, isLogMel: true, outCoeffs: &lpcCoeffs)
             let gain = baseGain * voice.energyScale
-            // 無音・休止・促音区間（<sil>, <pau>, <pad>, Q）においてボコーダーの無声乱数励起による
-            // 背景ヒスノイズや促音での雑音漏洩を完全に防ぐため、ゲインを強制的にゼロとする。
+
+            // 調音生理学（音声学）に基づく子音エネルギーと閉鎖区間の厳密制御
             var effectiveGain = gain
+            let pOffset = framePhoneOffsets[t]
+            let pDur = framePhoneDurations[t]
+
             switch pId {
             case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
                 effectiveGain = 0.0
+
+            case 10, 12, 23, 30, 38:
+                // 無声破裂音: k, t, p, ky, py
+                // 閉鎖期は完全無音（0.0）、最後の1フレームのみ破裂バースト
+                if pOffset < (pDur - 1) {
+                    effectiveGain = 0.0
+                } else {
+                    effectiveGain = min(0.18, gain * 0.50)
+                }
+
+            case 19, 21, 22, 35, 37:
+                // 有声破裂音: g, d, b, gy, by
+                if pOffset < (pDur - 1) {
+                    effectiveGain = min(0.04, gain * 0.15)
+                } else {
+                    effectiveGain = min(0.18, gain * 0.50)
+                }
+
+            case 28, 29:
+                // 無声破擦音: ch, ts
+                let halfDur = pDur / 2
+                if pOffset < halfDur {
+                    effectiveGain = 0.0
+                } else {
+                    effectiveGain = min(0.20, gain * 0.60)
+                }
+
+            case 11, 14, 27:
+                // 無声摩擦音: s, h, sh
+                effectiveGain = min(0.22, gain * 0.65)
+
             default:
                 break
             }

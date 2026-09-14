@@ -319,6 +319,66 @@ final class AcousticDiagnosticTests: XCTestCase {
         XCTAssertTrue(0.05 < streamRms, "ストリーミング合成波形の RMS が過小です: rms=\(streamRms)")
     }
 
+    /// 「こんにちは」の「こ」の発音時の波形・RMS・音素詳細分析
+    func testDiagnoseKoNoise() {
+        let engine = SpikeSpeechEngine()
+        let text = "こんにちは"
+        let linguistic = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary
+        )
+        print("=== [こんにちは 音素分析] ===")
+        var p = 0
+        var curF = 0
+        while p < linguistic.phoneIds.count {
+            let pId = linguistic.phoneIds[p]
+            let dur = Int(linguistic.durations[p])
+            let token = engine.vocabulary.token(for: Int(pId))
+            print("Phone [\(p)] \(token) (id=\(pId)): dur=\(dur) frames (\(curF)..<\(curF + dur))")
+            curF += dur
+            p += 1
+        }
+
+        let samples = engine.synthesize(text: text, voice: .female)
+        let hopSize = AudioConfig.hopSize
+        let frameCount = samples.count / hopSize
+        print("=== [こんにちは フレーム別 RMS 分析] ===")
+        var frameRmsList = [Float](repeating: 0.0, count: min(20, frameCount))
+        var f = 0
+        while f < min(20, frameCount) {
+            var sumSq: Float = 0.0
+            var s = 0
+            while s < hopSize {
+                let v = samples[(f * hopSize) + s]
+                sumSq += v * v
+                s += 1
+            }
+            let rms = sqrt(sumSq / Float(hopSize))
+            frameRmsList[f] = rms
+            let dB = 20.0 * log10(max(1e-6, rms))
+            print(String(format: "Frame %2d (sample %4d..<%4d): RMS=%.5f (%.1f dBFS)", f, f * hopSize, (f + 1) * hopSize, rms, dB))
+            f += 1
+        }
+
+        // 調音生理学の音響検証:
+        // 1. 無声破裂音 /k/ の閉鎖区間（Frame 0..2、最初の30ms）は口蓋を密着させて気流を遮断するため、
+        //    音響エネルギーが物理的にゼロ（RMS <= 1e-5）であることを厳格に検証する。
+        var kFrame = 0
+        while kFrame < 3 {
+            XCTAssertTrue(frameRmsList[kFrame] <= 1e-5, "/k/ の閉鎖区間 Frame \(kFrame) にノイズが漏洩しています: RMS=\(frameRmsList[kFrame])")
+            kFrame += 1
+        }
+
+        // 2. 破裂バースト期（Frame 3）は短いインパルス的開放アタックであり、
+        //    かつ耳障りな過大ホワイトノイズ（> 0.02）になっていないことを検証する。
+        XCTAssertTrue(frameRmsList[3] <= 0.02, "破裂バースト期 Frame 3 のエネルギーが過大です: RMS=\(frameRmsList[3])")
+
+        // 3. 後続母音 /o/（Frame 6 以降）で豊かな母音フォルマント共鳴（RMS >= 0.10）が立ち上がっていることを検証する。
+        XCTAssertTrue(0.10 <= frameRmsList[6], "母音 /o/ のフォルマント共鳴エネルギーが不足しています: RMS=\(frameRmsList[6])")
+    }
+
     /// JSUT 実音声のエネルギー分布、前後無音区間、Prior フォルマントピークの診断
     func testDiagnoseJSUTSampleAndPrior() throws {
         let fileManager = FileManager.default
@@ -683,5 +743,99 @@ final class AcousticDiagnosticTests: XCTestCase {
         }
         XCTAssertTrue(maxSample3 <= 1e-4, "無音フレーム3フレーム目でゲインが完全ゼロへ収束していません: max=\(maxSample3)")
     }
+
+    /// 実際に生成された /tmp/konnichiwa_generated.wav の全フレーム波形・音素・有声度・F0・スペクトル精密診断
+    func testDiagnoseActualGeneratedWav() throws {
+        let wavPath = "/tmp/konnichiwa_generated.wav"
+        let reader = WavAudioReader()
+        let pcm = try reader.loadWav16k(from: wavPath)
+        print("=== [/tmp/konnichiwa_generated.wav 精密診断レポート] ===")
+        print("総サンプル数: \(pcm.count) (\(Float(pcm.count) / 16000.0) 秒)")
+
+        let engine = SpikeSpeechEngine(weights: SpikingNetworkWeights.randomWeights())
+        let text = "こんにちは"
+        let linguistic = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary
+        )
+
+        let hopSize = AudioConfig.hopSize
+        let frameCount = pcm.count / hopSize
+
+        var curF = 0
+        var p = 0
+        print("--- [音素アライメント一覧] ---")
+        while p < linguistic.phoneIds.count {
+            let pId = linguistic.phoneIds[p]
+            let dur = Int(linguistic.durations[p])
+            let token = engine.vocabulary.token(for: Int(pId))
+            print("Phone [\(p)] \(token) (id=\(pId)): dur=\(dur) frames (\(curF)..<\(curF + dur))")
+            curF += dur
+            p += 1
+        }
+
+        print("--- [フレーム別詳細音響パラメータ推移] ---")
+        var f = 0
+        while f < min(25, frameCount) {
+            let start = f * hopSize
+            let end = min(pcm.count, start + hopSize)
+            var sumSq: Float = 0.0
+            var zcrCount = 0
+            var prevSign: Float = 0.0
+            var s = start
+            while s < end {
+                let v = pcm[s]
+                sumSq += v * v
+                if 0 < s {
+                    if (prevSign < 0.0 && 0.0 <= v) || (0.0 <= prevSign && v < 0.0) {
+                        zcrCount += 1
+                    }
+                }
+                prevSign = v
+                s += 1
+            }
+            let rms = sqrt(sumSq / Float(max(1, end - start)))
+            let dB = 20.0 * log10(max(1e-6, rms))
+            let zcr = Float(zcrCount) / Float(max(1, end - start))
+
+            let vFlag = f < linguistic.voicedFlags.count ? linguistic.voicedFlags[f] : -1.0
+            let f0Val = f < linguistic.f0Contour.count ? linguistic.f0Contour[f] : -1.0
+
+            // 該当フレームの音素トークン
+            var phToken = "?"
+            var pScan = 0
+            var fScan = 0
+            while pScan < linguistic.phoneIds.count {
+                let d = Int(linguistic.durations[pScan])
+                if f < (fScan + d) {
+                    phToken = engine.vocabulary.token(for: Int(linguistic.phoneIds[pScan]))
+                    break
+                }
+                fScan += d
+                pScan += 1
+            }
+
+            print(String(format: "Frame %2d: Phone=%-4s, RMS=%.5f (%5.1f dB), ZCR=%.3f, voiced=%.2f, F0=%5.1f", f, (phToken as NSString).utf8String!, rms, dB, zcr, vFlag, f0Val))
+
+            // 周波数帯域別エネルギーの診断 (Frame 3〜8)
+            if 3 <= f && f <= 8 {
+                // 160サンプルの自己相関および高域差分エネルギー
+                var highDiffSumSq: Float = 0.0
+                var sIdx = 1
+                while sIdx < (end - start) {
+                    let diff = pcm[start + sIdx] - pcm[start + sIdx - 1]
+                    highDiffSumSq += diff * diff
+                    sIdx += 1
+                }
+                let highRoughness = sqrt(highDiffSumSq / Float(max(1, end - start - 1)))
+                print(String(format: "  -> 高域粗さ(差分RMS): %.5f, 粗さ/全体RMS比: %.2f", highRoughness, highRoughness / max(1e-6, rms)))
+            }
+            f += 1
+        }
+        print("==========================================")
+    }
 }
+
 

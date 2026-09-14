@@ -259,7 +259,7 @@ public enum WebClientHTML {
             <div class="form-group" style="margin-bottom: 1.5rem;">
                 <label for="voice-select">話者・声質 (Voice Profile)</label>
                 <select id="voice-select" style="width: 100%; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.6rem; font-size: 0.95rem; outline: none;">
-                    <option value="female" selected>女性ボイス (Female / JSUT 標準)</option>
+                    <option value="female" selected>女性ボイス (Female)</option>
                     <option value="male">男性ボイス (Male / 低域ピッチ・声道拡大)</option>
                     <option value="neutral">中性ボイス (Neutral)</option>
                     <option value="child">子供ボイス (Child / 高域ピッチ・声道縮小)</option>
@@ -270,7 +270,7 @@ public enum WebClientHTML {
             <div class="mode-selector">
                 <label class="mode-option">
                     <input type="radio" name="mode" value="stream" checked>
-                    <span>ストリーミング (PCM 逐次再生)</span>
+                    <span>ストリーミング (PCM 逐次低遅延再生)</span>
                 </label>
                 <label class="mode-option">
                     <input type="radio" name="mode" value="wav">
@@ -467,9 +467,6 @@ public enum WebClientHTML {
                     collectedSamples = [];
                     break;
                 case 'done':
-                    if (isSynthesizing != true) {
-                        return;
-                    }
                     const totalTimeMs = Date.now() - requestStartTime;
                     statRtf.textContent = msg.rtf.toFixed(4);
                     statDur.textContent = msg.duration.toFixed(2) + 's';
@@ -488,9 +485,6 @@ public enum WebClientHTML {
             }
 
             async function handleBinaryAudio(arrayBuffer) {
-                if (isSynthesizing != true) {
-                    return;
-                }
                 if (currentRequestId != activePlaybackRequestId) {
                     return;
                 }
@@ -502,10 +496,8 @@ public enum WebClientHTML {
                     initAudio();
                     try {
                         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                        // 途中でキャンセルや新規リクエストが発行されていない限り確実に再生
                         if (currentRequestId != myRequestId) {
-                            return;
-                        }
-                        if (isSynthesizing != true) {
                             return;
                         }
 

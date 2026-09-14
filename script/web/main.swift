@@ -22,6 +22,11 @@ var port: UInt16 = 8080
 var host: String = "0.0.0.0"
 var weightsPath: String?
 
+// Cloud Run 等の環境変数 PORT を優先フォールバックとして取得
+if let envPort = ProcessInfo.processInfo.environment["PORT"], let p = UInt16(envPort) {
+    port = p
+}
+
 let args = CommandLine.arguments
 var i = 1
 while i < args.count {
@@ -53,9 +58,22 @@ while i < args.count {
     i += 1
 }
 
-// 疑似値やランダム重みへのフォールバックを排除し、学習済み重みファイルの指定を必須とする
-guard let path = weightsPath else {
-    print("エラー: SNN 音響モデルの重みファイル (-w / --weights <path>) の指定は必須です。")
+// 重みファイルパスの解決: 引数 -> 環境変数 WEIGHTS_PATH -> デフォルト Models/weights.json の順にフォールバック
+var resolvedWeightsPath = weightsPath
+if resolvedWeightsPath == nil {
+    if let envPath = ProcessInfo.processInfo.environment["WEIGHTS_PATH"], envPath.isEmpty != true {
+        resolvedWeightsPath = envPath
+    } else {
+        let defaultPath = "Models/weights.json"
+        if FileManager.default.fileExists(atPath: defaultPath) {
+            resolvedWeightsPath = defaultPath
+        }
+    }
+}
+
+// 疑似値やランダム重みへのフォールバックを排除し、実在する学習済み重みファイルの指定を必須とする
+guard let path = resolvedWeightsPath else {
+    print("エラー: SNN 音響モデルの重みファイル (-w / --weights <path> または環境変数 WEIGHTS_PATH) の指定は必須です。")
     print("例: spikespeech-web -w Models/weights.json --port 8080")
     print("ヘルプ表示: spikespeech-web --help")
     exit(1)

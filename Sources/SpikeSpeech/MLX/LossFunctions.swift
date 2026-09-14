@@ -1,3 +1,4 @@
+#if canImport(MLX)
 import Foundation
 import MLX
 
@@ -54,3 +55,4 @@ public enum AcousticLossFunctions {
         return spectralL1Loss(predicted: pDelta, target: tDelta, mask: deltaMask)
     }
 }
+#endif

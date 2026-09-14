@@ -130,8 +130,6 @@ func main() {
             currentDir + "/default.metallib",
             currentDir + "/.build/arm64-apple-macosx/debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
             currentDir + "/.build/arm64-apple-macosx/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
-            currentDir + "/../spiketrans/.build/arm64-apple-macosx/debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
-            currentDir + "/../spiketrans/.build/arm64-apple-macosx/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
         ]
 
         var cIdx = 0
@@ -641,6 +639,20 @@ func main() {
         finalLoss = avgLoss
 
         print("  [Epoch \(epoch + 1)/\(epochs)] 平均損失: \(String(format: "%.6f", avgLoss))")
+
+        // 5エポックごとに中間チェックポイントを最新重みファイルへアトミック保存する。
+        if (epoch + 1) % 5 == 0 || epoch + 1 == epochs {
+            let intermediateWeights = network.exportWeights()
+            do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .prettyPrinted
+                let intermediateData = try encoder.encode(intermediateWeights)
+                try intermediateData.write(to: URL(fileURLWithPath: outputPath))
+            } catch {
+                // pass
+            }
+        }
+
         epoch += 1
     }
 

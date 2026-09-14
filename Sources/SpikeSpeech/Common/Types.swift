@@ -187,7 +187,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         self.speakerEmbedding = speakerEmbedding
     }
 
-    /// 標準的な女性声プロファイル（JSUT コーパス相当、基本ピッチ 1.0）
+    /// 標準的な女性声プロファイル（基本ピッチ 1.0）
     public static let female = VoiceProfile(
         name: "female",
         pitchScale: 1.0,

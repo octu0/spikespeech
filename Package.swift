@@ -2,6 +2,72 @@
 import Foundation
 import PackageDescription
 
+#if os(Linux)
+// Linux (Cloud Run): 音声合成・Web サーバー推論専用。mlx-swift や C++/Fortran 依存を完全排除した Pure Swift 構成
+let package = Package(
+    name: "SpikeSpeech",
+    products: [
+        .library(
+            name: "SpikeSpeech",
+            targets: ["SpikeSpeech"]
+        ),
+        .library(
+            name: "SpikeSpeechWeb",
+            targets: ["SpikeSpeechWeb"]
+        ),
+        .executable(
+            name: "spikespeech-web",
+            targets: ["spikespeech-web"]
+        ),
+        .executable(
+            name: "synthesize",
+            targets: ["synthesize"]
+        ),
+        .executable(
+            name: "benchmark",
+            targets: ["benchmark"]
+        ),
+    ],
+    dependencies: [],
+    targets: [
+        .target(
+            name: "SpikeSpeech",
+            dependencies: [],
+            path: "Sources/SpikeSpeech",
+            exclude: ["MLX"]
+        ),
+        .target(
+            name: "SpikeSpeechWeb",
+            dependencies: [
+                "SpikeSpeech"
+            ],
+            path: "Sources/SpikeSpeechWeb"
+        ),
+        .executableTarget(
+            name: "spikespeech-web",
+            dependencies: [
+                "SpikeSpeech",
+                "SpikeSpeechWeb"
+            ],
+            path: "script/web"
+        ),
+        .executableTarget(
+            name: "synthesize",
+            dependencies: [
+                "SpikeSpeech"
+            ],
+            path: "script/synthesize"
+        ),
+        .executableTarget(
+            name: "benchmark",
+            dependencies: [
+                "SpikeSpeech"
+            ],
+            path: "script/benchmark"
+        ),
+    ]
+)
+#else
 var products: [Product] = [
     .library(
         name: "SpikeSpeech",
@@ -121,3 +187,4 @@ let package = Package(
     ],
     targets: targets
 )
+#endif

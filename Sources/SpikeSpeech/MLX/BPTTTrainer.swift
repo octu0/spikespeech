@@ -1,3 +1,4 @@
+#if canImport(MLX)
 import Foundation
 import MLX
 import MLXNN
@@ -368,3 +369,4 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
         )
     }
 }
+#endif

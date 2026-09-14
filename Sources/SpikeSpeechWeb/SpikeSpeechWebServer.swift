@@ -1,6 +1,7 @@
 import Foundation
+#if canImport(Network)
 import Network
-import CryptoKit
+#endif
 import SpikeSpeech
 
 /// スレッドセーフな非同期キャンセルトークン
@@ -22,6 +23,7 @@ final class CancellationToken: @unchecked Sendable {
     }
 }
 
+#if canImport(Network)
 /// SpikeSpeech WebSocket & HTTP 音声合成サーバー
 ///
 /// 外部依存ゼロの Pure Swift による Network.framework を用いた高速サーバー。
@@ -204,8 +206,8 @@ public final class SpikeSpeechWebServer: @unchecked Sendable {
         }
 
         let combined = secKey + magicWebSocketGUID
-        let sha1 = Insecure.SHA1.hash(data: Data(combined.utf8))
-        let acceptValue = Data(sha1).base64EncodedString()
+        let sha1Digest = PureSHA1.hash(data: Data(combined.utf8))
+        let acceptValue = sha1Digest.base64EncodedString()
 
         var handshake = "HTTP/1.1 101 Switching Protocols\r\n"
         handshake += "Upgrade: websocket\r\n"
@@ -433,7 +435,7 @@ public final class SpikeSpeechWebServer: @unchecked Sendable {
 
         let voiceName = request.voice ?? "female"
         let voiceProfile = VoiceProfile.preset(named: voiceName)
-        let startTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let startTime = PlatformTime.uptimeNanoseconds()
 
         switch request.mode {
         case "wav":
@@ -448,7 +450,7 @@ public final class SpikeSpeechWebServer: @unchecked Sendable {
                     return
                 }
 
-                let endTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let endTime = PlatformTime.uptimeNanoseconds()
                 let elapsedSec = Float(endTime - startTime) / 1_000_000_000.0
 
                 let sampleCount = max(0, (wavData.count - 44) / 2)
@@ -523,7 +525,7 @@ public final class SpikeSpeechWebServer: @unchecked Sendable {
                 }
 
                 totalSamples = samples.count
-                let endTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let endTime = PlatformTime.uptimeNanoseconds()
                 let elapsedSec = Float(endTime - startTime) / 1_000_000_000.0
                 let audioDuration = Float(totalSamples) / self.engine.sampleRate
                 var rtf = elapsedSec / max(0.001, audioDuration)
@@ -584,3 +586,38 @@ public final class SpikeSpeechWebServer: @unchecked Sendable {
         connection.send(content: frame, completion: .contentProcessed { _ in })
     }
 }
+#else
+/// SpikeSpeech WebSocket & HTTP 音声合成サーバー (Linux / POSIX ソケット版)
+///
+/// なぜ POSIXWebServer に委任するか:
+/// Linux / Cloud Run 環境では Apple の Network.framework が利用できないため、
+/// POSIX ソケット + DispatchSource 実装（POSIXWebServer）に透過的に移譲し、
+/// macOS と同一のパブリック API（init, start, stop, port, host, engine）を提供する。
+public final class SpikeSpeechWebServer: @unchecked Sendable {
+
+    public let port: UInt16
+    public let host: String
+    public let engine: SpikeSpeechEngine
+
+    private let posixServer: POSIXWebServer
+
+    public init(
+        port: UInt16 = 8080,
+        host: String = "0.0.0.0",
+        engine: SpikeSpeechEngine = SpikeSpeechEngine()
+    ) {
+        self.port = port
+        self.host = host
+        self.engine = engine
+        self.posixServer = POSIXWebServer(port: port, host: host, engine: engine)
+    }
+
+    public func start() throws {
+        try posixServer.start()
+    }
+
+    public func stop() {
+        posixServer.stop()
+    }
+}
+#endif

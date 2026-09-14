@@ -1,3 +1,4 @@
+#if canImport(MLX)
 import Foundation
 import MLX
 
@@ -24,3 +25,4 @@ public enum SurrogateGradients {
         return stopGradient(sHard - sSurrogate) + sSurrogate
     }
 }
+#endif
