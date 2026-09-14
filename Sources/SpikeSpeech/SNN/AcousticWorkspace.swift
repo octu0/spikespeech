@@ -128,47 +128,4 @@ public final class AcousticWorkspace: @unchecked Sendable {
             }
         }
     }
-
-    /// フレーム間で膜電位が過大に飽和して発火状態が固定化（ロック）するのを防ぐため、
-    /// 直前フレームの膜電位を減衰リークさせて音素遷移への感度を回復する。
-    @inline(__always)
-    public func leakMembranes(decay: Float = 0.2) {
-        var l = 0
-        while l < numLayers {
-            let st = layerStates[l]
-            let hMax = maxHiddenDim
-            let limit = hMax - (hMax % 8)
-            let decayVec = SIMD8<Float>(repeating: decay)
-            st.v.withUnsafeMutableBufferPointer { vBuf in
-                let vPtr = vBuf.baseAddress!
-                var n = 0
-                while n < limit {
-                    let v = SIMD8<Float>(
-                        vPtr[n + 0], vPtr[n + 1], vPtr[n + 2], vPtr[n + 3],
-                        vPtr[n + 4], vPtr[n + 5], vPtr[n + 6], vPtr[n + 7]
-                    )
-                    let decayed = v * decayVec
-                    vPtr[n + 0] = decayed[0]
-                    vPtr[n + 1] = decayed[1]
-                    vPtr[n + 2] = decayed[2]
-                    vPtr[n + 3] = decayed[3]
-                    vPtr[n + 4] = decayed[4]
-                    vPtr[n + 5] = decayed[5]
-                    vPtr[n + 6] = decayed[6]
-                    vPtr[n + 7] = decayed[7]
-                    n += 8
-                }
-                while n < hMax {
-                    vPtr[n] *= decay
-                    n += 1
-                }
-            }
-            st.s.withUnsafeMutableBufferPointer { sBuf in
-                zeroFloats.withUnsafeBufferPointer { zBuf in
-                    sBuf.baseAddress!.update(from: zBuf.baseAddress!, count: hMax)
-                }
-            }
-            l += 1
-        }
-    }
 }

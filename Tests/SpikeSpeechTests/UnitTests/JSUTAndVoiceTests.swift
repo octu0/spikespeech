@@ -760,7 +760,195 @@ final class JSUTAndVoiceTests: XCTestCase {
         XCTAssertTrue(0 < streamChunkCount)
     }
 
-    // MARK: - 6. 静的コーディング規約検査
+    /// 残差スケール residualScale の既定値が 1.0 であり、正本パイプラインで生成された学習目標残差と推論側の Prior 加算が
+    /// 数学的に完全可逆（往復復元）であることを実データで検証
+    func testResidualScaleConsistency() {
+        let engine = SpikeSpeechEngine()
+        XCTAssertEqual(engine.residualScale, 1.0, "既定の残差スケールは 1.0 でなければなりません")
+
+        let extractor = MelSpectrogramExtractor()
+        let tracker = PitchTracker()
+        let sampleRate = 16000
+        let audioSamples = 4800 // 300ms = 30 frames
+
+        var wave = [Float](repeating: 0.0, count: audioSamples)
+        var s = 0
+        while s < audioSamples {
+            wave[s] = sin((2.0 * Float.pi * 200.0 * Float(s)) / Float(sampleRate)) * 0.1
+            s += 1
+        }
+
+        // 正本 prepareTrainingPair による学習ペア生成
+        guard let pair = engine.prepareTrainingPair(
+            text: "あ",
+            pcm16k: wave,
+            melExtractor: extractor,
+            pitchTracker: tracker
+        ) else {
+            XCTFail("prepareTrainingPair が有効なペアを返しませんでした")
+            return
+        }
+
+        // 入力実音声からの直接 Log Mel 抽出
+        let originalMel = extractor.extractLogMel(pcm: wave)
+        let frameCount = min(pair.targets.count, originalMel.count)
+        XCTAssertTrue(0 < frameCount)
+
+        // 目標残差 targets[t] は targetMel[t] - blendedPrior[t] で定義される
+        // 推論時の合成: reconstructed[t] = blendedPrior[t] + (residualScale * targets[t])
+        // したがって targets[t] + blendedPrior[t] == targetMel[t] が厳密に成立することを、
+        // 女性 Prior（VoiceProfile.female.tract）から導出した blendedPriorSequence との間で検証
+        let femalePrior = engine.prior(for: VoiceProfile.female.tract)
+        var framePhoneIds = [Int](repeating: PhonemeVocabulary.silId, count: frameCount)
+        let boundaries = engine.detectSpeechBoundaries(pcm: wave, hopSize: AudioConfig.hopSize, totalFrames: originalMel.count)
+        let aId = engine.vocabulary.id(for: "a")
+        var f = 0
+        while f < frameCount {
+            if boundaries.leadSilence <= f && f < (boundaries.leadSilence + boundaries.speechFrames) {
+                framePhoneIds[f] = aId
+            }
+            f += 1
+        }
+
+        let blendedPriorSeq = engine.computeBlendedPriorSequence(
+            framePhoneIds: framePhoneIds,
+            activePrior: femalePrior,
+            melChannels: AudioConfig.melChannels
+        )
+
+        var t = 0
+        while t < frameCount {
+            var c = 0
+            while c < AudioConfig.melChannels {
+                let targetResidual = pair.targets[t][c]
+                let priorVal = blendedPriorSeq[t][c]
+                let reconstructed = priorVal + (engine.residualScale * targetResidual)
+                XCTAssertEqual(reconstructed, originalMel[t][c], accuracy: 1e-4, "フレーム \(t) ch \(c) で往復復元スペクトルが targetMel と不一致です")
+                c += 1
+            }
+            t += 1
+        }
+    }
+
+    /// decodeSequence においてフレーム間で膜電位が不自然に 0.2 倍に消去されず、BPTT と同様に時間連続性が保たれることを検証
+    func testDecoderMembraneContinuity() {
+        let weights = SpikingNetworkWeights.randomWeights(
+            inputDim: 128,
+            maxHiddenDim: 64,
+            outputDim: 64,
+            numLayers: 2
+        )
+        let decoder = SpikingAcousticDecoder(weights: weights)
+        let workspace = AcousticWorkspace(
+            maxHiddenDim: weights.maxHiddenDim,
+            outputDim: weights.outputDim,
+            numLayers: weights.numLayers
+        )
+
+        // 2 フレーム分の入力特徴量系列
+        let frame0 = [Float](repeating: 0.5, count: 128)
+        let frame1 = [Float](repeating: 0.5, count: 128)
+        let seq = [frame0, frame1]
+
+        let output = decoder.decodeSequence(featuresSeq: seq, workspace: workspace)
+        XCTAssertEqual(output.count, 2)
+
+        // 第 2 フレームの推論後に膜電位がゼロや極端な減衰（0.2 倍）になっておらず、
+        // 直前フレームの膜電位が時間連続的に引き継がれていることを検証
+        var nonZeroMembrane = false
+        var i = 0
+        let v0 = workspace.layerStates[0].v
+        while i < v0.count {
+            if 0.01 < abs(v0[i]) {
+                nonZeroMembrane = true
+                break
+            }
+            i += 1
+        }
+        XCTAssertTrue(nonZeroMembrane, "フレーム間で膜電位が時間連続的に保持されていません")
+    }
+
+    /// computeBlendedPriorSequence が音素境界で隣接音素 Prior を滑らかにブレンドすることを検証
+    func testPriorBlendingSymmetry() {
+        let engine = SpikeSpeechEngine()
+        let activePrior = engine.acousticPrior
+
+        // 音素 ID 5 (/a/) から音素 ID 6 (/i/) への遷移
+        let framePhoneIds = [5, 5, 6, 6]
+        let blended = engine.computeBlendedPriorSequence(
+            framePhoneIds: framePhoneIds,
+            activePrior: activePrior,
+            melChannels: AudioConfig.melChannels
+        )
+
+        XCTAssertEqual(blended.count, 4)
+
+        let pureA = activePrior.getPriorMel(phoneId: 5)
+        let pureI = activePrior.getPriorMel(phoneId: 6)
+
+        // フレーム 0 は定常 /a/ なので pureA と完全一致
+        XCTAssertEqual(blended[0][10], pureA[10], accuracy: 1e-4)
+
+        // フレーム 1 は次音素 /i/ への調音結合により (0.70 * A) + (0.30 * I) にブレンド
+        let expectedBlend1 = (0.70 * pureA[10]) + (0.30 * pureI[10])
+        XCTAssertEqual(blended[1][10], expectedBlend1, accuracy: 1e-4)
+
+        // フレーム 2 は前音素 /a/ からの調音結合により (0.30 * A) + (0.70 * I) にブレンド
+        let expectedBlend2 = (0.30 * pureA[10]) + (0.70 * pureI[10])
+        XCTAssertEqual(blended[2][10], expectedBlend2, accuracy: 1e-4)
+
+        // フレーム 3 は定常 /i/ なので pureI と完全一致
+        XCTAssertEqual(blended[3][10], pureI[10], accuracy: 1e-4)
+    }
+
+    /// 学習データ構築パイプラインの正本（SpikeSpeechEngine.prepareTrainingPair）において、
+    /// 微小ゲイン録音であっても有声母音エネルギー（ch70）が推論側母音エネルギー（0.80）と完全一致することを直接検証
+    func testEnergyNormalizationDistribution() {
+        let engine = SpikeSpeechEngine()
+        let extractor = MelSpectrogramExtractor()
+        let tracker = PitchTracker()
+        let sampleRate = 16000
+        let audioSamples = 4800 // 300ms = 30 frames
+
+        // 微小振幅（RMS 約 0.07）の正弦波音声
+        var wave = [Float](repeating: 0.0, count: audioSamples)
+        var s = 0
+        while s < audioSamples {
+            wave[s] = sin((2.0 * Float.pi * 200.0 * Float(s)) / Float(sampleRate)) * 0.1
+            s += 1
+        }
+
+        // 本番パイプラインを直接実行
+        guard let pair = engine.prepareTrainingPair(
+            text: "あ",
+            pcm16k: wave,
+            melExtractor: extractor,
+            pitchTracker: tracker
+        ) else {
+            XCTFail("prepareTrainingPair が有効なペアを返しませんでした")
+            return
+        }
+
+        XCTAssertTrue(0 < pair.features.count)
+        XCTAssertEqual(pair.features.count, pair.targets.count)
+
+        // 入力特徴量 ch70（エネルギー）のピーク値を走査
+        var peakEnergy: Float = 0.0
+        var f = 0
+        while f < pair.features.count {
+            let energyCh = pair.features[f][70]
+            if peakEnergy < energyCh {
+                peakEnergy = energyCh
+            }
+            f += 1
+        }
+
+        // 発話内ピークが推論側母音エネルギー（0.80）に正確に正規化されていることを検証
+        XCTAssertTrue(0.75 <= peakEnergy, "スケーリング後の発話ピークエネルギーが推論側母音エネルギー（0.80）に届いていません: \(peakEnergy)")
+        XCTAssertTrue(peakEnergy <= 0.85, "スケーリング後の発話ピークエネルギーが過大です: \(peakEnergy)")
+    }
+
+    // MARK: - 7. 静的コーディング規約検査
 
     /// 本改修で新規作成・修正された全ソースコードがプロジェクト規約に完全適合していることを機械走査
     func testNewComponentsStaticRuleCheck() throws {
@@ -770,8 +958,11 @@ final class JSUTAndVoiceTests: XCTestCase {
         let targetPaths = [
             currentDir + "/Sources/SpikeSpeech/Common/Types.swift",
             currentDir + "/Sources/SpikeSpeech/DSP/AudioFeatureExtractor.swift",
+            currentDir + "/Sources/SpikeSpeech/DSP/PitchTracker.swift",
+            currentDir + "/Sources/SpikeSpeech/SNN/SpikingAcousticDecoder.swift",
             currentDir + "/script/dataset/jsut.swift",
             currentDir + "/Sources/SpikeSpeech/Pipeline/SpikeSpeechEngine.swift",
+            currentDir + "/Sources/SpikeSpeech/Pipeline/SpikeSpeechEngine+Training.swift",
             currentDir + "/Sources/SpikeSpeechWeb/Types.swift",
             currentDir + "/Sources/SpikeSpeechWeb/SpikeSpeechWebServer.swift",
             currentDir + "/script/train/main.swift",

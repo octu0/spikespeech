@@ -360,8 +360,8 @@ public final class LengthRegulator: Sendable {
 
         // 8. 音素物理カテゴリに基づく音響エネルギー輪郭の生成
         // なぜ一律固定値（0.60/0.10）ではなく音素カテゴリ別物理プロファイルにするか:
-        // 学習時は PitchTracker の実測 RMS（母音部 0.50〜0.85、摩擦部 0.20〜0.30、閉鎖部 0.02、無音 0.0）を
-        // SNN に供給しているため、推論時も同じ物理音響エネルギー分布を供給して分布外（OOD）入力を防ぐ。
+        // 学習時は PitchTracker の実測 RMS を発話内ピーク 0.80（母音部約 0.80、摩擦部 0.20〜0.30、閉鎖部 0.02、無音 0.0）
+        // に正規化して SNN に供給しているため、推論時も母音ピーク 0.80 の同一分布を供給して分布外（OOD）入力を防ぐ。
         var baseEnergyContour = [Float](repeating: 0.0, count: totalFrames)
         var curFrame = 0
         var phIter = 0
@@ -386,7 +386,7 @@ public final class LengthRegulator: Sendable {
                 if vocabulary.isVoiced(symbol: symbol) {
                     switch symbol {
                     case "a", "i", "u", "e", "o", "N", "_":
-                        targetEnergy = 0.70 // 母音・撥音・長音
+                        targetEnergy = 0.80 // 母音・撥音・長音（学習側ピーク 0.80 と完全一致）
                     default:
                         targetEnergy = 0.45 // その他有声子音（鼻音・半母音・弾音など）
                     }

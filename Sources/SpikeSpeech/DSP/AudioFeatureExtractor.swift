@@ -494,10 +494,13 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
                     b += 1
                 }
 
-                // ゼロ除算および非有限値の対数演算を防止するため下限値を設定する
+                // なぜ下限値を 3.8e-4 (logf ≈ -7.88) に設定するか:
+                // PhonemeAcousticPrior の無音・ノイズフロア（3.8e-4）と厳密に一致させることで、
+                // 実録音の無音区間やフォールバック無音において Prior と Mel 抽出の床を揃え、
+                // 無音フレームでの過大な負の残差による勾配汚染を完全に根絶するため。
                 var clamped = melEnergy
-                if clamped.isFinite != true || clamped < 1e-5 {
-                    clamped = 1e-5
+                if clamped.isFinite != true || clamped < 3.8e-4 {
+                    clamped = 3.8e-4
                 }
                 spectrogram[f][ch] = logf(clamped)
                 ch += 1

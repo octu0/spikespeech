@@ -13,9 +13,9 @@ func main() {
     var numLayers: Int = 2
     var inDim: Int = 128
     var outDim: Int = AudioConfig.melChannels // 64
+    var timeSteps: Int = 4
     var maxSamples: Int = 50
     var datasetPath: String? = nil
-    var voiceName: String = "female"
     var outputPath: String = "Models/weights.json"
     var loadWeightsPath: String? = "Models/weights.json"
     var forceFresh: Bool = false
@@ -40,12 +40,6 @@ func main() {
                     }
                     maxSamples = safeVal
                 }
-                i += 1
-            }
-        case "-v", "--voice":
-            let nextIdx = i + 1
-            if nextIdx < args.count {
-                voiceName = args[nextIdx]
                 i += 1
             }
         case "-e", "--epochs":
@@ -96,6 +90,14 @@ func main() {
                 }
                 i += 1
             }
+        case "--time-steps":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Int(args[nextIdx]) {
+                    timeSteps = max(1, val)
+                }
+                i += 1
+            }
         case "-o", "--output":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -111,7 +113,7 @@ func main() {
         case "--fresh":
             forceFresh = true
         case "-h", "--help":
-            print("Usage: train [-d <jsut_dir>] [-s <samples>] [-v <voice>] [-e <epochs>] [--lr <learning_rate>] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [-w <weights.json>] [--fresh] [-o <output.json>]")
+            print("Usage: train [-d <jsut_dir>] [-s <samples>] [-e <epochs>] [--lr <learning_rate>] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
             return
         default:
             break
@@ -158,42 +160,7 @@ func main() {
         }
     }
 
-    // ルート直下に誤って配置された不要 WAV ファイルを Tests/resources へ安全に移動
-    let rootWavs = [
-        "test_denoised.wav",
-        "test_aiueo_final.wav",
-        "test_aiueo_test.wav",
-        "test_child.wav",
-        "test_deep.wav",
-        "test_female.wav",
-        "test_male.wav"
-    ]
-    for wavName in rootWavs {
-        let srcPath = currentDir + "/" + wavName
-        let dstPath = currentDir + "/Tests/resources/" + wavName
-        if fileManager.fileExists(atPath: srcPath) {
-            if fileManager.fileExists(atPath: dstPath) != true {
-                try? fileManager.copyItem(atPath: srcPath, toPath: dstPath)
-            }
-            try? fileManager.removeItem(atPath: srcPath)
-        }
-    }
-
-    // ルート直下の weights.json を Models/weights.json と同期してルートから除去
-    let rootWeights = currentDir + "/weights.json"
-    if fileManager.fileExists(atPath: rootWeights) {
-        try? fileManager.removeItem(atPath: rootWeights)
-    }
-
-    // ライブラリ本体 (Sources/SpikeSpeech/Corpus) からコーパスファイルを完全排除
-    let corpusDirInSources = currentDir + "/Sources/SpikeSpeech/Corpus"
-    if fileManager.fileExists(atPath: corpusDirInSources) {
-        try? fileManager.removeItem(atPath: corpusDirInSources)
-    }
-
     MLXRandom.seed(2026)
-
-    let voiceProfile = VoiceProfile.preset(named: voiceName)
 
     print("==================================================")
     print("SpikeSpeech SNN 音響モデル BPTT 学習パイプライン")
@@ -202,20 +169,34 @@ func main() {
     print("学習率:       \(learningRate)")
     print("隠れ層次元:   \(hiddenDim)")
     print("層数:         \(numLayers)")
-    print("話者設定:     \(voiceProfile.name)")
+    print("教師音声基準: JSUT (女性単一話者 VoiceProfile.female.tract Prior)")
     print("出力パス:     \(outputPath)")
     print("--------------------------------------------------")
 
     // 既存の学習済み重みが存在する場合はウォームスタートし、学習の蓄積と損失減少の継続性を確保する
+    // なぜ全次元（input, output, hidden, layers）の厳密検査を行うか:
+    // CLI 引数で隠れ層次元や層数が変更された場合に、異なるシェイプの重みを誤ロードして
+    // 行列積のクラッシュや意図しない旧構造のまま学習が継続される不整合を完全に防止するため。
     var initialWeights: SpikingNetworkWeights? = nil
     if forceFresh != true {
         if let path = loadWeightsPath {
             if fileManager.fileExists(atPath: path) {
                 if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
                     if let loaded = try? JSONDecoder().decode(SpikingNetworkWeights.self, from: data) {
-                        if loaded.inputDim == inDim && loaded.outputDim == outDim {
+                        // なぜ全アーキテクチャパラメータ（input, output, hidden, layers, timeSteps）を厳密に検証するか:
+                        // SNN BPTT 学習では層数や隠れ層次元だけでなく、時間ステップ数（timeSteps）が異なると
+                        // 膜電位蓄積やスパイク時間統合のダイナミクスが破綻して学習が不能となるため。
+                        let isMatch = (loaded.inputDim == inDim) &&
+                                      (loaded.outputDim == outDim) &&
+                                      (loaded.maxHiddenDim == hiddenDim) &&
+                                      (loaded.numLayers == numLayers) &&
+                                      (loaded.timeSteps == timeSteps)
+                        switch isMatch {
+                        case true:
                             initialWeights = loaded
                             print("既存の学習済み重みをロードしました: \(path)")
+                        default:
+                            print("警告: 既存の重みと指定されたアーキテクチャパラメータが一致しません (input: \(loaded.inputDim)vs\(inDim), output: \(loaded.outputDim)vs\(outDim), hidden: \(loaded.maxHiddenDim)vs\(hiddenDim), layers: \(loaded.numLayers)vs\(numLayers), timeSteps: \(loaded.timeSteps)vs\(timeSteps))。新規初期化します。")
                         }
                     }
                 }
@@ -232,6 +213,7 @@ func main() {
             inputDim: inDim,
             maxHiddenDim: hiddenDim,
             outputDim: outDim,
+            timeSteps: timeSteps,
             numLayers: numLayers
         )
         print("新規の決定論的ランダム重みで初期化しました。")
@@ -275,268 +257,9 @@ func main() {
 
     var trainingData: [(features: [[Float]], targets: [[Float]])] = []
 
-    // 実音声波形から先頭無音、発話有音区間、および末尾無音区間のフレーム数を検出（VAD）
-    func detectSpeechBoundaries(
-        pcm: [Float],
-        hopSize: Int = AudioConfig.hopSize,
-        totalFrames: Int
-    ) -> (leadSilence: Int, speechFrames: Int, trailSilence: Int) {
-        if totalFrames <= 0 || pcm.isEmpty {
-            return (0, 0, 0)
-        }
-
-        var frameRms = [Float](repeating: 0.0, count: totalFrames)
-        var maxRms: Float = 0.0
-        var f = 0
-        while f < totalFrames {
-            let sampleStart = f * hopSize
-            var sumSq: Float = 0.0
-            var s = 0
-            while s < hopSize {
-                let sIdx = sampleStart + s
-                if sIdx < pcm.count {
-                    let val = pcm[sIdx]
-                    sumSq += val * val
-                }
-                s += 1
-            }
-            let rms = sqrt(sumSq / Float(hopSize))
-            frameRms[f] = rms
-            if maxRms < rms {
-                maxRms = rms
-            }
-            f += 1
-        }
-
-        var threshold = maxRms * 0.04
-        if threshold < 0.005 {
-            threshold = 0.005
-        }
-
-        var lead = 0
-        while lead < totalFrames {
-            if threshold <= frameRms[lead] {
-                break
-            }
-            lead += 1
-        }
-
-        var trail = 0
-        var tIdx = totalFrames - 1
-        while 0 <= tIdx {
-            if threshold <= frameRms[tIdx] {
-                break
-            }
-            trail += 1
-            tIdx -= 1
-        }
-
-        var speech = totalFrames - lead - trail
-        if speech < 4 {
-            lead = 0
-            trail = 0
-            speech = totalFrames
-        }
-
-        return (leadSilence: lead, speechFrames: speech, trailSilence: trail)
-    }
-
-    // テキストと言語特徴量、音声波形から VAD アライメント・残差目標 (targetMel - prior) を抽出
-    func preparePair(
-        text: String,
-        pcm16k: [Float],
-        engine: SpikeSpeechEngine,
-        voiceProfile: VoiceProfile,
-        melExtractor: MelSpectrogramExtractor,
-        pitchTracker: PitchTracker
-    ) -> (features: [[Float]], targets: [[Float]])? {
-        if pcm16k.isEmpty {
-            return nil
-        }
-        let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
-        let targetFrames = targetMel.count
-        if targetFrames <= 0 {
-            return nil
-        }
-
-        // 学習時は決定論的アライメントのため 1/f ゆらぎをバイパス（アライメント汚染の根絶）
-        let baseLinguistic = engine.lengthRegulator.processText(
-            text: text,
-            normalizer: engine.normalizer,
-            prosodyModel: engine.prosodyModel,
-            vocabulary: engine.vocabulary,
-            speedFactor: 1.0,
-            baseF0: voiceProfile.baseF0,
-            applyFluctuation: false
-        )
-
-        let origTotalFrames = baseLinguistic.totalFrames
-        let phoneCount = baseLinguistic.phoneIds.count
-
-        let boundaries = detectSpeechBoundaries(
-            pcm: pcm16k,
-            hopSize: AudioConfig.hopSize,
-            totalFrames: targetFrames
-        )
-        let leadSilence = boundaries.leadSilence
-        let speechFrames = boundaries.speechFrames
-        let trailSilence = boundaries.trailSilence
-
-        var alignedFeatures: [[Float]]
-        var fullPhoneIds: [Int32] = []
-        var fullDurations: [Int] = []
-
-        if origTotalFrames <= 0 || phoneCount <= 0 {
-            alignedFeatures = [[Float]](repeating: [Float](repeating: 0.0, count: engine.weights.inputDim), count: targetFrames)
-            fullPhoneIds = [Int32(PhonemeVocabulary.silId)]
-            fullDurations = [targetFrames]
-        } else {
-            let stretchRatio = Float(speechFrames) / Float(max(1, origTotalFrames))
-            var scaledDurations = [Float](repeating: 0.0, count: phoneCount)
-            var p = 0
-            while p < phoneCount {
-                let origD = Float(baseLinguistic.durations[p])
-                scaledDurations[p] = max(1.0, origD * stretchRatio)
-                p += 1
-            }
-
-            let quantizedDurations = engine.lengthRegulator.quantizeDurations(durations: scaledDurations)
-            var sumQuantized = 0
-            var q = 0
-            while q < quantizedDurations.count {
-                sumQuantized += quantizedDurations[q]
-                q += 1
-            }
-
-            var speechDurations = quantizedDurations
-            let diff = speechFrames - sumQuantized
-            if diff < 0 {
-                var remaining = -diff
-                var idx = speechDurations.count - 1
-                while 0 <= idx && 0 < remaining {
-                    if 1 < speechDurations[idx] {
-                        let reducible = speechDurations[idx] - 1
-                        let dec = min(remaining, reducible)
-                        speechDurations[idx] -= dec
-                        remaining -= dec
-                    }
-                    idx -= 1
-                }
-            }
-            if 0 < diff && 0 < speechDurations.count {
-                let lastIdx = speechDurations.count - 1
-                speechDurations[lastIdx] += diff
-            }
-
-            if 0 < leadSilence {
-                fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-                fullDurations.append(leadSilence)
-            }
-
-            var bIdx = 0
-            while bIdx < phoneCount {
-                fullPhoneIds.append(baseLinguistic.phoneIds[bIdx])
-                fullDurations.append(speechDurations[bIdx])
-                bIdx += 1
-            }
-
-            if 0 < trailSilence {
-                fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-                fullDurations.append(trailSilence)
-            }
-
-            // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間エネルギー抽出
-            // なぜ実測値を用いるか:
-            // 数式による理論 F0 は平坦で幾何学的なカーブとなるためロボット的な発音を招く。
-            // 実際の声優さんの音声から抽出した実測ピッチコンター・生体ゆらぎ・有声無声遷移・エネルギーを
-            // 入力特徴量として直接供給することで、人間味あふれる抑揚と音響スペクトルの相関を SNN に直接学習させる。
-            let pitchResult = pitchTracker.track(pcm: pcm16k)
-            var alignedF0 = [Float](repeating: 0.0, count: targetFrames)
-            var alignedVoiced = [Float](repeating: 0.0, count: targetFrames)
-            var alignedEnergy = [Float](repeating: 0.0, count: targetFrames)
-            var f = 0
-            while f < targetFrames {
-                if f < pitchResult.frameCount {
-                    alignedF0[f] = pitchResult.f0[f]
-                    alignedVoiced[f] = pitchResult.voiced[f]
-                    alignedEnergy[f] = pitchResult.energy[f]
-                }
-                f += 1
-            }
-
-            var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
-            var dIdx = 0
-            while dIdx < fullDurations.count {
-                int32Durations[dIdx] = Int32(fullDurations[dIdx])
-                dIdx += 1
-            }
-
-            let alignedLinguistic = LinguisticFeatures(
-                phoneIds: fullPhoneIds,
-                durations: int32Durations,
-                f0Contour: alignedF0,
-                voicedFlags: alignedVoiced,
-                energyContour: alignedEnergy,
-                totalFrames: targetFrames
-            )
-
-            alignedFeatures = engine.encodeLinguisticFeatures(
-                features: alignedLinguistic
-            )
-        }
-
-        let finalCount = min(alignedFeatures.count, targetMel.count)
-        var safeFeatures = alignedFeatures
-        if finalCount < safeFeatures.count {
-            safeFeatures.removeSubrange(finalCount..<safeFeatures.count)
-        }
-
-        var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: finalCount)
-        var framePhoneIds = [Int](repeating: 1, count: finalCount)
-        var curFrame = 0
-        var pIdx = 0
-        let pCount = min(fullPhoneIds.count, fullDurations.count)
-        while pIdx < pCount {
-            let pId = fullPhoneIds[pIdx]
-            let d = fullDurations[pIdx]
-            var f = 0
-            while f < d {
-                let frameIdx = curFrame + f
-                if frameIdx < finalCount {
-                    framePhoneIds[frameIdx] = Int(pId)
-                }
-                f += 1
-            }
-            curFrame += d
-            pIdx += 1
-        }
-
-        // なぜコーパス話者基準（成人女性基準）の Prior を固定して引くか:
-        // JSUT は成人女性単一話者の音声コーパスである。
-        // 訓練目標は「女性実音声 Mel − 女性基準 Prior」として純粋な音韻残差を学習させる必要があり、
-        // 異なる話者 Prior を引くと SNN が声道幾何差（VTLN）を打ち消す有害残差を学習して声道層と干渉するため。
-        let corpusTract = VocalTract(lengthScale: 1.0, bandwidthScale: 1.0)
-        let activePrior = engine.prior(for: corpusTract)
-        var t = 0
-        while t < finalCount {
-            let phoneId = framePhoneIds[t]
-            var prior = [Float](repeating: 0.0, count: AudioConfig.melChannels)
-            prior.withUnsafeMutableBufferPointer { dst in
-                activePrior.copyPriorMel(phoneId: phoneId, dst: dst.baseAddress!)
-            }
-
-            let melChannels = min(targetMel[t].count, AudioConfig.melChannels)
-            var c = 0
-            while c < melChannels {
-                safeTargets[t][c] = targetMel[t][c] - prior[c]
-                c += 1
-            }
-            t += 1
-        }
-
-        return (features: safeFeatures, targets: safeTargets)
-    }
-
+    // なぜローカル関数を廃止し SpikeSpeechEngine.prepareTrainingPair を正本として呼ぶか:
+    // 同一ロジックの二重実装を根絶し、単体テスト・学習 CLI・データセット生成で全く同一の
+    // アライメント・Blended Prior 目標残差生成器を唯一の正本として共有するため。
     let pitchTracker = PitchTracker()
 
     switch corpusDir {
@@ -573,11 +296,9 @@ func main() {
 
                     if fileManager.fileExists(atPath: wavFile) {
                         if let pcm16k = try? wavReader.loadWav16k(from: wavFile) {
-                            if let pair = preparePair(
+                            if let pair = engine.prepareTrainingPair(
                                 text: text,
                                 pcm16k: pcm16k,
-                                engine: engine,
-                                voiceProfile: voiceProfile,
                                 melExtractor: melExtractor,
                                 pitchTracker: pitchTracker
                             ) {
@@ -596,11 +317,9 @@ func main() {
         var sIdx = 0
         while sIdx < standardCorpus.count {
             let item = standardCorpus[sIdx]
-            if let pair = preparePair(
+            if let pair = engine.prepareTrainingPair(
                 text: item.text,
                 pcm16k: item.samples,
-                engine: engine,
-                voiceProfile: voiceProfile,
                 melExtractor: melExtractor,
                 pitchTracker: pitchTracker
             ) {
@@ -666,7 +385,7 @@ func main() {
                 let intermediateData = try encoder.encode(intermediateWeights)
                 try intermediateData.write(to: URL(fileURLWithPath: outputPath))
             } catch {
-                // pass
+                print("チェックポイント書き込み失敗: \(error)")
             }
         }
 

@@ -450,12 +450,13 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
 
         workspace.reset()
 
+        // なぜフレーム間での強制的な leakMembranes(0.2) を行わないか:
+        // BPTT 学習時（BPTTTrainer.swift）にはフレーム間での膜電位強制減衰やスパイクのゼロクリアは存在せず、
+        // 膜電位とリカレントスパイクが時間連続的に伝播している。
+        // 推論時にも同様に膜電位とリカレントスパイクの時間連続性を維持することで、
+        // BPTT が学習した時間文脈（wRec）を推論時に 100% 忠実に再現させるため。
         var t = 0
         while t < totalFrames {
-            if 0 < t {
-                // 直前フレームの直流入力で蓄積した膜電位を減衰させ、音素遷移に対する感度を確保する
-                workspace.leakMembranes(decay: 0.2)
-            }
             featuresSeq[t].withUnsafeBufferPointer { pIn in
                 result[t].withUnsafeMutableBufferPointer { pOut in
                     decodeFrame(

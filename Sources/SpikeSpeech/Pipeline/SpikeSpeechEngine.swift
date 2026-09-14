@@ -36,9 +36,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     public init(
         weights: SpikingNetworkWeights = SpikingNetworkWeights.randomWeights(),
         sampleRate: Float = Float(AudioConfig.sampleRate),
-        // 大規模コーパス（500文以上）の学習過程で生じるSNNの高周波スペクトルゆらぎやざらつきノイズがボコーダーに過大に混入するのを防ぎ、
-        // 事前フォルマントアンカー（Prior）の明瞭な母音共鳴を基盤として、子音やアクセントの質感のみを自然に付与するためデフォルト値を0.20とする。
-        residualScale: Float = 0.20
+        // なぜデフォルト値を 1.0 とするのか:
+        // SNN 音響モデルは訓練時に実音声 Mel と Prior の差分である全残差 (targetMel - prior) を
+        // 目的関数として直接最適化している。推論時にも同一スケール（1.0）で残差を加算することで、
+        // BPTT が学習した音韻補正およびスペクトル残差を 100% 反映させ、学習と推論の目的関数を数理的に完全一致させる。
+        residualScale: Float = 1.0
     ) {
         self.weights = weights
         self.sampleRate = sampleRate
@@ -240,6 +242,146 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         return seq
     }
 
+    /// 各フレームの音素 ID 系列に基づき、調音結合（Coarticulation）を考慮した事前対数 Mel 系列を算出する。
+    /// なぜ学習と推論で共通化するか:
+    /// 音素境界での生 Prior からの急激な段差をクロスフェード平滑化した事前スペクトルに対して
+    /// 残差 (targetMel - blendedPrior) を学習・加算することで、学習時と推論時で残差の物理的意味が 1 対 1 で完全に一致するため。
+    public func computeBlendedPriorSequence(
+        framePhoneIds: [Int],
+        activePrior: PhonemeAcousticPrior,
+        melChannels: Int
+    ) -> [[Float]] {
+        let totalFrames = framePhoneIds.count
+        if totalFrames <= 0 {
+            return []
+        }
+
+        var blendedSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+
+        var t = 0
+        while t < totalFrames {
+            let pId = framePhoneIds[t]
+            let prevPId: Int
+            if 0 < t {
+                prevPId = framePhoneIds[t - 1]
+            } else {
+                prevPId = pId
+            }
+
+            let nextPId: Int
+            if (t + 1) < totalFrames {
+                nextPId = framePhoneIds[t + 1]
+            } else {
+                nextPId = pId
+            }
+
+            var currPrior = [Float](repeating: 0.0, count: melChannels)
+            currPrior.withUnsafeMutableBufferPointer { pDst in
+                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+            }
+
+            var blendedPrior = currPrior
+            if prevPId != pId {
+                var canBlendPrev = true
+                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
+                    canBlendPrev = false
+                }
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
+                    canBlendPrev = false
+                }
+
+                if canBlendPrev {
+                    var prevPrior = [Float](repeating: 0.0, count: melChannels)
+                    prevPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
+                        c += 1
+                    }
+                }
+            }
+            if nextPId != pId {
+                var canBlendNext = true
+                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
+                    canBlendNext = false
+                }
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
+                    canBlendNext = false
+                }
+
+                if canBlendNext {
+                    var nextPrior = [Float](repeating: 0.0, count: melChannels)
+                    nextPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                    }
+                    var c = 0
+                    while c < melChannels {
+                        blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
+                        c += 1
+                    }
+                }
+            }
+
+            blendedSeq[t] = blendedPrior
+            t += 1
+        }
+
+        return blendedSeq
+    }
+
+    /// 合成対数 Mel 系列に対して時間軸方向の 5 点加重平滑化フィルタを適用する。
+    /// なぜ 5 点加重平滑化を行うか:
+    /// 調音器官（舌・口唇・下顎）の生理学的慣性による連続的な声道形状変化を再現し、
+    /// フレーム境界でのステップ状不連続を解消して滑らかで自然なフォルマント軌跡を生成するため。
+    public func smoothMelSequence(
+        combinedMelSeq: [[Float]],
+        framePhoneIds: [Int],
+        melChannels: Int
+    ) -> [[Float]] {
+        let totalFrames = combinedMelSeq.count
+        var smoothedMelSeq = combinedMelSeq
+        if 4 < totalFrames {
+            var smT = 2
+            let smEnd = totalFrames - 2
+            while smT < smEnd {
+                let pIdPrev2 = framePhoneIds[smT - 2]
+                let pIdPrev1 = framePhoneIds[smT - 1]
+                let pIdCurr = framePhoneIds[smT]
+                let pIdNext1 = framePhoneIds[smT + 1]
+                let pIdNext2 = framePhoneIds[smT + 2]
+
+                // ポーズ・無音・破裂音閉鎖区間の前後境界では無音フロアと急峻なアタックを鋭敏に保つため、
+                // 5 点近傍内に無音・破裂音が侵入している場合は平滑化をバイパスする
+                var isPauseNear = false
+                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
+                var ck = 0
+                while ck < 5 {
+                    let chkId = checkList[ck]
+                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
+                        isPauseNear = true
+                    }
+                    ck += 1
+                }
+
+                if isPauseNear != true {
+                    var ch = 0
+                    while ch < melChannels {
+                        smoothedMelSeq[smT][ch] = (0.06 * combinedMelSeq[smT - 2][ch]) +
+                                                  (0.24 * combinedMelSeq[smT - 1][ch]) +
+                                                  (0.40 * combinedMelSeq[smT][ch]) +
+                                                  (0.24 * combinedMelSeq[smT + 1][ch]) +
+                                                  (0.06 * combinedMelSeq[smT + 2][ch])
+                        ch += 1
+                    }
+                }
+                smT += 1
+            }
+        }
+        return smoothedMelSeq
+    }
+
     /// 日本語テキストから 16kHz モノラル PCM 浮動小数点サンプル列を合成する。
     @discardableResult
     public func synthesize(
@@ -328,10 +470,18 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         var frames: [AcousticFrame] = []
         frames.reserveCapacity(totalFrames)
 
+        // 調音結合 Prior ブレンド系列の算出（学習時と 100% 同一の共通メソッドを利用）
+        let blendedPriorSeq = computeBlendedPriorSequence(
+            framePhoneIds: framePhoneIds,
+            activePrior: activePrior,
+            melChannels: melChannels
+        )
+
         // 全フレームの合成対数 Mel スペクトログラム作業バッファ [totalFrames * melChannels]
         var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
 
         var t = 0
+        let resScale = self.residualScale
         while t < totalFrames {
             let outDim = acousticSeq[t].count
             let copyCount = min(melChannels, outDim)
@@ -343,121 +493,20 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
             }
 
-            // 音素境界における自然な調音結合 (Coarticulation) クロスフェードの算出
-            let pId = framePhoneIds[t]
-            let prevPId: Int
-            if 0 < t {
-                prevPId = framePhoneIds[t - 1]
-            } else {
-                prevPId = pId
-            }
-
-            let nextPId: Int
-            if t + 1 < totalFrames {
-                nextPId = framePhoneIds[t + 1]
-            } else {
-                nextPId = pId
-            }
-
-            var currPrior = [Float](repeating: 0.0, count: melChannels)
-            currPrior.withUnsafeMutableBufferPointer { pDst in
-                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
-            }
-
-            var blendedPrior = currPrior
-            if prevPId != pId {
-                var canBlendPrev = true
-                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
-                    canBlendPrev = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendPrev = false
-                }
-
-                if canBlendPrev {
-                    var prevPrior = [Float](repeating: 0.0, count: melChannels)
-                    prevPrior.withUnsafeMutableBufferPointer { pDst in
-                        activePrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
-                    }
-                    var c = 0
-                    while c < melChannels {
-                        blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
-                        c += 1
-                    }
-                }
-            }
-            if nextPId != pId {
-                var canBlendNext = true
-                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
-                    canBlendNext = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendNext = false
-                }
-
-                if canBlendNext {
-                    var nextPrior = [Float](repeating: 0.0, count: melChannels)
-                    nextPrior.withUnsafeMutableBufferPointer { pDst in
-                        activePrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
-                    }
-                    var c = 0
-                    while c < melChannels {
-                        blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
-                        c += 1
-                    }
-                }
-            }
-
-            let resScale = self.residualScale
             var compC = 0
             while compC < melChannels {
-                combinedMelSeq[t][compC] = blendedPrior[compC] + (resScale * rawSnnMel[compC])
+                combinedMelSeq[t][compC] = blendedPriorSeq[t][compC] + (resScale * rawSnnMel[compC])
                 compC += 1
             }
             t += 1
         }
 
-        // 時間軸方向の 5 点加重平滑化フィルタ (Temporal Coarticulation Smoothing: [0.06, 0.24, 0.40, 0.24, 0.06])
-        // 調音器官（舌・唇・下顎）の生理学的慣性による連続的な声道形状変化を再現し、
-        // フレーム境界でのステップ状不連続を解消して滑らかで自然なフォルマント軌跡を生成する
-        var smoothedMelSeq = combinedMelSeq
-        if 4 < totalFrames {
-            var smT = 2
-            let smEnd = totalFrames - 2
-            while smT < smEnd {
-                let pIdPrev2 = framePhoneIds[smT - 2]
-                let pIdPrev1 = framePhoneIds[smT - 1]
-                let pIdCurr = framePhoneIds[smT]
-                let pIdNext1 = framePhoneIds[smT + 1]
-                let pIdNext2 = framePhoneIds[smT + 2]
-
-                // ポーズ・無音・破裂音閉鎖区間の前後境界では無音フロアと急峻なアタックを鋭敏に保つため、
-                // 5点近傍内に無音・破裂音が侵入している場合は平滑化をバイパスする
-                var isPauseNear = false
-                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
-                var ck = 0
-                while ck < 5 {
-                    let chkId = checkList[ck]
-                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
-                        isPauseNear = true
-                    }
-                    ck += 1
-                }
-
-                if isPauseNear != true {
-                    var ch = 0
-                    while ch < melChannels {
-                        smoothedMelSeq[smT][ch] = (0.06 * combinedMelSeq[smT - 2][ch]) +
-                                                  (0.24 * combinedMelSeq[smT - 1][ch]) +
-                                                  (0.40 * combinedMelSeq[smT][ch]) +
-                                                  (0.24 * combinedMelSeq[smT + 1][ch]) +
-                                                  (0.06 * combinedMelSeq[smT + 2][ch])
-                        ch += 1
-                    }
-                }
-                smT += 1
-            }
-        }
+        // 時間軸方向の 5 点加重平滑化フィルタ
+        let smoothedMelSeq = smoothMelSequence(
+            combinedMelSeq: combinedMelSeq,
+            framePhoneIds: framePhoneIds,
+            melChannels: melChannels
+        )
 
         var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
         t = 0
@@ -789,10 +838,18 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             pIdx += 1
         }
 
+        // 調音結合 Prior ブレンド系列の算出（学習時と 100% 同一の共通メソッドを利用）
+        let blendedPriorSeq = computeBlendedPriorSequence(
+            framePhoneIds: framePhoneIds,
+            activePrior: activePrior,
+            melChannels: melChannels
+        )
+
         // 全フレームの合成対数 Mel スペクトログラム作業バッファ [totalFrames * melChannels]
         var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
 
         var tMel = 0
+        let resScale = self.residualScale
         while tMel < totalFrames {
             let outDim = acousticSeq[tMel].count
             let copyCount = min(melChannels, outDim)
@@ -804,116 +861,20 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
             }
 
-            let pId = framePhoneIds[tMel]
-            let prevPId: Int
-            if 0 < tMel {
-                prevPId = framePhoneIds[tMel - 1]
-            } else {
-                prevPId = pId
-            }
-
-            let nextPId: Int
-            if tMel + 1 < totalFrames {
-                nextPId = framePhoneIds[tMel + 1]
-            } else {
-                nextPId = pId
-            }
-
-            var currPrior = [Float](repeating: 0.0, count: melChannels)
-            currPrior.withUnsafeMutableBufferPointer { pDst in
-                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
-            }
-
-            var blendedPrior = currPrior
-            if prevPId != pId {
-                var canBlendPrev = true
-                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
-                    canBlendPrev = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendPrev = false
-                }
-
-                if canBlendPrev {
-                    var prevPrior = [Float](repeating: 0.0, count: melChannels)
-                    prevPrior.withUnsafeMutableBufferPointer { pDst in
-                        activePrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
-                    }
-                    var c = 0
-                    while c < melChannels {
-                        blendedPrior[c] = (0.30 * prevPrior[c]) + (0.70 * blendedPrior[c])
-                        c += 1
-                    }
-                }
-            }
-            if nextPId != pId {
-                var canBlendNext = true
-                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
-                    canBlendNext = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendNext = false
-                }
-
-                if canBlendNext {
-                    var nextPrior = [Float](repeating: 0.0, count: melChannels)
-                    nextPrior.withUnsafeMutableBufferPointer { pDst in
-                        activePrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
-                    }
-                    var c = 0
-                    while c < melChannels {
-                        blendedPrior[c] = (0.70 * blendedPrior[c]) + (0.30 * nextPrior[c])
-                        c += 1
-                    }
-                }
-            }
-
-            let resScale = self.residualScale
             var compC = 0
             while compC < melChannels {
-                combinedMelSeq[tMel][compC] = blendedPrior[compC] + (resScale * rawSnnMel[compC])
+                combinedMelSeq[tMel][compC] = blendedPriorSeq[tMel][compC] + (resScale * rawSnnMel[compC])
                 compC += 1
             }
             tMel += 1
         }
 
         // 時間軸方向の 5 点加重平滑化フィルタ
-        var smoothedMelSeq = combinedMelSeq
-        if 4 < totalFrames {
-            var smT = 2
-            let smEnd = totalFrames - 2
-            while smT < smEnd {
-                let pIdPrev2 = framePhoneIds[smT - 2]
-                let pIdPrev1 = framePhoneIds[smT - 1]
-                let pIdCurr = framePhoneIds[smT]
-                let pIdNext1 = framePhoneIds[smT + 1]
-                let pIdNext2 = framePhoneIds[smT + 2]
-
-                var isPauseNear = false
-                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
-                var ck = 0
-                while ck < 5 {
-                    let chkId = checkList[ck]
-                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
-                        isPauseNear = true
-                    }
-                    ck += 1
-                }
-
-                if isPauseNear != true {
-                    var ch = 0
-                    while ch < melChannels {
-                        smoothedMelSeq[smT][ch] = (0.06 * combinedMelSeq[smT - 2][ch]) +
-                                                  (0.24 * combinedMelSeq[smT - 1][ch]) +
-                                                  (0.40 * combinedMelSeq[smT][ch]) +
-                                                  (0.24 * combinedMelSeq[smT + 1][ch]) +
-                                                  (0.06 * combinedMelSeq[smT + 2][ch])
-                        ch += 1
-                    }
-                }
-                smT += 1
-            }
-        }
+        let smoothedMelSeq = smoothMelSequence(
+            combinedMelSeq: combinedMelSeq,
+            framePhoneIds: framePhoneIds,
+            melChannels: melChannels
+        )
 
         var allSamples = [Float](repeating: 0.0, count: totalFrames * frameSize)
         var frameBuffer = [Float](repeating: 0.0, count: frameSize)

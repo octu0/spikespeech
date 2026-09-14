@@ -126,6 +126,7 @@ public final class PitchTracker: @unchecked Sendable {
             f += 1
         }
 
+
         // 時間的連続性に基づく F0 メディアン平滑化 (孤立したピッチ誤検出スパイクの除去)
         var smoothF0 = f0List
         if 2 < frameCount {
@@ -178,8 +179,11 @@ public final class PitchTracker: @unchecked Sendable {
 
         // 背景ノイズ・微弱無音区間（約 -46 dBFS 以下）の早期足切り
         // 声帯振動の物理的エネルギーが存在しない無音区間での相関誤検出を防止する
+        // なぜ純粋な短時間 RMS（min(1.0, rms)）を返すか:
+        // 低レベル DSP 抽出器として人為的な 3 倍増幅を行わず、物理的な信号振幅（0.0〜1.0）を誠実に保持することで、
+        // 学習側パイプラインでのピーク正規化や推論側のエネルギー条件付けと数学的にクリーンに連携させるため。
         if rms < 0.005 {
-            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms * 3.0))
+            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms))
         }
 
         // 2. 正規化交差相関 (NCCF: Normalized Cross-Correlation) の計算
@@ -243,7 +247,7 @@ public final class PitchTracker: @unchecked Sendable {
 
         // 有声判定: 大域最大相関が閾値未満の場合は無声音とする
         if globalMaxPeak < voicingThreshold || peakLags.isEmpty {
-            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms * 3.0))
+            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms))
         }
 
         // 4. 最短有意ラグ（First Significant Peak）による真の基本周期確定
@@ -290,20 +294,20 @@ public final class PitchTracker: @unchecked Sendable {
 
         let preciseLag = Float(bestLag) + delta
         if preciseLag <= 0.0 {
-            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms * 3.0))
+            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms))
         }
 
         let extractedF0 = sampleRate / preciseLag
 
         // 有効ピッチ範囲の最終防壁検査
         if extractedF0 < minF0 || maxF0 < extractedF0 {
-            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms * 3.0))
+            return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms))
         }
 
         return (
             f0: extractedF0,
             voiced: 1.0,
-            energy: min(1.0, rms * 3.0)
+            energy: min(1.0, rms)
         )
     }
 }
