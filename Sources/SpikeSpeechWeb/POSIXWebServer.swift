@@ -59,7 +59,7 @@ public final class POSIXWebServer: @unchecked Sendable {
         #if canImport(Darwin)
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         #else
-        let fd = Glibc.socket(AF_INET, SOCK_STREAM, 0)
+        let fd = Glibc.socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
         #endif
 
         if fd < 0 {
@@ -748,7 +748,7 @@ public final class POSIXWebServer: @unchecked Sendable {
                 #if canImport(Darwin)
                 let n = Darwin.send(clientFd, ptr.advanced(by: sent), total - sent, 0)
                 #else
-                let n = Glibc.send(clientFd, ptr.advanced(by: sent), total - sent, MSG_NOSIGNAL)
+                let n = Glibc.send(clientFd, ptr.advanced(by: sent), total - sent, Int32(MSG_NOSIGNAL))
                 #endif
                 if n <= 0 {
                     break

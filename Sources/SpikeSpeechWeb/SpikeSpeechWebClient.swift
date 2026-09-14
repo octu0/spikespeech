@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 
 /// SpikeSpeech WebSocket クライアント
@@ -154,3 +155,4 @@ public final class SpikeSpeechWebClient: @unchecked Sendable {
         }
     }
 }
+#endif
