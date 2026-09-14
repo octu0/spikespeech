@@ -111,7 +111,7 @@ final class Tier3CombinationTests: XCTestCase {
             prosodyModel: prosodyModel,
             vocabulary: vocabulary
         )
-        let seq = engine.encodeLinguisticFeatures(features: features, pitchScale: 1.0)
+        let seq = engine.encodeLinguisticFeatures(features: features)
         XCTAssertEqual(seq.count, features.totalFrames)
         XCTAssertEqual(seq[0].count, engine.weights.inputDim)
 

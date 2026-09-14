@@ -7,44 +7,44 @@ final class JSUTAndVoiceTests: XCTestCase {
 
     // MARK: - 1. VoiceProfile 単体検証
 
-    /// 既定の話者プロファイル（女性、男性、中性）のパラメータ整合性を検証
+    /// 既定の話者プロファイル（女性、男性、中性、子供、重低音）の生理音響パラメータ整合性を検証
     func testVoiceProfilePresetsIntegrity() {
-        // 女性ボイス（JSUT 標準）
+        // 女性ボイス（JSUT 標準基準）
         let female = VoiceProfile.female
         XCTAssertEqual(female.name, "female")
-        XCTAssertEqual(female.pitchScale, 1.0)
-        XCTAssertEqual(female.pitchShift, 0.0)
-        XCTAssertEqual(female.formantScale, 1.0)
+        XCTAssertEqual(female.baseF0, 220.0)
+        XCTAssertEqual(female.glottal.openQuotient, 0.55)
+        XCTAssertEqual(female.glottal.returnQuotient, 0.16)
+        XCTAssertEqual(female.glottal.aspirationMix, 0.04)
+        XCTAssertEqual(female.tract.lengthScale, 1.00)
+        XCTAssertEqual(female.tract.bandwidthScale, 1.00)
         XCTAssertEqual(female.energyScale, 1.0)
-        XCTAssertEqual(female.speakerEmbedding.count, 16)
 
-        // 男性ボイス（低域ピッチ、声道拡大）
+        // 男性ボイス（低域ピッチ 120Hz、締まった声帯 OQ 0.42、長い声道 0.85）
         let male = VoiceProfile.male
         XCTAssertEqual(male.name, "male")
-        XCTAssertTrue(male.pitchScale < 1.0)
-        XCTAssertTrue(male.pitchShift < 0.0)
-        XCTAssertTrue(male.formantScale < 1.0)
-        XCTAssertEqual(male.speakerEmbedding.count, 16)
+        XCTAssertTrue(male.baseF0 < 220.0)
+        XCTAssertTrue(male.glottal.openQuotient < female.glottal.openQuotient)
+        XCTAssertTrue(male.tract.lengthScale < female.tract.lengthScale)
 
-        // 中性ボイス
+        // 中性ボイス (baseF0 170Hz)
         let neutral = VoiceProfile.neutral
         XCTAssertEqual(neutral.name, "neutral")
-        XCTAssertTrue(neutral.pitchScale < 1.0)
-        XCTAssertEqual(neutral.speakerEmbedding.count, 16)
+        XCTAssertTrue(neutral.baseF0 < female.baseF0)
+        XCTAssertTrue(male.baseF0 < neutral.baseF0)
 
-        // 子供ボイス
+        // 子供ボイス (baseF0 300Hz、短い声道 1.18、息漏れ 0.10)
         let child = VoiceProfile.child
         XCTAssertEqual(child.name, "child")
-        XCTAssertTrue(1.0 < child.pitchScale)
-        XCTAssertTrue(1.0 < child.formantScale)
-        XCTAssertEqual(child.speakerEmbedding.count, 16)
+        XCTAssertTrue(female.baseF0 < child.baseF0)
+        XCTAssertTrue(female.tract.lengthScale < child.tract.lengthScale)
+        XCTAssertTrue(female.glottal.aspirationMix < child.glottal.aspirationMix)
 
-        // 重低音男性ボイス
+        // 重低音男性ボイス (baseF0 95Hz、極めて長い声道 0.80)
         let deepMale = VoiceProfile.deepMale
         XCTAssertEqual(deepMale.name, "deepMale")
-        XCTAssertTrue(deepMale.pitchScale < 0.6)
-        XCTAssertTrue(deepMale.formantScale < 0.85)
-        XCTAssertEqual(deepMale.speakerEmbedding.count, 16)
+        XCTAssertTrue(deepMale.baseF0 < male.baseF0)
+        XCTAssertTrue(deepMale.tract.lengthScale < male.tract.lengthScale)
 
         // 既定値が female であること
         XCTAssertEqual(VoiceProfile.default, VoiceProfile.female)
@@ -66,11 +66,10 @@ final class JSUTAndVoiceTests: XCTestCase {
     func testVoiceProfileCodableRoundTrip() throws {
         let customVoice = VoiceProfile(
             name: "custom_actor",
-            pitchScale: 1.25,
-            pitchShift: 15.0,
-            formantScale: 1.05,
-            energyScale: 0.95,
-            speakerEmbedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6]
+            baseF0: 185.0,
+            glottal: GlottalSource(openQuotient: 0.50, returnQuotient: 0.12, aspirationMix: 0.05, spectralTilt: -1.5),
+            tract: VocalTract(lengthScale: 0.92, bandwidthScale: 0.95),
+            energyScale: 1.02
         )
 
         let encoder = JSONEncoder()
@@ -80,11 +79,10 @@ final class JSUTAndVoiceTests: XCTestCase {
         let decoded = try decoder.decode(VoiceProfile.self, from: data)
 
         XCTAssertEqual(decoded.name, customVoice.name)
-        XCTAssertEqual(decoded.pitchScale, customVoice.pitchScale)
-        XCTAssertEqual(decoded.pitchShift, customVoice.pitchShift)
-        XCTAssertEqual(decoded.formantScale, customVoice.formantScale)
+        XCTAssertEqual(decoded.baseF0, customVoice.baseF0)
+        XCTAssertEqual(decoded.glottal, customVoice.glottal)
+        XCTAssertEqual(decoded.tract, customVoice.tract)
         XCTAssertEqual(decoded.energyScale, customVoice.energyScale)
-        XCTAssertEqual(decoded.speakerEmbedding, customVoice.speakerEmbedding)
     }
 
     // MARK: - 2. WavAudioReader 単体検証
@@ -323,22 +321,23 @@ final class JSUTAndVoiceTests: XCTestCase {
         )
 
         let features = engine.encodeLinguisticFeatures(
-            features: linguistic,
-            voice: .female,
-            pitchScale: 1.0
+            features: linguistic
         )
 
         let expectedFrames = audioSamples / AudioConfig.hopSize // 30 frames
         XCTAssertEqual(targetMel.count, expectedFrames)
         XCTAssertTrue(0 < features.count)
 
-        // 話者埋め込み（ch 68〜83）に VoiceProfile.female の値が注入されていることを検証
-        let femaleEmb = VoiceProfile.female.speakerEmbedding
-        var embIdx = 0
-        while embIdx < min(16, femaleEmb.count) {
-            let injectedVal = features[0][68 + embIdx]
-            XCTAssertEqual(injectedVal, femaleEmb[embIdx], accuracy: 1e-5)
-            embIdx += 1
+        // 直交特徴量（ch64: 有声度, ch65: 無声度, ch66: 正規化F0）が正しく注入されていることを検証
+        var f = 0
+        while f < features.count {
+            let voiced = features[f][64]
+            let unvoiced = features[f][65]
+            let sum: Float = voiced + unvoiced
+            let targetOne: Float = 1.0
+            let eps: Float = 1e-4
+            XCTAssertEqual(sum, targetOne, accuracy: eps, "有声度と無声度の和は常に 1.0（直交補空間）であること")
+            f += 1
         }
     }
 
@@ -386,7 +385,7 @@ final class JSUTAndVoiceTests: XCTestCase {
         XCTAssertTrue(0 < femaleSamples.count)
         XCTAssertTrue(0 < maleSamples.count)
 
-        // 両者の波形が完全一致せず、声質パラメータ（ピッチ・埋め込み）の違いにより異なることを実証
+        // 両者の波形が完全一致せず、物理音響プロファイル（基音 baseF0・声帯パルス OQ/RQ・声道長 VTLN）の違いにより異なることを実証
         var diffSum: Float = 0.0
         let compareCount = min(femaleSamples.count, maleSamples.count)
         var i = 0
@@ -397,7 +396,7 @@ final class JSUTAndVoiceTests: XCTestCase {
         let avgDiff = diffSum / Float(compareCount)
         XCTAssertTrue(0.01 < avgDiff, "女性ボイスと男性ボイスの合成波形に有意な差異が存在しません: diff=\(avgDiff)")
 
-        // 3. ピッチ（周波数）特性の検証: 男性ボイス（ピッチ 0.65）はゼロ交差数が女性ボイスより少なくなる
+        // 3. ピッチ（周波数）特性の検証: 低い基音を持つ男性ボイスはゼロ交差数が女性ボイスより少なくなる
         var femaleZeroCrossings = 0
         var fIdx = 1
         while fIdx < femaleSamples.count {
@@ -420,17 +419,109 @@ final class JSUTAndVoiceTests: XCTestCase {
         XCTAssertTrue(maleZeroCrossings < femaleZeroCrossings, "男性ボイスのゼロ交差数が女性ボイスを下回っていません: male=\(maleZeroCrossings), female=\(femaleZeroCrossings)")
     }
 
-    /// ピッチ固定条件下で formantScale のみが異なる場合に LPC スペクトル・合成波形が有意に変化することを実証
-    func testVoiceFormantScalingModifiesLPCAndSpectrum() {
+    /// 話者切り替え時において、話者基音の絶対値が変わっても「発音・アクセントの響き（相対 F0 輪郭）」が
+    /// 統計的・音響学的に完全に保存されていることをピアソン相関係数により実証（相談書 §5.8 必須検定）
+    func testVoiceSwitchingAccentShapePreservation() {
+        let prosody = ProsodyModel()
+        let vocab = PhonemeVocabulary()
+        var bio = BiologicalFluctuation(seed: 1234)
+
+        // 「こんにちは」のアクセント句（低高高高低）
+        let moras = [
+            MoraToken(text: "こ", phonemes: [PhonemeToken(id: 15, symbol: "k", category: .consonant, durationFrames: 4), PhonemeToken(id: 9, symbol: "o", category: .vowel, durationFrames: 8)], tone: .low),
+            MoraToken(text: "ん", phonemes: [PhonemeToken(id: 30, symbol: "N", category: .consonant, durationFrames: 8)], tone: .high),
+            MoraToken(text: "に", phonemes: [PhonemeToken(id: 20, symbol: "n", category: .consonant, durationFrames: 4), PhonemeToken(id: 6, symbol: "i", category: .vowel, durationFrames: 8)], tone: .high),
+            MoraToken(text: "ち", phonemes: [PhonemeToken(id: 23, symbol: "ch", category: .consonant, durationFrames: 4), PhonemeToken(id: 6, symbol: "i", category: .vowel, durationFrames: 8)], tone: .high),
+            MoraToken(text: "は", phonemes: [PhonemeToken(id: 25, symbol: "w", category: .consonant, durationFrames: 4), PhonemeToken(id: 5, symbol: "a", category: .vowel, durationFrames: 8)], tone: .low)
+        ]
+        let phrase = AccentPhrase(moras: moras)
+
+        let (f0Female, _, _) = prosody.generateF0Contour(
+            phrases: [phrase],
+            vocabulary: vocab,
+            baseF0: VoiceProfile.female.baseF0,
+            fluctuation: &bio,
+            applyFluctuation: false
+        )
+
+        var bioMale = BiologicalFluctuation(seed: 1234)
+        let (f0Male, _, _) = prosody.generateF0Contour(
+            phrases: [phrase],
+            vocabulary: vocab,
+            baseF0: VoiceProfile.male.baseF0,
+            fluctuation: &bioMale,
+            applyFluctuation: false
+        )
+
+        XCTAssertEqual(f0Female.count, f0Male.count)
+
+        // 有声区間における対数 F0 の平均値を算出
+        var logFemale: [Float] = []
+        var logMale: [Float] = []
+        var sumFemale: Float = 0.0
+        var sumMale: Float = 0.0
+        var frame = 0
+        while frame < f0Female.count {
+            if 0.0 < f0Female[frame] && 0.0 < f0Male[frame] {
+                let lf = logf(f0Female[frame])
+                let lm = logf(f0Male[frame])
+                logFemale.append(lf)
+                logMale.append(lm)
+                sumFemale += lf
+                sumMale += lm
+            }
+            frame += 1
+        }
+
+        XCTAssertTrue(0 < logFemale.count)
+        let meanFemale = sumFemale / Float(logFemale.count)
+        let meanMale = sumMale / Float(logMale.count)
+
+        // ピアソン相関係数 r を算出
+        var cov: Float = 0.0
+        var varF: Float = 0.0
+        var varM: Float = 0.0
+        var idx = 0
+        while idx < logFemale.count {
+            let df = logFemale[idx] - meanFemale
+            let dm = logMale[idx] - meanMale
+            cov += df * dm
+            varF += df * df
+            varM += dm * dm
+            idx += 1
+        }
+
+        let denom = sqrtf(varF * varM)
+        XCTAssertTrue(0.0 < denom)
+        let corr = cov / denom
+
+        // 相関係数 r > 0.99 であり、話者基音を差し替えても抑揚・アクセントの形（響き）が完全保存されていることを数学的に証明
+        XCTAssertTrue(0.99 <= corr, "話者差し替えによる相対アクセント相関が不十分です: r=\(corr)")
+    }
+
+    /// ピッチ（baseF0）および声門励起を同一に保った条件下で、VocalTract.lengthScale（真の VTLN）の差異により合成波形・共鳴スペクトルが有意に変化することを実証
+    func testVocalTractVTLNModifiesLPCAndSpectrum() {
         let engine = SpikeSpeechEngine()
         let text = "あああああ"
 
-        // 同一ピッチ・同一埋め込みで、formantScale のみ 1.0 vs 0.88 のプロファイル
-        let baseProfile = VoiceProfile(name: "v100", pitchScale: 1.0, pitchShift: 0.0, formantScale: 1.0, energyScale: 1.0)
-        let scaledProfile = VoiceProfile(name: "v088", pitchScale: 1.0, pitchShift: 0.0, formantScale: 0.88, energyScale: 1.0)
+        // 同一ピッチ・同一声帯音源で、声道長（lengthScale）のみ 1.00 vs 0.85（男性声道）のプロファイル
+        let baseProfile = VoiceProfile(
+            name: "standard_tract",
+            baseF0: 200.0,
+            glottal: GlottalSource(),
+            tract: VocalTract(lengthScale: 1.00, bandwidthScale: 1.00),
+            energyScale: 1.0
+        )
+        let longTractProfile = VoiceProfile(
+            name: "long_tract",
+            baseF0: 200.0,
+            glottal: GlottalSource(),
+            tract: VocalTract(lengthScale: 0.85, bandwidthScale: 0.90),
+            energyScale: 1.0
+        )
 
         let samplesBase = engine.synthesize(text: text, voice: baseProfile)
-        let samplesScaled = engine.synthesize(text: text, voice: scaledProfile)
+        let samplesScaled = engine.synthesize(text: text, voice: longTractProfile)
 
         XCTAssertTrue(0 < samplesBase.count)
         XCTAssertTrue(0 < samplesScaled.count)
@@ -443,8 +534,206 @@ final class JSUTAndVoiceTests: XCTestCase {
             i += 1
         }
         let avgDiff = diffSum / Float(count)
-        // formantScale による周波数軸伸縮により波形に統計的有意差が生じる
-        XCTAssertTrue(0.005 < avgDiff, "formantScale の変化による合成波形差分が検出されません: diff=\(avgDiff)")
+        // Hz 空間でのフォルマント周波数シフトにより合成波形に統計的有意差が生じる
+        XCTAssertTrue(0.005 < avgDiff, "VTLN による合成波形差分が検出されません: diff=\(avgDiff)")
+    }
+
+    /// PhonemeAcousticPrior における真の VTLN による F1 フォルマントピークの周波数シフトを検証（相談書 §5.8 必須検定）
+    func testPhonemeAcousticPriorFormantPeakShift() {
+        // 女性基準 (lengthScale=1.00) と男性 (lengthScale=0.85: 長い声道によりフォルマントが低域へシフト)
+        let femalePrior = PhonemeAcousticPrior(tract: VocalTract(lengthScale: 1.00, bandwidthScale: 1.00))
+        let malePrior = PhonemeAcousticPrior(tract: VocalTract(lengthScale: 0.85, bandwidthScale: 1.00))
+
+        // 母音 /a/ (ID 5) の事前対数 Mel スペクトル（64 チャンネル）
+        let femaleA = femalePrior.getPriorMel(phoneId: 5)
+        let maleA = malePrior.getPriorMel(phoneId: 5)
+
+        // F1 フォルマント帯域（低周波側、チャンネル 0〜25）におけるピーク位置（argmax）を探索
+        var femalePeakBin = 0
+        var femaleMaxVal: Float = -100.0
+        var bin = 0
+        while bin < 25 {
+            if femaleMaxVal < femaleA[bin] {
+                femaleMaxVal = femaleA[bin]
+                femalePeakBin = bin
+            }
+            bin += 1
+        }
+
+        var malePeakBin = 0
+        var maleMaxVal: Float = -100.0
+        bin = 0
+        while bin < 25 {
+            if maleMaxVal < maleA[bin] {
+                maleMaxVal = maleA[bin]
+                malePeakBin = bin
+            }
+            bin += 1
+        }
+
+        // 男性声道（lengthScale=0.85）では F1 フォルマントピークのビン番号が女性基準よりも低周波側へ有意にシフトすることを実証
+        XCTAssertTrue(malePeakBin < femalePeakBin, "男性 Prior の F1 フォルマントピークが低域側へシフトしていません: maleBin=\(malePeakBin), femaleBin=\(femalePeakBin)")
+    }
+
+    /// 声帯音源 OQ（開口率）の違いによる高調波エネルギー減衰（H1-H2 相当）の物理特性変化を検証（相談書 §5.8 必須検定）
+    func testGlottalSourceHarmonicDecay() {
+        let pulse = RosenbergPulse(sampleRate: 16000.0)
+
+        // 女性基準の開口率 (OQ 0.55, RQ 0.16)
+        let femaleGlottal = GlottalSource(openQuotient: 0.55, returnQuotient: 0.16)
+        pulse.apply(glottal: femaleGlottal)
+
+        // 160Hz の声帯振動波形を 320 サンプル（2 周期分）生成
+        let periodSamples = Int(16000.0 / 160.0)
+        let totalSamples = periodSamples * 2
+        var femaleWave = [Float](repeating: 0.0, count: totalSamples)
+        var s = 0
+        while s < totalSamples {
+            femaleWave[s] = pulse.nextSample(f0: 160.0, removeDC: true)
+            s += 1
+        }
+
+        // 引き締まった重低音の急峻な声帯閉鎖 (OQ 0.38, RQ 0.08)
+        let deepGlottal = GlottalSource(openQuotient: 0.38, returnQuotient: 0.08)
+        pulse.apply(glottal: deepGlottal)
+        pulse.reset()
+        var deepWave = [Float](repeating: 0.0, count: totalSamples)
+        s = 0
+        while s < totalSamples {
+            deepWave[s] = pulse.nextSample(f0: 160.0, removeDC: true)
+            s += 1
+        }
+
+        // 基本波 H1 (160Hz, 周期 k=2) と第 2 高調波 H2 (320Hz, 周期 k=4) のフーリエ係数絶対値を離散フーリエ積分で計算
+        func computeHarmonicPower(wave: [Float], harmonicK: Int) -> Float {
+            var re: Float = 0.0
+            var im: Float = 0.0
+            let n = wave.count
+            var i = 0
+            while i < n {
+                let angle = (2.0 * Float.pi * Float(harmonicK) * Float(i)) / Float(n)
+                re += wave[i] * cosf(angle)
+                im -= wave[i] * sinf(angle)
+                i += 1
+            }
+            return (re * re) + (im * im)
+        }
+
+        let femaleH1 = computeHarmonicPower(wave: femaleWave, harmonicK: 2)
+        let femaleH2 = computeHarmonicPower(wave: femaleWave, harmonicK: 4)
+        let deepH1 = computeHarmonicPower(wave: deepWave, harmonicK: 2)
+        let deepH2 = computeHarmonicPower(wave: deepWave, harmonicK: 4)
+
+        let femaleRatio = femaleH2 / max(1e-6, femaleH1)
+        let deepRatio = deepH2 / max(1e-6, deepH1)
+
+        // 急峻な閉鎖特性（OQ 0.38）を持つ重低音男声は、開口率の緩やかな女性声（OQ 0.55）に比べて
+        // 高次倍音（第 2 高調波 H2）の相対エネルギー比率が有意に増大（H1-H2 減衰が小さくエッジが立つ）することを実証
+        XCTAssertTrue(femaleRatio < deepRatio, "急峻閉鎖パルスの高次倍音比率が女性パルスを上回っていません: femaleRatio=\(femaleRatio), deepRatio=\(deepRatio)")
+    }
+
+    /// 正のスペクトル傾斜 (spectralTilt: +1.0) により高周波エネルギーが増加することを検証（相談書 §5.8 必須検定）
+    func testSpectralTiltHighFrequencyEmphasis() {
+        let vocoderFlat = LPCVocoder()
+        vocoderFlat.apply(glottal: GlottalSource(spectralTilt: 0.0))
+
+        let vocoderTilted = LPCVocoder()
+        vocoderTilted.apply(glottal: GlottalSource(spectralTilt: 1.5))
+
+        // 全極フィルタメモリをゼロにした有声励起フレーム（同一ゲイン・同一基音）
+        let frame = AcousticFrame(
+            lpcCoefficients: [Float](repeating: 0.0, count: 16),
+            gain: 1.0,
+            pitchF0: 200.0,
+            voiced: 1.0
+        )
+
+        var flatBuffer = [Float](repeating: 0.0, count: 160)
+        var tiltedBuffer = [Float](repeating: 0.0, count: 160)
+
+        flatBuffer.withUnsafeMutableBufferPointer { dst in
+            vocoderFlat.synthesizeFrame(frame: frame, dst: dst.baseAddress!)
+        }
+        tiltedBuffer.withUnsafeMutableBufferPointer { dst in
+            vocoderTilted.synthesizeFrame(frame: frame, dst: dst.baseAddress!)
+        }
+
+        // 高域（サンプル間差分エネルギー）の算出
+        var flatHighEnergy: Float = 0.0
+        var tiltedHighEnergy: Float = 0.0
+        var i = 1
+        while i < 160 {
+            let dFlat = flatBuffer[i] - flatBuffer[i - 1]
+            let dTilted = tiltedBuffer[i] - tiltedBuffer[i - 1]
+            flatHighEnergy += dFlat * dFlat
+            tiltedHighEnergy += dTilted * dTilted
+            i += 1
+        }
+
+        // 正の spectralTilt により高域微分エネルギーが有意に増加することを実証
+        XCTAssertTrue(flatHighEnergy < tiltedHighEnergy, "正の spectralTilt による高域エネルギー増加が検出されません: flat=\(flatHighEnergy), tilted=\(tiltedHighEnergy)")
+    }
+
+    /// RosenbergPulse の GlottalSource 動的更新を検証
+    func testGlottalSourceDynamicPulseModification() {
+        let pulse = RosenbergPulse(sampleRate: 16000.0)
+
+        // 標準開口率
+        let standardGlottal = GlottalSource(openQuotient: 0.55, returnQuotient: 0.16)
+        pulse.apply(glottal: standardGlottal)
+        let stdN1 = pulse.n1Ratio
+        let stdN2 = pulse.n2Ratio
+
+        // 重低音・引き締まった声帯（OQ 0.38, RQ 0.08）
+        let deepGlottal = GlottalSource(openQuotient: 0.38, returnQuotient: 0.08)
+        pulse.apply(glottal: deepGlottal)
+        let deepN1 = pulse.n1Ratio
+        let deepN2 = pulse.n2Ratio
+
+        // 開口時間比率および閉口時間比率が動的に短縮されることを検証
+        XCTAssertTrue(deepN1 < stdN1, "開口時間が引き締まり短縮されていること")
+        XCTAssertTrue(deepN2 < stdN2, "閉口急峻度が高まり短縮されていること")
+    }
+
+    /// ProsodyModel において話者基音 baseF0 を差し替えても相対アクセント・抑揚が完全に保存されることを検証
+    func testRelativeProsodyBaseF0StrictLinearity() {
+        let prosody = ProsodyModel()
+        let vocab = PhonemeVocabulary()
+        var bio = BiologicalFluctuation(seed: 42)
+
+        let moras = [
+            MoraToken(text: "あ", phonemes: [PhonemeToken(id: 5, symbol: "a", category: .vowel, durationFrames: 10)], tone: .high),
+            MoraToken(text: "め", phonemes: [PhonemeToken(id: 8, symbol: "e", category: .vowel, durationFrames: 10)], tone: .low)
+        ]
+        let phrase = AccentPhrase(moras: moras)
+
+        let (f0Female, _, _) = prosody.generateF0Contour(
+            phrases: [phrase],
+            vocabulary: vocab,
+            baseF0: 220.0,
+            fluctuation: &bio,
+            applyFluctuation: false
+        )
+
+        var bioMale = BiologicalFluctuation(seed: 42)
+        let (f0Male, _, _) = prosody.generateF0Contour(
+            phrases: [phrase],
+            vocabulary: vocab,
+            baseF0: 120.0,
+            fluctuation: &bioMale,
+            applyFluctuation: false
+        )
+
+        XCTAssertEqual(f0Female.count, f0Male.count)
+        let expectedRatio: Float = 220.0 / 120.0
+        var f = 0
+        while f < f0Female.count {
+            if 0.0 < f0Male[f] {
+                let ratio = f0Female[f] / f0Male[f]
+                XCTAssertEqual(ratio, expectedRatio, accuracy: 0.05, "話者基音の比率が保たれ相対抑揚が保存されていること: frame=\(f)")
+            }
+            f += 1
+        }
     }
 
     /// WAV 出力およびストリーミング出力における話者差し替えの動作を検証

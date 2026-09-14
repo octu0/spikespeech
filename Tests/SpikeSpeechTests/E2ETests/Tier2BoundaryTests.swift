@@ -223,7 +223,7 @@ final class Tier2BoundaryTests: XCTestCase {
             prosodyModel: prosodyModel,
             vocabulary: vocabulary
         )
-        let seq = engine.encodeLinguisticFeatures(features: features, pitchScale: 3.0)
+        let seq = engine.encodeLinguisticFeatures(features: features)
         XCTAssertEqual(seq.count, features.totalFrames)
         var f = 0
         while f < seq.count {
@@ -821,7 +821,7 @@ final class Tier2BoundaryTests: XCTestCase {
             prosodyModel: prosodyModel,
             vocabulary: vocabulary
         )
-        let seq = engine.encodeLinguisticFeatures(features: feat, pitchScale: -1.0)
+        let seq = engine.encodeLinguisticFeatures(features: feat)
         XCTAssertEqual(seq.count, feat.totalFrames)
     }
 

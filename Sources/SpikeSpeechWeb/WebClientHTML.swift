@@ -259,11 +259,11 @@ public enum WebClientHTML {
             <div class="form-group" style="margin-bottom: 1.5rem;">
                 <label for="voice-select">話者・声質 (Voice Profile)</label>
                 <select id="voice-select" style="width: 100%; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.6rem; font-size: 0.95rem; outline: none;">
-                    <option value="female" selected>女性ボイス (Female)</option>
-                    <option value="male">男性ボイス (Male / 低域ピッチ・声道拡大)</option>
-                    <option value="neutral">中性ボイス (Neutral)</option>
-                    <option value="child">子供ボイス (Child / 高域ピッチ・声道縮小)</option>
-                    <option value="deepMale">重低音ボイス (Deep Male / 超低域)</option>
+                    <option value="female" selected>女性ボイス (Female / 声帯開口0.55・声道基準1.0・基音220Hz)</option>
+                    <option value="male">男性ボイス (Male / 長声道0.85・締まり声帯0.42・基音120Hz)</option>
+                    <option value="neutral">中性ボイス (Neutral / 基音170Hz)</option>
+                    <option value="child">子供ボイス (Child / 短声道1.18・息漏れ声・基音300Hz)</option>
+                    <option value="deepMale">重低音ボイス (Deep Male / 超長声道0.80・急峻閉鎖・基音95Hz)</option>
                 </select>
             </div>
 

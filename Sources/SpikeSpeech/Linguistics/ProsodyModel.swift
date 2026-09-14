@@ -190,15 +190,18 @@ public final class ProsodyModel: Sendable {
     }
 
     /// 各フレームの目標 F0 周波数 [Hz] および有声フラグ系列を生成する（生体ゆらぎインスタンス共有版）
-    /// なぜ生体ゆらぎインスタンスを共有するか:
-    /// テンポゆらぎ、ピッチジッター、シマーが同一の生体ゆらぎ（1/f ピンクノイズ）系列を
-    /// 継続して消費することで、呼気圧・声帯振動の生理学的連動性を維持するため。
+    /// なぜ baseF0 を引数で受け取れるようにするか:
+    /// 話者の絶対基音周波数は声質（VoiceProfile）に属し、言語処理・アクセント句の相対抑揚（句成分・アクセント成分・文降下・マイクロプロソディ・ジッター）
+    /// とは直交するため、推論時に話者の絶対基音を直接注入して自然な F0 輪郭を生成できるようにするため。
     public func generateF0Contour(
         phrases: [AccentPhrase],
         vocabulary: PhonemeVocabulary,
+        baseF0: Float = 220.0,
         fluctuation: inout BiologicalFluctuation,
         applyFluctuation: Bool = true
     ) -> (f0Contour: [Float], voicedFlags: [Float], totalFrames: Int) {
+        let effectiveBaseF0 = baseF0
+
         var f0List: [Float] = []
         var voicedList: [Float] = []
 
@@ -316,7 +319,7 @@ public final class ProsodyModel: Sendable {
                             // なぜ有声フレーム内のみで Jitter を算出するか:
                             // 無声フレームで疑似乱数ジェネレータを進めると、無声子音の長さに応じて
                             // 後続母音のピッチ位相が不自然にずれる現象を防止するため。
-                            let rawF0 = baseF0 * expf(phraseComp + accentComp) * declination * intrinsicScale * microprosodyScale
+                            let rawF0 = effectiveBaseF0 * expf(phraseComp + accentComp) * declination * intrinsicScale * microprosodyScale
                             var f0 = rawF0
                             if applyFluctuation {
                                 f0 = fluctuation.computePitchJitter(baseF0: rawF0)
@@ -329,12 +332,16 @@ public final class ProsodyModel: Sendable {
                                 f0 = f0 * onsetScale
                             }
 
-                            // 60Hz〜480Hz の適正有声帯域内に確実にクランプ
-                            if f0 < 60.0 {
-                                f0 = 60.0
+                            // 話者の絶対基音に応じた生理学的適正有声帯域内に確実にクランプ
+                            // なぜ固定 60〜480Hz ではなく話者基音連動にするか:
+                            // 重低音話者 (95Hz) の低音や子供話者 (300Hz) の高音域が不自然に飽和クリップされるのを防ぐため。
+                            let minF0 = max(45.0, effectiveBaseF0 * 0.45)
+                            let maxF0 = min(600.0, effectiveBaseF0 * 2.20)
+                            if f0 < minF0 {
+                                f0 = minF0
                             }
-                            if 480.0 < f0 {
-                                f0 = 480.0
+                            if maxF0 < f0 {
+                                f0 = maxF0
                             }
 
                             f0List.append(f0)

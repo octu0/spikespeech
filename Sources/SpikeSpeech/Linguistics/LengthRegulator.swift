@@ -224,6 +224,7 @@ public final class LengthRegulator: Sendable {
         prosodyModel: ProsodyModel,
         vocabulary: PhonemeVocabulary,
         speedFactor: Float = 1.0,
+        baseF0: Float = 220.0,
         applyFluctuation: Bool = true
     ) -> LinguisticFeatures {
         if text.isEmpty {
@@ -346,13 +347,13 @@ public final class LengthRegulator: Sendable {
         }
 
         // 7. F0 輪郭パラメータの生成
-        // なぜ bioFluctuation を渡すか:
-        // テンポゆらぎを算出した生体ゆらぎインスタンスの状態を継続し、同一の 1/f 系列から
-        // ピッチジッターを算出することで、生理学的な呼気圧・声帯運動の連動性を維持するため。
-        // また applyFluctuation フラグを渡すことで、学習データ生成時にジッター計算を完全に停止する。
+        // なぜ baseF0 を渡すか:
+        // 話者の絶対基音周波数を直接注入し、句成分・アクセント成分・生体ゆらぎが話者基音にスケールされた
+        // 物理的に正しい絶対 F0 輪郭を算出するため。
         let (f0Contour, voicedFlags, totalFrames) = prosodyModel.generateF0Contour(
             phrases: phrases,
             vocabulary: vocabulary,
+            baseF0: baseF0,
             fluctuation: &bioFluctuation,
             applyFluctuation: applyFluctuation
         )

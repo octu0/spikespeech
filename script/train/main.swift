@@ -366,6 +366,7 @@ func main() {
             prosodyModel: engine.prosodyModel,
             vocabulary: engine.vocabulary,
             speedFactor: 1.0,
+            baseF0: voiceProfile.baseF0,
             applyFluctuation: false
         )
 
@@ -480,9 +481,7 @@ func main() {
             )
 
             alignedFeatures = engine.encodeLinguisticFeatures(
-                features: alignedLinguistic,
-                voice: voiceProfile,
-                pitchScale: 1.0
+                features: alignedLinguistic
             )
         }
 
@@ -512,12 +511,18 @@ func main() {
             pIdx += 1
         }
 
+        // なぜコーパス話者基準（成人女性基準）の Prior を固定して引くか:
+        // JSUT は成人女性単一話者の音声コーパスである。
+        // 訓練目標は「女性実音声 Mel − 女性基準 Prior」として純粋な音韻残差を学習させる必要があり、
+        // 異なる話者 Prior を引くと SNN が声道幾何差（VTLN）を打ち消す有害残差を学習して声道層と干渉するため。
+        let corpusTract = VocalTract(lengthScale: 1.0, bandwidthScale: 1.0)
+        let activePrior = engine.prior(for: corpusTract)
         var t = 0
         while t < finalCount {
             let phoneId = framePhoneIds[t]
             var prior = [Float](repeating: 0.0, count: AudioConfig.melChannels)
             prior.withUnsafeMutableBufferPointer { dst in
-                engine.acousticPrior.copyPriorMel(phoneId: phoneId, dst: dst.baseAddress!)
+                activePrior.copyPriorMel(phoneId: phoneId, dst: dst.baseAddress!)
             }
 
             let melChannels = min(targetMel[t].count, AudioConfig.melChannels)

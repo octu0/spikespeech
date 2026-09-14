@@ -186,10 +186,10 @@ final class FluctuationTests: XCTestCase {
         XCTAssertTrue(variance <= 0.65, "分散が過大にならないこと (実測分散: \(variance))")
     }
 
-    /// ΔF0 の話者スケーリング対称性と無声マスクの検証
+    /// ΔF0 のフレーム間変化率と無声マスクの検証
     /// なぜ検証するか:
-    /// 男性（pitchScale=0.65, pitchShift=-40）や子供（1.35, +50）プロファイルにおいて、
-    /// 前フレームとの差分が生 Hz とスケール済み Hz で食い違って ±1.0 に飽和するバグが解消されたかを証明するため。
+    /// 前フレームとの差分が有声無声境界で正しくマスクされ、有声継続区間で一定ピッチ時に
+    /// ±1.0 に飽和せず 0.0 に安定することを証明するため。
     func testDeltaF0ScaleSymmetry() {
         let engine = SpikeSpeechEngine()
 
@@ -209,36 +209,26 @@ final class FluctuationTests: XCTestCase {
             totalFrames: 5
         )
 
-        // 男性プロファイル（低ピッチ化）
-        let maleVoice = VoiceProfile(
-            name: "test_male",
-            pitchScale: 0.65,
-            pitchShift: -40.0,
-            formantScale: 0.90,
-            energyScale: 1.0,
-            speakerEmbedding: [Float](repeating: 0.0, count: 16)
-        )
+        let encoded = engine.encodeLinguisticFeatures(features: ling)
 
-        let encodedMale = engine.encodeLinguisticFeatures(features: ling, voice: maleVoice)
-
-        // フレーム 0: 無声 -> deltaF0 = 0.0
-        XCTAssertEqual(encodedMale[0][85], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
+        // フレーム 0: 無声 -> deltaF0 (ch67) = 0.0
+        XCTAssertEqual(encoded[0][67], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
 
         // フレーム 1: 無声から有声への立ち上がり -> 無声境界マスクにより deltaF0 = 0.0
-        XCTAssertEqual(encodedMale[1][85], 0.0, accuracy: 1e-4, "有声開始フレームでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[1][67], 0.0, accuracy: 1e-4, "有声開始フレームでの deltaF0 は 0.0 であること")
 
         // フレーム 2: 有声継続かつ F0 一定 (200Hz) -> 差分 0.0（飽和バグ解消の証明）
-        XCTAssertEqual(encodedMale[2][85], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[2][67], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
 
         // フレーム 3: 有声継続かつ F0 一定 (200Hz) -> 差分 0.0
-        XCTAssertEqual(encodedMale[3][85], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[3][67], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
 
         // フレーム 4: 有声から無声への移行 -> deltaF0 = 0.0
-        XCTAssertEqual(encodedMale[4][85], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[4][67], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
 
-        // ch86 の直交特徴量（無声度 = 1.0 - voiced）の検証
-        XCTAssertEqual(encodedMale[0][86], 1.0, accuracy: 1e-4, "無声フレームの ch86 は 1.0 であること")
-        XCTAssertEqual(encodedMale[2][86], 0.0, accuracy: 1e-4, "有声フレームの ch86 は 0.0 であること")
+        // ch65 の直交特徴量（無声度 = 1.0 - voiced）の検証
+        XCTAssertEqual(encoded[0][65], 1.0, accuracy: 1e-4, "無声フレームの ch65 は 1.0 であること")
+        XCTAssertEqual(encoded[2][65], 0.0, accuracy: 1e-4, "有声フレームの ch65 は 0.0 であること")
     }
 
     /// 音素ヘルパー hy (32) の無声摩擦音・無声子音分類の検証

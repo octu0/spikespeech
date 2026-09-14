@@ -38,7 +38,7 @@ final class AcousticDiagnosticTests: XCTestCase {
         print("[Diagnostic] phoneIds: \(linguisticFeatures.phoneIds)")
         print("[Diagnostic] durations: \(linguisticFeatures.durations)")
 
-        let inputSeq = engine.encodeLinguisticFeatures(features: linguisticFeatures, voice: .female)
+        let inputSeq = engine.encodeLinguisticFeatures(features: linguisticFeatures)
         print("[Diagnostic] inputSeq frames: \(inputSeq.count), inDim: \(inputSeq.first?.count ?? 0)")
         let phone0Dur = Int(linguisticFeatures.durations[0])
         let phone1Idx = min(inputSeq.count - 1, phone0Dur + 1)

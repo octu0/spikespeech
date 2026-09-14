@@ -20,6 +20,18 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     /// SNN音響モデルが生成した残差Mel特徴量の加算合成比率
     public var residualScale: Float
 
+    /// 声道長パラメータごとの PhonemeAcousticPrior キャッシュ
+    private var priorCache: [Int: PhonemeAcousticPrior] = [:]
+    private let priorLock = NSLock()
+
+    /// 声道幾何パラメータから一意かつ決定論的な整数キャッシュキーを生成する
+    @inline(__always)
+    private static func tractCacheKey(for tract: VocalTract) -> Int {
+        let ls = Int(roundf(tract.lengthScale * 1000.0))
+        let bw = Int(roundf(tract.bandwidthScale * 1000.0))
+        return (ls * 10000) + bw
+    }
+
     /// 初期化
     public init(
         weights: SpikingNetworkWeights = SpikingNetworkWeights.randomWeights(),
@@ -37,11 +49,16 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         self.vocabulary = PhonemeVocabulary()
         self.lengthRegulator = LengthRegulator(hiddenDimension: weights.inputDim)
         self.decoder = SpikingAcousticDecoder(weights: weights)
-        self.acousticPrior = PhonemeAcousticPrior(
+        let defaultTract = VocalTract(lengthScale: 1.0, bandwidthScale: 1.0)
+        let defaultPrior = PhonemeAcousticPrior(
             melChannels: AudioConfig.melChannels,
             vocabSize: 64,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            tract: defaultTract
         )
+        self.acousticPrior = defaultPrior
+        self.priorCache[Self.tractCacheKey(for: defaultTract)] = defaultPrior
+
         self.melToLPC = MelToLPC(
             melChannels: AudioConfig.melChannels,
             fftBins: 257,
@@ -61,12 +78,39 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         )
     }
 
+    /// 声道伝達特性（VocalTract）に応じた PhonemeAcousticPrior を取得または生成する
+    ///
+    /// なぜキャッシュするか:
+    /// 音声合成ごとに同一話者の Prior テーブル（4096 Float）を再計算するオーバーヘッドを排除し、
+    /// リアルタイム即時推論時のゼロアロケーションと O(1) 参照を実現するため。
+    public func prior(for tract: VocalTract) -> PhonemeAcousticPrior {
+        let key = Self.tractCacheKey(for: tract)
+        priorLock.lock()
+        defer { priorLock.unlock() }
+        switch priorCache[key] {
+        case .some(let p):
+            return p
+        case .none:
+            let p = PhonemeAcousticPrior(
+                melChannels: AudioConfig.melChannels,
+                vocabSize: 64,
+                sampleRate: sampleRate,
+                tract: tract
+            )
+            priorCache[key] = p
+            return p
+        }
+    }
+
     /// 言語特徴量から SNN 入力フレーム特徴量系列を生成する。
-    /// 離散音素シンボルだけでなく、連続的な調音進行と声帯振動パラメータを直接膜電位へ注入し、自然な音響変化を促す。
+    ///
+    /// なぜ未学習の話者埋め込み（ch68-83）を排除し直交特徴量のみにするか:
+    /// 単一話者学習において手書き話者埋め込みは単なる定数直流バイアスとして吸収され、
+    /// 推論時に他話者の未学習ベクトルを注入すると膜電位をランダムに歪める有害電流となるため。
+    /// 話者同一性は Prior（Filter）と Vocoder（Source）で物理的に制御し、
+    /// SNN は音素・有声度・F0・進行度・エネルギーの純粋な音響残差に専念させる。
     public func encodeLinguisticFeatures(
-        features: LinguisticFeatures,
-        voice: VoiceProfile = .female,
-        pitchScale: Float = 1.0
+        features: LinguisticFeatures
     ) -> [[Float]] {
         let totalFrames = features.totalFrames
         if totalFrames <= 0 {
@@ -100,18 +144,14 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 if frameIdx < features.f0Contour.count {
                     rawF0 = features.f0Contour[frameIdx]
                 }
-                var baseF0 = rawF0 * voice.pitchScale * pitchScale
                 var voiced: Float = 0.0
                 if frameIdx < features.voicedFlags.count {
                     voiced = features.voicedFlags[frameIdx]
                 }
-                if 0.5 <= voiced {
-                    baseF0 += voice.pitchShift
+                var f0 = rawF0
+                if f0 < 0.0 {
+                    f0 = 0.0
                 }
-                if baseF0 < 0.0 {
-                    baseF0 = 0.0
-                }
-                let f0 = baseF0
 
                 // 1. 音素 ID の One-Hot 符号化
                 // 背景電流に埋もれず膜電位の閾値を確実に突破できるよう、音素発火電流を注入する
@@ -124,12 +164,15 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
 
                 // 2. 韻律および音響生理学的特徴の付加
-                // 音素発火電流 (3.0) に対して SNN が有意にピッチ・有声度・エネルギーを学習できるよう、
-                // 適切なスケール (1.0〜1.5) で膜電位駆動電流を供給する
                 if 64 < inDim {
                     seq[frameIdx][64] = voiced * 1.0
                 }
                 if 65 < inDim {
+                    // ch64 の有声度に対する直交抑制電流として機能させる無声度 (1.0 - voiced)
+                    let unvoiced = 1.0 - voiced
+                    seq[frameIdx][65] = unvoiced * 1.0
+                }
+                if 66 < inDim {
                     var normF0 = f0 / 500.0
                     if normF0 < 0.0 {
                         normF0 = 0.0
@@ -138,48 +181,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                         normF0 = 1.0
                     }
                     // F0 ピッチ周波数を 500Hz 基準で [0.0, 1.0] に安全正規化して供給
-                    seq[frameIdx][65] = normF0 * 1.0
-                }
-                if 66 < inDim {
-                    let progress = Float(f) / Float(max(1, duration))
-                    seq[frameIdx][66] = progress * 1.0
+                    seq[frameIdx][66] = normF0 * 1.0
                 }
                 if 67 < inDim {
-                    let rate = 10.0 / Float(max(1, duration))
-                    seq[frameIdx][67] = min(1.0, rate) * 1.0
-                }
-
-                // 3. 話者埋め込み特徴量（声質ベクトル）の注入
-                // 学習データと推論で一貫した話者空間表現を維持し、声質の固有表現を正確にデコーダーへ伝達する
-                let embStart = 68
-                let embEnd = min(inDim, 84)
-                let embVector = voice.speakerEmbedding
-                var embIdx = embStart
-                while embIdx < embEnd {
-                    let vIdx = embIdx - embStart
-                    if vIdx < embVector.count {
-                        seq[frameIdx][embIdx] = embVector[vIdx]
-                    }
-                    embIdx += 1
-                }
-
-                // 4. 音響ダイナミクス特徴量（実測短時間エネルギー & ピッチ変化率 ΔF0 & 無声度コンテキスト）
-                // 静的な固定 sin 波ではなく、声帯・呼気のリアルな物理運動と動的抑揚を SNN に直接供給する
-                if 84 < inDim {
-                    var engVal: Float = 0.50
-                    if frameIdx < features.energyContour.count {
-                        engVal = features.energyContour[frameIdx]
-                    }
-                    if 1.0 < engVal {
-                        engVal = 1.0
-                    }
-                    seq[frameIdx][84] = engVal * 1.0
-                }
-                if 85 < inDim {
-                    // なぜ前フレーム F0 にも同一の話者スケール・シフトを適用するか:
-                    // 生 Hz とスケール済み Hz の引き算を行うと、男性や子供プロファイルで
-                    // ピッチ変化率ではなく定数オフセット（±1.0 飽和）が注入されてしまうバグを防止するため。
-                    // また無声フレームや無声・有声境界ではピッチ変化率は未定義であるため 0.0 にマスクする。
+                    // なぜ前フレーム F0 との差分を 50Hz スケールでクリップするか:
+                    // 急峻なピッチ変動（抑揚アクセント境界）を SNN に直接知らせるため。
                     var deltaF0: Float = 0.0
                     if 0.5 <= voiced && 0 < frameIdx {
                         let prevIdx = frameIdx - 1
@@ -189,12 +195,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                         }
                         if 0.5 <= prevVoiced && prevIdx < features.f0Contour.count {
                             let rawPrevF0 = features.f0Contour[prevIdx]
-                            var basePrevF0 = rawPrevF0 * voice.pitchScale * pitchScale
-                            basePrevF0 += voice.pitchShift
-                            if basePrevF0 < 0.0 {
-                                basePrevF0 = 0.0
+                            var prevF0 = rawPrevF0
+                            if prevF0 < 0.0 {
+                                prevF0 = 0.0
                             }
-                            deltaF0 = (f0 - basePrevF0) / 50.0
+                            deltaF0 = (f0 - prevF0) / 50.0
                         }
                     }
                     var clampedDelta = deltaF0
@@ -204,14 +209,25 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1.0 < clampedDelta {
                         clampedDelta = 1.0
                     }
-                    seq[frameIdx][85] = clampedDelta * 1.0
+                    seq[frameIdx][67] = clampedDelta * 1.0
                 }
-                if 86 < inDim {
-                    // なぜ ch64 の有声度に対して無声度 (1.0 - voiced) を割り当てるか:
-                    // 有声度の二重注入を排除し、声帯振動停止・無声子音コンテキストを表す
-                    // 直交的抑制電流として機能させるため。
-                    let unvoiced = 1.0 - voiced
-                    seq[frameIdx][86] = unvoiced * 1.0
+                if 68 < inDim {
+                    let progress = Float(f) / Float(max(1, duration))
+                    seq[frameIdx][68] = progress * 1.0
+                }
+                if 69 < inDim {
+                    let rate = 10.0 / Float(max(1, duration))
+                    seq[frameIdx][69] = min(1.0, rate) * 1.0
+                }
+                if 70 < inDim {
+                    var engVal: Float = 0.50
+                    if frameIdx < features.energyContour.count {
+                        engVal = features.energyContour[frameIdx]
+                    }
+                    if 1.0 < engVal {
+                        engVal = 1.0
+                    }
+                    seq[frameIdx][70] = engVal * 1.0
                 }
 
                 f += 1
@@ -246,14 +262,26 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         if 10.0 < safeSpeed {
             safeSpeed = 10.0
         }
+        var safePitch = pitch
+        if safePitch.isFinite != true {
+            safePitch = 1.0
+        }
+        if safePitch < 0.20 {
+            safePitch = 0.20
+        }
+        if 5.00 < safePitch {
+            safePitch = 5.00
+        }
 
-        // 1. テキスト正規化および言語韻律処理
+        // 1. テキスト正規化および言語韻律処理（話者基音 baseF0 にユーザー指定 pitch を一元反映）
+        let effectiveBaseF0 = voice.baseF0 * safePitch
         let linguisticFeatures = lengthRegulator.processText(
             text: text,
             normalizer: normalizer,
             prosodyModel: prosodyModel,
             vocabulary: vocabulary,
-            speedFactor: safeSpeed
+            speedFactor: safeSpeed,
+            baseF0: effectiveBaseF0
         )
 
         let totalFrames = linguisticFeatures.totalFrames
@@ -261,8 +289,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             return []
         }
 
-        // 2. 言語特徴量のフレーム系列展開 (話者プロファイルを注入)
-        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures, voice: voice, pitchScale: pitch)
+        // 2. 言語特徴量のフレーム系列展開（F0 二重補正を完全撤廃）
+        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures)
 
         // 3. 多層 SNN 音響デコーダー推論
         let acousticSeq = decoder.decodeSequence(
@@ -271,7 +299,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         )
 
         // 各フレームに対応する音素 ID、音素内オフセット、および音素継続フレーム数の時間軸展開マップの構築
-        // 音素ごとの標準フォルマント事前アンカー参照および調音音声学に基づく子音閉鎖区間の厳密制御に用いる
         var framePhoneIds = [Int](repeating: 1, count: totalFrames)
         var framePhoneOffsets = [Int](repeating: 0, count: totalFrames)
         var framePhoneDurations = [Int](repeating: 1, count: totalFrames)
@@ -295,7 +322,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             pIdx += 1
         }
 
-        // 4. SNN 出力 Mel 特徴量から LPC 係数およびゲインの復元
+        // 4. 話者声道特性（VocalTract）に基づく真の VTLN Prior と SNN 残差の統合
+        let activePrior = prior(for: voice.tract)
         let melChannels = melToLPC.melChannels
         var frames: [AcousticFrame] = []
         frames.reserveCapacity(totalFrames)
@@ -316,8 +344,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
 
             // 音素境界における自然な調音結合 (Coarticulation) クロスフェードの算出
-            // 人間の調音器官（舌・唇・声帯）の物理的運動慣性を模倣し、
-            // 音素が切り替わる境界前後（約 20ms）において先行・後続音素の共鳴スペクトルを滑らかに補間する
             let pId = framePhoneIds[t]
             let prevPId: Int
             if 0 < t {
@@ -335,12 +361,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
             var currPrior = [Float](repeating: 0.0, count: melChannels)
             currPrior.withUnsafeMutableBufferPointer { pDst in
-                acousticPrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
             }
 
             var blendedPrior = currPrior
             if prevPId != pId {
-                // 先行音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
                 var canBlendPrev = true
                 if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
                     canBlendPrev = false
@@ -352,7 +377,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 if canBlendPrev {
                     var prevPrior = [Float](repeating: 0.0, count: melChannels)
                     prevPrior.withUnsafeMutableBufferPointer { pDst in
-                        acousticPrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                        activePrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
                     }
                     var c = 0
                     while c < melChannels {
@@ -362,7 +387,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
             }
             if nextPId != pId {
-                // 後続音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
                 var canBlendNext = true
                 if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
                     canBlendNext = false
@@ -374,7 +398,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 if canBlendNext {
                     var nextPrior = [Float](repeating: 0.0, count: melChannels)
                     nextPrior.withUnsafeMutableBufferPointer { pDst in
-                        acousticPrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                        activePrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
                     }
                     var c = 0
                     while c < melChannels {
@@ -441,28 +465,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             let pId = framePhoneIds[t]
             let melVec = smoothedMelSeq[t]
 
-            // フォルマント周波数スケーリング（声道の伸縮）
-            // 男性の場合は声道が長く共鳴周波数が低いため、Mel スペクトログラムの周波数軸を低域へシフトする
-            var lpcInputMel = melVec
-            if 1e-4 < abs(voice.formantScale - 1.0) {
-                let invScale = 1.0 / voice.formantScale
-                var c = 0
-                while c < melChannels {
-                    let srcPos = Float(c) * invScale
-                    let i0 = Int(srcPos)
-                    let i1 = min(melChannels - 1, i0 + 1)
-                    let frac = srcPos - Float(i0)
-                    if i0 < melChannels {
-                        lpcInputMel[c] = (1.0 - frac) * melVec[i0] + (frac * melVec[i1])
-                    } else {
-                        lpcInputMel[c] = melVec[melChannels - 1]
-                    }
-                    c += 1
-                }
-            }
-
             var lpcCoeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
-            let baseGain = melToLPC.convert(mel: lpcInputMel, isLogMel: true, outCoeffs: &lpcCoeffs)
+            let baseGain = melToLPC.convert(mel: melVec, isLogMel: true, outCoeffs: &lpcCoeffs)
             let gain = baseGain * voice.energyScale
             // 調音生理学（音声学）に基づく子音エネルギーと閉鎖区間の厳密制御
             // 人間の調音器官（舌・口蓋・唇）の物理的作用を模倣し、無声破裂音の閉鎖期（前半）での
@@ -523,15 +527,12 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 effectiveGain = bioFluctuation.computeAmplitudeShimmer(baseGain: effectiveGain)
             }
 
-            var baseF0 = linguisticFeatures.f0Contour[t] * voice.pitchScale * pitch
+            // 話者の絶対基音に基づく F0 周波数の直接適用（二重乗算を撤廃）
+            var f0: Float = 0.0
+            if t < linguisticFeatures.f0Contour.count {
+                f0 = max(0.0, linguisticFeatures.f0Contour[t])
+            }
             let voiced = linguisticFeatures.voicedFlags[t]
-            if 0.5 <= voiced {
-                baseF0 += voice.pitchShift
-            }
-            if baseF0 < 0.0 {
-                baseF0 = 0.0
-            }
-            let f0 = baseF0
 
             frames.append(
                 AcousticFrame(
@@ -544,8 +545,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             t += 1
         }
 
-        // 5. Source-Filter LPC ボコーダーによる波形合成
+        // 5. Source-Filter LPC ボコーダーによる波形合成（話者声門パラメータを動的適用）
         vocoder.reset()
+        vocoder.apply(glottal: voice.glottal)
         var rawSamples = vocoder.synthesize(frames: frames)
 
         // 6. 無音・休止・促音区間（<sil>, <pau>, <pad>, Q）におけるクリック防止フェードアウトと完全ゼロミュート
@@ -725,12 +727,25 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             safeSpeed = 10.0
         }
 
+        var safePitch = pitch
+        if safePitch.isFinite != true {
+            safePitch = 1.0
+        }
+        if safePitch < 0.20 {
+            safePitch = 0.20
+        }
+        if 5.00 < safePitch {
+            safePitch = 5.00
+        }
+
+        let effectiveBaseF0 = voice.baseF0 * safePitch
         let linguisticFeatures = lengthRegulator.processText(
             text: text,
             normalizer: normalizer,
             prosodyModel: prosodyModel,
             vocabulary: vocabulary,
-            speedFactor: safeSpeed
+            speedFactor: safeSpeed,
+            baseF0: effectiveBaseF0
         )
 
         let totalFrames = linguisticFeatures.totalFrames
@@ -738,15 +753,17 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             return []
         }
 
-        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures, voice: voice, pitchScale: pitch)
+        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures)
         let acousticSeq = decoder.decodeSequence(
             featuresSeq: inputSeq,
             workspace: workspace
         )
 
+        let activePrior = prior(for: voice.tract)
         let melChannels = melToLPC.melChannels
         let frameSize = AudioConfig.hopSize
         vocoder.reset()
+        vocoder.apply(glottal: voice.glottal)
 
         // 各フレームに対応する音素 ID、音素内オフセット、および音素継続フレーム数の時間軸展開マップの構築
         var framePhoneIds = [Int](repeating: 1, count: totalFrames)
@@ -804,7 +821,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
             var currPrior = [Float](repeating: 0.0, count: melChannels)
             currPrior.withUnsafeMutableBufferPointer { pDst in
-                acousticPrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
             }
 
             var blendedPrior = currPrior
@@ -820,7 +837,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 if canBlendPrev {
                     var prevPrior = [Float](repeating: 0.0, count: melChannels)
                     prevPrior.withUnsafeMutableBufferPointer { pDst in
-                        acousticPrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
+                        activePrior.copyPriorMel(phoneId: prevPId, dst: pDst.baseAddress!)
                     }
                     var c = 0
                     while c < melChannels {
@@ -841,7 +858,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 if canBlendNext {
                     var nextPrior = [Float](repeating: 0.0, count: melChannels)
                     nextPrior.withUnsafeMutableBufferPointer { pDst in
-                        acousticPrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
+                        activePrior.copyPriorMel(phoneId: nextPId, dst: pDst.baseAddress!)
                     }
                     var c = 0
                     while c < melChannels {
@@ -913,26 +930,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             let pId = framePhoneIds[t]
             let melVec = smoothedMelSeq[t]
 
-            // フォルマント周波数スケーリング（声道の伸縮）
-            var lpcInputMel = melVec
-            if 1e-4 < abs(voice.formantScale - 1.0) {
-                let invScale = 1.0 / voice.formantScale
-                var c = 0
-                while c < melChannels {
-                    let srcPos = Float(c) * invScale
-                    let i0 = Int(srcPos)
-                    let i1 = min(melChannels - 1, i0 + 1)
-                    let frac = srcPos - Float(i0)
-                    if i0 < melChannels {
-                        lpcInputMel[c] = (1.0 - frac) * melVec[i0] + (frac * melVec[i1])
-                    } else {
-                        lpcInputMel[c] = melVec[melChannels - 1]
-                    }
-                    c += 1
-                }
-            }
-
-            let baseGain = melToLPC.convert(mel: lpcInputMel, isLogMel: true, outCoeffs: &lpcCoeffs)
+            let baseGain = melToLPC.convert(mel: melVec, isLogMel: true, outCoeffs: &lpcCoeffs)
             let gain = baseGain * voice.energyScale
 
             // 調音生理学（音声学）に基づく子音エネルギーと閉鎖区間の厳密制御
@@ -983,15 +981,12 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 effectiveGain = bioFluctuation.computeAmplitudeShimmer(baseGain: effectiveGain)
             }
 
-            var baseF0 = linguisticFeatures.f0Contour[t] * voice.pitchScale * pitch
+            // 話者の絶対基音に基づく F0 周波数の直接適用（二重乗算を撤廃）
+            var f0: Float = 0.0
+            if t < linguisticFeatures.f0Contour.count {
+                f0 = max(0.0, linguisticFeatures.f0Contour[t])
+            }
             let voiced = linguisticFeatures.voicedFlags[t]
-            if 0.5 <= voiced {
-                baseF0 += voice.pitchShift
-            }
-            if baseF0 < 0.0 {
-                baseF0 = 0.0
-            }
-            let f0 = baseF0
 
             let acousticFrame = AcousticFrame(
                 lpcCoefficients: lpcCoeffs,

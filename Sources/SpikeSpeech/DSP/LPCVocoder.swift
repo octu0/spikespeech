@@ -33,6 +33,7 @@ public final class LPCVocoder: @unchecked Sendable {
     public let frameSize: Int       // 160サンプル
     public let lpcOrder: Int        // 16
     public let deEmphasisCoeff: Float // 0.97
+    public private(set) var glottal: GlottalSource
 
     private let rosenbergPulse: RosenbergPulse
     private var rngState: UInt64 = 88172645463325252
@@ -46,6 +47,8 @@ public final class LPCVocoder: @unchecked Sendable {
     private var deEmphasisState: Float = 0.0
     /// 唇放射微分のための直前声門波サンプル
     private var prevVoicedPulse: Float = 0.0
+    /// スペクトル傾斜フィルタ用直前パルスサンプル
+    private var prevTiltedPulse: Float = 0.0
     /// 無声音摩擦気流の高域放射整形（低域濁りヒスノイズ排除）のための直前乱数サンプル
     private var prevUnvoicedNoise: Float = 0.0
     /// フレーム間 F0 連続補間のための直前周波数
@@ -61,17 +64,28 @@ public final class LPCVocoder: @unchecked Sendable {
         sampleRate: Float = 16000.0,
         frameSize: Int = AudioConfig.hopSize, // 160
         lpcOrder: Int = AudioConfig.lpcOrder, // 16
-        deEmphasisCoeff: Float = 0.95
+        deEmphasisCoeff: Float = 0.95,
+        glottal: GlottalSource = GlottalSource()
     ) {
         self.sampleRate = sampleRate
         self.frameSize = frameSize
         self.lpcOrder = lpcOrder
         self.deEmphasisCoeff = deEmphasisCoeff
+        self.glottal = glottal
 
         self.rosenbergPulse = RosenbergPulse(sampleRate: sampleRate)
+        self.rosenbergPulse.apply(glottal: glottal)
         self.prevLpcCoeffs = [Float](repeating: 0.0, count: lpcOrder)
         self.currLpcCoeffs = [Float](repeating: 0.0, count: lpcOrder)
         self.filterMemory = [Float](repeating: 0.0, count: lpcOrder)
+    }
+
+    /// 声帯生理パラメータ（GlottalSource）の動的適用
+    ///
+    /// 声門パルス開口率・閉鎖形状を更新し、息漏れやスペクトル傾斜を即時反映する。
+    public func apply(glottal: GlottalSource) {
+        self.glottal = glottal
+        rosenbergPulse.apply(glottal: glottal)
     }
 
     /// ボコーダーの内部状態をリセット
@@ -93,6 +107,7 @@ public final class LPCVocoder: @unchecked Sendable {
         currGain = 0.0
         deEmphasisState = 0.0
         prevVoicedPulse = 0.0
+        prevTiltedPulse = 0.0
         prevUnvoicedNoise = 0.0
         prevPitchF0 = 0.0
         prevVoicedRatio = 0.0
@@ -314,15 +329,47 @@ public final class LPCVocoder: @unchecked Sendable {
             let radiatedPulse = rawPulse - (lipRadiationCoeff * prevVoicedPulse)
             prevVoicedPulse = rawPulse
 
-            // 全極共鳴フィルタのQ値増幅による過大振幅とリミッター飽和を防ぐため、励起信号を適正レベルに調整する
-            let excitationScale: Float = 0.85
-            let voicedExcitation = radiatedPulse * excitationScale
+            // スペクトル傾斜（Spectral Tilt）の物理制御
+            // 負の値（女性や小児の丸い声色）: 1極低域通過フィルタ（リーク積分器）で高域倍音を減衰
+            // 正の値（男性や重低音の引き締まったエッジ感）: 1極高域強調フィルタで急峻な声帯閉鎖の高調波を増強
+            let tiltedPulse: Float
+            let tilt = glottal.spectralTilt
+            if tilt < 0.0 {
+                var tiltAlpha = -tilt * 0.05
+                if 0.35 < tiltAlpha {
+                    tiltAlpha = 0.35
+                }
+                tiltedPulse = ((1.0 - tiltAlpha) * radiatedPulse) + (tiltAlpha * prevTiltedPulse)
+            } else {
+                if 0.0 < tilt {
+                    var k = tilt * 0.15
+                    if 0.40 < k {
+                        k = 0.40
+                    }
+                    tiltedPulse = radiatedPulse + (k * (radiatedPulse - prevTiltedPulse))
+                } else {
+                    tiltedPulse = radiatedPulse
+                }
+            }
+            prevTiltedPulse = tiltedPulse
+
             // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)。
             // 無声励起が過大になると母音のフォルマント共鳴を妨げ耳障りなホワイトノイズが知覚されるため、自然な子音アタックが得られる0.18に調整する。
             let rawNoise = nextRandomFloat()
             let shapedNoise = rawNoise - (0.95 * prevUnvoicedNoise)
             prevUnvoicedNoise = rawNoise
             let unvoicedExcitation = shapedNoise * 0.18
+
+            // 有声励起への高周波息漏れ気流ノイズ（Aspiration）の動的混合
+            // 無声子音用の微弱スケール（0.18）に依存せず、有声パルス（振幅~0.85）と聴覚的に釣り合うゲイン（0.40）で
+            // 高域通過整形ノイズを混合し、子供や女性の息の多い声（Breathy voice）を声帯励起レベルで明瞭に再現する。
+            let asp = glottal.aspirationMix
+            let excitationScale: Float = 0.85
+            let voicedPulsePart = (1.0 - (asp * 0.5)) * (tiltedPulse * excitationScale)
+            let aspirationNoise = shapedNoise * 0.40
+            let voicedAspPart = asp * aspirationNoise
+            let voicedExcitation = voicedPulsePart + voicedAspPart
+
             let excitation = (sampleVoiced * voicedExcitation) + (sampleUnvoiced * unvoicedExcitation)
             let inputSignal = excitation * g
 
@@ -471,15 +518,47 @@ public final class LPCVocoder: @unchecked Sendable {
             let radiatedPulse = rawPulse - (lipRadiationCoeff * prevVoicedPulse)
             prevVoicedPulse = rawPulse
 
-            // 全極共鳴フィルタのQ値増幅による過大振幅とリミッター飽和を防ぐため、励起信号を適正レベルに調整する
-            let excitationScale: Float = 0.85
-            let voicedExcitation = radiatedPulse * excitationScale
+            // スペクトル傾斜（Spectral Tilt）の物理制御
+            // 負の値（女性や小児の丸い声色）: 1極低域通過フィルタ（リーク積分器）で高域倍音を減衰
+            // 正の値（男性や重低音の引き締まったエッジ感）: 1極高域強調フィルタで急峻な声帯閉鎖の高調波を増強
+            let tiltedPulse: Float
+            let tilt = glottal.spectralTilt
+            if tilt < 0.0 {
+                var tiltAlpha = -tilt * 0.05
+                if 0.35 < tiltAlpha {
+                    tiltAlpha = 0.35
+                }
+                tiltedPulse = ((1.0 - tiltAlpha) * radiatedPulse) + (tiltAlpha * prevTiltedPulse)
+            } else {
+                if 0.0 < tilt {
+                    var k = tilt * 0.15
+                    if 0.40 < k {
+                        k = 0.40
+                    }
+                    tiltedPulse = radiatedPulse + (k * (radiatedPulse - prevTiltedPulse))
+                } else {
+                    tiltedPulse = radiatedPulse
+                }
+            }
+            prevTiltedPulse = tiltedPulse
+
             // 無声子音区間での低域濁りヒスノイズを防止し、ディエンファシス積分器 (1 / (1 - 0.95 z^-1)) の直流利得発散を相殺するための高域放射微分整形 (1 - 0.95 z^-1)。
             // 無声励起が過大になると母音のフォルマント共鳴を妨げ耳障りなホワイトノイズが知覚されるため、自然な子音アタックが得られる0.18に調整する。
             let rawNoise = nextRandomFloat()
             let shapedNoise = rawNoise - (0.95 * prevUnvoicedNoise)
             prevUnvoicedNoise = rawNoise
             let unvoicedExcitation = shapedNoise * 0.18
+
+            // 有声励起への高周波息漏れ気流ノイズ（Aspiration）の動的混合
+            // 無声子音用の微弱スケール（0.18）に依存せず、有声パルス（振幅~0.85）と聴覚的に釣り合うゲイン（0.40）で
+            // 高域通過整形ノイズを混合し、子供や女性の息の多い声（Breathy voice）を声帯励起レベルで明瞭に再現する。
+            let asp = glottal.aspirationMix
+            let excitationScale: Float = 0.85
+            let voicedPulsePart = (1.0 - (asp * 0.5)) * (tiltedPulse * excitationScale)
+            let aspirationNoise = shapedNoise * 0.40
+            let voicedAspPart = asp * aspirationNoise
+            let voicedExcitation = voicedPulsePart + voicedAspPart
+
             let excitation = (sampleVoiced * voicedExcitation) + (sampleUnvoiced * unvoicedExcitation)
             let inputSignal = excitation * g
 

@@ -7,12 +7,12 @@ import Foundation
 public final class RosenbergPulse: @unchecked Sendable {
 
     public let sampleRate: Float
-    public let n1Ratio: Float // 開口時間比率
-    public let n2Ratio: Float // 閉口時間比率
-    private let openCloseSum: Float
-    private let invN1: Float
-    private let invN2: Float
-    private let meanDcOffset: Float // 直流成分オフセット
+    public private(set) var n1Ratio: Float // 開口時間比率
+    public private(set) var n2Ratio: Float // 閉口時間比率
+    private var openCloseSum: Float
+    private var invN1: Float
+    private var invN2: Float
+    private var meanDcOffset: Float // 直流成分オフセット
 
     /// 連続発振器位相 [0.0, 1.0)
     private var phase: Float = 0.0
@@ -34,6 +34,35 @@ public final class RosenbergPulse: @unchecked Sendable {
         self.invN2 = 1.0 / n2Ratio
         // 理論平均値による直流成分
         self.meanDcOffset = (0.5 * n1Ratio) + ((2.0 / 3.0) * n2Ratio)
+    }
+
+    /// 声帯生理パラメータ（GlottalSource）に基づくパルス形状の動的適用
+    ///
+    /// 開口率（OQ）と閉鎖急峻度（RQ）から開口時間比率 n1Ratio および
+    /// 閉口時間比率 n2Ratio を算出し、直流成分オフセットを正確に再計算する。
+    public func apply(glottal: GlottalSource) {
+        let oq = glottal.openQuotient
+        let rq = glottal.returnQuotient
+        // n2 = OQ * RQ, n1 = OQ * (1.0 - RQ)
+        var n2 = oq * rq
+        var n1 = oq * (1.0 - rq)
+        if n1 < 0.05 {
+            n1 = 0.05
+        }
+        if n2 < 0.02 {
+            n2 = 0.02
+        }
+        if 0.95 < (n1 + n2) {
+            let s = 0.95 / (n1 + n2)
+            n1 *= s
+            n2 *= s
+        }
+        self.n1Ratio = n1
+        self.n2Ratio = n2
+        self.openCloseSum = n1 + n2
+        self.invN1 = 1.0 / n1
+        self.invN2 = 1.0 / n2
+        self.meanDcOffset = (0.5 * n1) + ((2.0 / 3.0) * n2)
     }
 
     /// 位相を初期状態にリセット
