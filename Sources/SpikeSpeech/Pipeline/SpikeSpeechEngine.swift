@@ -96,8 +96,15 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     break
                 }
 
-                var baseF0 = features.f0Contour[frameIdx] * voice.pitchScale * pitchScale
-                let voiced = features.voicedFlags[frameIdx]
+                var rawF0: Float = 0.0
+                if frameIdx < features.f0Contour.count {
+                    rawF0 = features.f0Contour[frameIdx]
+                }
+                var baseF0 = rawF0 * voice.pitchScale * pitchScale
+                var voiced: Float = 0.0
+                if frameIdx < features.voicedFlags.count {
+                    voiced = features.voicedFlags[frameIdx]
+                }
                 if 0.5 <= voiced {
                     baseF0 += voice.pitchShift
                 }
@@ -107,8 +114,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let f0 = baseF0
 
                 // 1. 音素 ID の One-Hot 符号化
-                // 背景電流（話者埋め込みや調波）に埋もれず膜電位の閾値を確実に突破できるよう、
-                // 音素発火電流をスケールアップして注入する。
+                // 背景電流に埋もれず膜電位の閾値を確実に突破できるよう、音素発火電流を注入する
                 if 0 <= pid {
                     if pid < 64 {
                         if pid < inDim {
@@ -118,9 +124,10 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
 
                 // 2. 韻律および音響生理学的特徴の付加
-                // 単一ニューロンへの過剰電流注入による飽和クリッピングを防ぐため適正スケールに調整
+                // 音素発火電流 (3.0) に対して SNN が有意にピッチ・有声度・エネルギーを学習できるよう、
+                // 適切なスケール (1.0〜1.5) で膜電位駆動電流を供給する
                 if 64 < inDim {
-                    seq[frameIdx][64] = voiced * 0.5
+                    seq[frameIdx][64] = voiced * 1.0
                 }
                 if 65 < inDim {
                     var normF0 = f0 / 500.0
@@ -130,15 +137,16 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1.0 < normF0 {
                         normF0 = 1.0
                     }
-                    seq[frameIdx][65] = normF0 * 0.5
+                    // F0 ピッチ周波数を 500Hz 基準で [0.0, 1.0] に安全正規化して供給
+                    seq[frameIdx][65] = normF0 * 1.0
                 }
                 if 66 < inDim {
                     let progress = Float(f) / Float(max(1, duration))
-                    seq[frameIdx][66] = progress * 0.5
+                    seq[frameIdx][66] = progress * 1.0
                 }
                 if 67 < inDim {
                     let rate = 10.0 / Float(max(1, duration))
-                    seq[frameIdx][67] = min(1.0, rate) * 0.5
+                    seq[frameIdx][67] = min(1.0, rate) * 1.0
                 }
 
                 // 3. 話者埋め込み特徴量（声質ベクトル）の注入
@@ -155,14 +163,55 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     embIdx += 1
                 }
 
-                // 4. 高次調波埋め込み
-                // 多数の調波チャンネルの加算電流による飽和を防ぎ、適度なピッチ周期同期を促す
-                var k = embEnd
-                while k < inDim {
-                    let harmonicIndex = Float(k - (embEnd - 1))
-                    let phase = (2.0 * Float.pi * harmonicIndex * f0) / sampleRate
-                    seq[frameIdx][k] = sin(phase) * voiced * 0.2
-                    k += 1
+                // 4. 音響ダイナミクス特徴量（実測短時間エネルギー & ピッチ変化率 ΔF0 & 無声度コンテキスト）
+                // 静的な固定 sin 波ではなく、声帯・呼気のリアルな物理運動と動的抑揚を SNN に直接供給する
+                if 84 < inDim {
+                    var engVal: Float = 0.50
+                    if frameIdx < features.energyContour.count {
+                        engVal = features.energyContour[frameIdx]
+                    }
+                    if 1.0 < engVal {
+                        engVal = 1.0
+                    }
+                    seq[frameIdx][84] = engVal * 1.0
+                }
+                if 85 < inDim {
+                    // なぜ前フレーム F0 にも同一の話者スケール・シフトを適用するか:
+                    // 生 Hz とスケール済み Hz の引き算を行うと、男性や子供プロファイルで
+                    // ピッチ変化率ではなく定数オフセット（±1.0 飽和）が注入されてしまうバグを防止するため。
+                    // また無声フレームや無声・有声境界ではピッチ変化率は未定義であるため 0.0 にマスクする。
+                    var deltaF0: Float = 0.0
+                    if 0.5 <= voiced && 0 < frameIdx {
+                        let prevIdx = frameIdx - 1
+                        var prevVoiced: Float = 0.0
+                        if prevIdx < features.voicedFlags.count {
+                            prevVoiced = features.voicedFlags[prevIdx]
+                        }
+                        if 0.5 <= prevVoiced && prevIdx < features.f0Contour.count {
+                            let rawPrevF0 = features.f0Contour[prevIdx]
+                            var basePrevF0 = rawPrevF0 * voice.pitchScale * pitchScale
+                            basePrevF0 += voice.pitchShift
+                            if basePrevF0 < 0.0 {
+                                basePrevF0 = 0.0
+                            }
+                            deltaF0 = (f0 - basePrevF0) / 50.0
+                        }
+                    }
+                    var clampedDelta = deltaF0
+                    if clampedDelta < -1.0 {
+                        clampedDelta = -1.0
+                    }
+                    if 1.0 < clampedDelta {
+                        clampedDelta = 1.0
+                    }
+                    seq[frameIdx][85] = clampedDelta * 1.0
+                }
+                if 86 < inDim {
+                    // なぜ ch64 の有声度に対して無声度 (1.0 - voiced) を割り当てるか:
+                    // 有声度の二重注入を排除し、声帯振動停止・無声子音コンテキストを表す
+                    // 直交的抑制電流として機能させるため。
+                    let unvoiced = 1.0 - voiced
+                    seq[frameIdx][86] = unvoiced * 1.0
                 }
 
                 f += 1
@@ -293,19 +342,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             if prevPId != pId {
                 // 先行音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
                 var canBlendPrev = true
-                switch prevPId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
                     canBlendPrev = false
-                default:
-                    break
                 }
-                switch pId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 12, 23, 30, 38:
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
                     canBlendPrev = false
-                default:
-                    break
                 }
 
                 if canBlendPrev {
@@ -323,19 +364,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             if nextPId != pId {
                 // 後続音素が無声子音・破裂音・ポーズの場合は、母音フォルマントに無声ノイズPriorを混入させない
                 var canBlendNext = true
-                switch nextPId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
                     canBlendNext = false
-                default:
-                    break
                 }
-                switch pId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 12, 23, 30, 38:
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
                     canBlendNext = false
-                default:
-                    break
                 }
 
                 if canBlendNext {
@@ -380,12 +413,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
                 var ck = 0
                 while ck < 5 {
-                    switch checkList[ck] {
-                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                         10, 12, 23, 30, 38:
+                    let chkId = checkList[ck]
+                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
                         isPauseNear = true
-                    default:
-                        break
                     }
                     ck += 1
                 }
@@ -405,6 +435,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
         }
 
+        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
         t = 0
         while t < totalFrames {
             let pId = framePhoneIds[t]
@@ -440,14 +471,14 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             let pOffset = framePhoneOffsets[t]
             let pDur = framePhoneDurations[t]
 
-            switch pId {
-            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
+            switch true {
+            case vocabulary.isPauseOrSilence(id: pId):
                 // 無音・休止・促音区間（<sil>, <pau>, <pad>, Q）:
                 // 呼気・声帯振動が完全に遮断されているため絶対無音とする。
                 effectiveGain = 0.0
 
-            case 10, 12, 23, 30, 38:
-                // 無声破裂音: k (10), t (12), p (23), ky (30), py (38)
+            case vocabulary.isUnvoicedStop(id: pId):
+                // 無声破裂音: k, t, p, ky, py
                 // 舌や口唇が気流を完全に閉塞する「閉鎖期」（最終フレーム前）は物理的に音響エネルギーがゼロである。
                 // 閉鎖期に無声乱数を注入すると母音立ち上がり前に「ザー」という異音となるため完全ミュート（0.0）とし、
                 // 気流が急激に開放される直前の最後の 1 フレーム（破裂バースト）のみシャープに適正ゲインを付与する。
@@ -457,8 +488,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.18, gain * 0.50)
                 }
 
-            case 19, 21, 22, 35, 37:
-                // 有声破裂音: g (19), d (21), b (22), gy (35), by (37)
+            case vocabulary.isVoicedStop(id: pId):
+                // 有声破裂音: g, d, b, gy, by
                 // 閉鎖期は気流通過ノイズがゼロで微弱な低周波声帯振動（ボイスバー）のみ存在するため、
                 // 閉鎖期は極小ゲインとし、最後の 1 フレームで破裂バーストを付与する。
                 if pOffset < (pDur - 1) {
@@ -467,8 +498,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.18, gain * 0.50)
                 }
 
-            case 28, 29:
-                // 無声破擦音: ch (28), ts (29)
+            case vocabulary.isAffricate(id: pId):
+                // 無声破擦音: ch, ts
                 // 閉鎖期から摩擦期への過渡的二相構造。前半（閉鎖区間）は呼気遮断のため無音（0.0）とし、
                 // 後半（摩擦区間）のみ摩擦ノイズを発生させる。
                 let halfDur = pDur / 2
@@ -478,13 +509,18 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.20, gain * 0.60)
                 }
 
-            case 11, 14, 27:
-                // 無声摩擦音: s (11), h (14), sh (27)
+            case vocabulary.isUnvoicedFricative(id: pId):
+                // 無声摩擦音: s, h, sh
                 // 定常的な気流摩擦音。耳障りな過大ヒスノイズの突出を防止するため適正上限でクリップする。
                 effectiveGain = min(0.22, gain * 0.65)
 
             default:
                 break
+            }
+
+            // 生理学的 1/f 振幅ゆらぎ（Shimmer / 呼吸筋の微小な息の強弱）の適用
+            if 0.0 < effectiveGain {
+                effectiveGain = bioFluctuation.computeAmplitudeShimmer(baseGain: effectiveGain)
             }
 
             var baseF0 = linguisticFeatures.f0Contour[t] * voice.pitchScale * pitch
@@ -521,24 +557,13 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         var fIdx = 0
         while fIdx < totalFrames {
             let pId = framePhoneIds[fIdx]
-            var isSilence = false
-            switch pId {
-            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                isSilence = true
-            default:
-                break
-            }
+            let isSilence = vocabulary.isPauseOrSilence(id: pId)
 
             if isSilence {
                 var prevIsSilence = true
                 if 0 < fIdx {
                     let prevPid = framePhoneIds[fIdx - 1]
-                    switch prevPid {
-                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                        prevIsSilence = true
-                    default:
-                        prevIsSilence = false
-                    }
+                    prevIsSilence = vocabulary.isPauseOrSilence(id: prevPid)
                 }
 
                 let startSample = fIdx * frameSize
@@ -594,13 +619,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         var vF = 0
         while vF < totalFrames {
             let pId = framePhoneIds[vF]
-            var isSpeech = true
-            switch pId {
-            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
-                isSpeech = false
-            default:
-                break
-            }
+            let isSpeech = vocabulary.isPauseOrSilence(id: pId) != true
             if isSpeech {
                 let startS = vF * frameSize
                 let endS = min(rawSamples.count, startS + frameSize)
@@ -791,19 +810,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             var blendedPrior = currPrior
             if prevPId != pId {
                 var canBlendPrev = true
-                switch prevPId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
                     canBlendPrev = false
-                default:
-                    break
                 }
-                switch pId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 12, 23, 30, 38:
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
                     canBlendPrev = false
-                default:
-                    break
                 }
 
                 if canBlendPrev {
@@ -820,19 +831,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
             if nextPId != pId {
                 var canBlendNext = true
-                switch nextPId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 11, 12, 14, 23, 27, 28, 29, 30, 38:
+                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
                     canBlendNext = false
-                default:
-                    break
                 }
-                switch pId {
-                case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                     10, 12, 23, 30, 38:
+                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
                     canBlendNext = false
-                default:
-                    break
                 }
 
                 if canBlendNext {
@@ -873,12 +876,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
                 var ck = 0
                 while ck < 5 {
-                    switch checkList[ck] {
-                    case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId,
-                         10, 12, 23, 30, 38:
+                    let chkId = checkList[ck]
+                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
                         isPauseNear = true
-                    default:
-                        break
                     }
                     ck += 1
                 }
@@ -901,6 +901,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         var allSamples = [Float](repeating: 0.0, count: totalFrames * frameSize)
         var frameBuffer = [Float](repeating: 0.0, count: frameSize)
         var lpcCoeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
+        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
 
         var t = 0
         while t < totalFrames {
@@ -939,11 +940,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             let pOffset = framePhoneOffsets[t]
             let pDur = framePhoneDurations[t]
 
-            switch pId {
-            case PhonemeVocabulary.silId, PhonemeVocabulary.pauId, PhonemeVocabulary.padId, PhonemeVocabulary.qId:
+            switch true {
+            case vocabulary.isPauseOrSilence(id: pId):
                 effectiveGain = 0.0
 
-            case 10, 12, 23, 30, 38:
+            case vocabulary.isUnvoicedStop(id: pId):
                 // 無声破裂音: k, t, p, ky, py
                 // 閉鎖期は完全無音（0.0）、最後の1フレームのみ破裂バースト
                 if pOffset < (pDur - 1) {
@@ -952,7 +953,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.18, gain * 0.50)
                 }
 
-            case 19, 21, 22, 35, 37:
+            case vocabulary.isVoicedStop(id: pId):
                 // 有声破裂音: g, d, b, gy, by
                 if pOffset < (pDur - 1) {
                     effectiveGain = min(0.04, gain * 0.15)
@@ -960,7 +961,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.18, gain * 0.50)
                 }
 
-            case 28, 29:
+            case vocabulary.isAffricate(id: pId):
                 // 無声破擦音: ch, ts
                 let halfDur = pDur / 2
                 if pOffset < halfDur {
@@ -969,12 +970,17 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     effectiveGain = min(0.20, gain * 0.60)
                 }
 
-            case 11, 14, 27:
+            case vocabulary.isUnvoicedFricative(id: pId):
                 // 無声摩擦音: s, h, sh
                 effectiveGain = min(0.22, gain * 0.65)
 
             default:
                 break
+            }
+
+            // 生理学的 1/f 振幅ゆらぎ（Shimmer / 呼吸筋の微小な息の強弱）の適用
+            if 0.0 < effectiveGain {
+                effectiveGain = bioFluctuation.computeAmplitudeShimmer(baseGain: effectiveGain)
             }
 
             var baseF0 = linguisticFeatures.f0Contour[t] * voice.pitchScale * pitch

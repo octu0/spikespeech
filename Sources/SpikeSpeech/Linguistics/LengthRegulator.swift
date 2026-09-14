@@ -223,10 +223,11 @@ public final class LengthRegulator: Sendable {
         normalizer: TextNormalizer,
         prosodyModel: ProsodyModel,
         vocabulary: PhonemeVocabulary,
-        speedFactor: Float = 1.0
+        speedFactor: Float = 1.0,
+        applyFluctuation: Bool = true
     ) -> LinguisticFeatures {
         if text.isEmpty {
-            return LinguisticFeatures(phoneIds: [], durations: [], f0Contour: [], voicedFlags: [], totalFrames: 0)
+            return LinguisticFeatures(phoneIds: [], durations: [], f0Contour: [], voicedFlags: [], energyContour: [], totalFrames: 0)
         }
 
         // 外部から非有限値やゼロが指定された場合でも、後続の計算が安全範囲内で安定して実行されることを保証する。
@@ -249,6 +250,7 @@ public final class LengthRegulator: Sendable {
 
         // 3. 各音素および休止の浮動小数点 Duration 系列の収集
         var rawFloatDurations: [Float] = []
+        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
         var pIdx = 0
         while pIdx < phrases.count {
             let phrase = phrases[pIdx]
@@ -268,6 +270,13 @@ public final class LengthRegulator: Sendable {
                 while phIdx < mora.phonemes.count {
                     let token = mora.phonemes[phIdx]
                     var scaled = floatDurationFrames(category: token.category, symbol: token.symbol, speed: safeSpeedFactor)
+
+                    // 生理学的 1/f テンポゆらぎの適用 (推論時のみ適用し、学習時アライメントの汚染を防止)
+                    if applyFluctuation {
+                        let tempoScale = bioFluctuation.computeTempoScale()
+                        scaled *= tempoScale
+                    }
+
                     // 文末または読点ポーズ直前のモーラを自然に約1.25倍伸張（Phrase-Final Lengthening）
                     if shouldLengthen {
                         switch token.category {
@@ -337,16 +346,73 @@ public final class LengthRegulator: Sendable {
         }
 
         // 7. F0 輪郭パラメータの生成
+        // なぜ bioFluctuation を渡すか:
+        // テンポゆらぎを算出した生体ゆらぎインスタンスの状態を継続し、同一の 1/f 系列から
+        // ピッチジッターを算出することで、生理学的な呼気圧・声帯運動の連動性を維持するため。
+        // また applyFluctuation フラグを渡すことで、学習データ生成時にジッター計算を完全に停止する。
         let (f0Contour, voicedFlags, totalFrames) = prosodyModel.generateF0Contour(
             phrases: phrases,
-            vocabulary: vocabulary
+            vocabulary: vocabulary,
+            fluctuation: &bioFluctuation,
+            applyFluctuation: applyFluctuation
         )
+
+        // 8. 音素物理カテゴリに基づく音響エネルギー輪郭の生成
+        // なぜ一律固定値（0.60/0.10）ではなく音素カテゴリ別物理プロファイルにするか:
+        // 学習時は PitchTracker の実測 RMS（母音部 0.50〜0.85、摩擦部 0.20〜0.30、閉鎖部 0.02、無音 0.0）を
+        // SNN に供給しているため、推論時も同じ物理音響エネルギー分布を供給して分布外（OOD）入力を防ぐ。
+        var baseEnergyContour = [Float](repeating: 0.0, count: totalFrames)
+        var curFrame = 0
+        var phIter = 0
+        while phIter < phoneIds.count {
+            let pid = Int(phoneIds[phIter])
+            let dur = Int(durations[phIter])
+            var targetEnergy: Float = 0.0
+
+            switch true {
+            case vocabulary.isPauseOrSilence(id: pid):
+                targetEnergy = 0.0
+            case vocabulary.isUnvoicedStop(id: pid):
+                targetEnergy = 0.02 // 閉鎖無音区間
+            case vocabulary.isUnvoicedFricative(id: pid):
+                targetEnergy = 0.25 // 無声摩擦気流
+            case vocabulary.isAffricate(id: pid):
+                targetEnergy = 0.20 // 破擦音
+            case vocabulary.isVoicedStop(id: pid):
+                targetEnergy = 0.35 // 有声破裂音
+            default:
+                let symbol = vocabulary.token(for: pid)
+                if vocabulary.isVoiced(symbol: symbol) {
+                    switch symbol {
+                    case "a", "i", "u", "e", "o", "N", "_":
+                        targetEnergy = 0.70 // 母音・撥音・長音
+                    default:
+                        targetEnergy = 0.45 // その他有声子音（鼻音・半母音・弾音など）
+                    }
+                } else {
+                    targetEnergy = 0.15
+                }
+            }
+
+            var f = 0
+            while f < dur {
+                let frameIdx = curFrame + f
+                if frameIdx < totalFrames {
+                    baseEnergyContour[frameIdx] = targetEnergy
+                }
+                f += 1
+            }
+
+            curFrame += dur
+            phIter += 1
+        }
 
         return LinguisticFeatures(
             phoneIds: phoneIds,
             durations: durations,
             f0Contour: f0Contour,
             voicedFlags: voicedFlags,
+            energyContour: baseEnergyContour,
             totalFrames: totalFrames
         )
     }

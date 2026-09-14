@@ -170,9 +170,34 @@ public final class ProsodyModel: Sendable {
     ///
     /// 無声子音、促音、ポーズ区間では物理的に声帯振動が存在しないため、
     /// 目標周波数および有声フラグをゼロにしてSNNデコーダーに正しく伝達する。
+    /// 各フレームの目標 F0 周波数 [Hz] および有声フラグ系列を生成する
+    ///
+    /// 無声子音、促音、ポーズ区間では物理的に声帯振動が存在しないため、
+    /// 目標周波数および有声フラグをゼロにしてSNNデコーダーに正しく伝達する。
     public func generateF0Contour(
         phrases: [AccentPhrase],
-        vocabulary: PhonemeVocabulary
+        vocabulary: PhonemeVocabulary,
+        seed: UInt64 = 0x1234_5678_9abc_def0,
+        applyFluctuation: Bool = true
+    ) -> (f0Contour: [Float], voicedFlags: [Float], totalFrames: Int) {
+        var bioFluctuation = BiologicalFluctuation(seed: seed)
+        return generateF0Contour(
+            phrases: phrases,
+            vocabulary: vocabulary,
+            fluctuation: &bioFluctuation,
+            applyFluctuation: applyFluctuation
+        )
+    }
+
+    /// 各フレームの目標 F0 周波数 [Hz] および有声フラグ系列を生成する（生体ゆらぎインスタンス共有版）
+    /// なぜ生体ゆらぎインスタンスを共有するか:
+    /// テンポゆらぎ、ピッチジッター、シマーが同一の生体ゆらぎ（1/f ピンクノイズ）系列を
+    /// 継続して消費することで、呼気圧・声帯振動の生理学的連動性を維持するため。
+    public func generateF0Contour(
+        phrases: [AccentPhrase],
+        vocabulary: PhonemeVocabulary,
+        fluctuation: inout BiologicalFluctuation,
+        applyFluctuation: Bool = true
     ) -> (f0Contour: [Float], voicedFlags: [Float], totalFrames: Int) {
         var f0List: [Float] = []
         var voicedList: [Float] = []
@@ -182,6 +207,7 @@ public final class ProsodyModel: Sendable {
         var globalFrame = 0
         var sentenceFrame = 0
         var voicedStreak = 0
+        var prevPhonemeSymbol = ""
 
         while pIdx < phrases.count {
             let phrase = phrases[pIdx]
@@ -257,12 +283,22 @@ public final class ProsodyModel: Sendable {
                         // 文境界（句点・長ポーズ）で呼気圧がリセットされる生理学的機構を再現する。
                         let declination = expf(-0.05 * min(4.0, tSentence))
 
-                        // 4. 自然な生体声帯微小ゆらぎ (Organic Glottal Micro-variation)
-                        // 単一周波数の過剰な正弦波変調（ビブラート感・ロボット感）を排除し、
-                        // 非調和な超低周波数の合成による微小な自然ゆらぎ（振幅 0.5% 未満）を付与する。
-                        let jitter1 = 0.003 * sin(2.0 * Float.pi * 1.73 * tSentence)
-                        let jitter2 = 0.002 * sin(2.0 * Float.pi * 3.11 * tSentence)
-                        let jitter = 1.0 + jitter1 + jitter2
+                        // 4. 調音音声学に基づくマイクロプロソディ (Microprosody / 子音牽引ピッチ効果)
+                        // 先行する無声子音の気圧解放や有声子音の負荷により、母音立ち上がりの F0 が過渡的に変動する
+                        var microprosodyScale: Float = 1.0
+                        if isVoicedPhoneme && f < 3 {
+                            let decay = Float(3 - f) / 3.0
+                            switch prevPhonemeSymbol {
+                            case "k", "ky", "t", "ch", "ts", "p", "py", "s", "sh", "h", "hy":
+                                // 無声破裂・摩擦音後: 声門下圧の上昇によりピッチが一時的に跳ね上がる (+3.0%)
+                                microprosodyScale = 1.0 + (0.030 * decay)
+                            case "g", "gy", "d", "b", "by", "z", "j", "m", "my", "n", "ny", "r", "ry":
+                                // 有声子音・鼻音後: 声帯への音響負荷によりピッチが低域から立ち上がる (-2.0%)
+                                microprosodyScale = 1.0 - (0.020 * decay)
+                            default:
+                                break
+                            }
+                        }
 
                         // 5. 母音固有基本周波数 (Intrinsic Vowel Pitch / IF0)
                         // 音響音声学における舌根挙上と喉頭牽引の相互作用により、狭母音 (i, u) は広母音よりわずかにピッチが高くなる
@@ -274,11 +310,18 @@ public final class ProsodyModel: Sendable {
                             break
                         }
 
-                        // 6. F0 周波数の合成
-                        var f0 = baseF0 * expf(phraseComp + accentComp) * declination * jitter * intrinsicScale
-
                         if isVoicedPhoneme {
                             voicedStreak += 1
+                            // 6. F0 周波数の合成と 1/f 生体ピッチゆらぎ (Jitter)
+                            // なぜ有声フレーム内のみで Jitter を算出するか:
+                            // 無声フレームで疑似乱数ジェネレータを進めると、無声子音の長さに応じて
+                            // 後続母音のピッチ位相が不自然にずれる現象を防止するため。
+                            let rawF0 = baseF0 * expf(phraseComp + accentComp) * declination * intrinsicScale * microprosodyScale
+                            var f0 = rawF0
+                            if applyFluctuation {
+                                f0 = fluctuation.computePitchJitter(baseF0: rawF0)
+                            }
+
                             // 有声化開始アタック (Onset Glottal Attack)
                             // 無声から有声へ切り替わる先頭 2 フレームで声帯振動がわずかに低域から立ち上がる生理学的アタック
                             if voicedStreak <= 2 {
@@ -286,7 +329,7 @@ public final class ProsodyModel: Sendable {
                                 f0 = f0 * onsetScale
                             }
 
-                            // 50Hz〜500Hz の適正有声帯域内に確実にクランプ
+                            // 60Hz〜480Hz の適正有声帯域内に確実にクランプ
                             if f0 < 60.0 {
                                 f0 = 60.0
                             }
@@ -307,6 +350,7 @@ public final class ProsodyModel: Sendable {
                         sentenceFrame += 1
                         f += 1
                     }
+                    prevPhonemeSymbol = phoneme.symbol
                     phIdx += 1
                 }
                 mIdx += 1

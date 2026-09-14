@@ -347,7 +347,8 @@ func main() {
         pcm16k: [Float],
         engine: SpikeSpeechEngine,
         voiceProfile: VoiceProfile,
-        melExtractor: MelSpectrogramExtractor
+        melExtractor: MelSpectrogramExtractor,
+        pitchTracker: PitchTracker
     ) -> (features: [[Float]], targets: [[Float]])? {
         if pcm16k.isEmpty {
             return nil
@@ -358,12 +359,14 @@ func main() {
             return nil
         }
 
+        // 学習時は決定論的アライメントのため 1/f ゆらぎをバイパス（アライメント汚染の根絶）
         let baseLinguistic = engine.lengthRegulator.processText(
             text: text,
             normalizer: engine.normalizer,
             prosodyModel: engine.prosodyModel,
             vocabulary: engine.vocabulary,
-            speedFactor: 1.0
+            speedFactor: 1.0,
+            applyFluctuation: false
         )
 
         let origTotalFrames = baseLinguistic.totalFrames
@@ -441,22 +444,23 @@ func main() {
                 fullDurations.append(trailSilence)
             }
 
+            // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間エネルギー抽出
+            // なぜ実測値を用いるか:
+            // 数式による理論 F0 は平坦で幾何学的なカーブとなるためロボット的な発音を招く。
+            // 実際の声優さんの音声から抽出した実測ピッチコンター・生体ゆらぎ・有声無声遷移・エネルギーを
+            // 入力特徴量として直接供給することで、人間味あふれる抑揚と音響スペクトルの相関を SNN に直接学習させる。
+            let pitchResult = pitchTracker.track(pcm: pcm16k)
             var alignedF0 = [Float](repeating: 0.0, count: targetFrames)
             var alignedVoiced = [Float](repeating: 0.0, count: targetFrames)
-            let baseF0Count = baseLinguistic.f0Contour.count
-
-            if 0 < baseF0Count && 0 < speechFrames {
-                var s = 0
-                while s < speechFrames {
-                    let frameIdx = leadSilence + s
-                    if frameIdx < targetFrames {
-                        let normPos = Float(s) / Float(max(1, speechFrames))
-                        let srcIdx = min(baseF0Count - 1, max(0, Int(normPos * Float(baseF0Count))))
-                        alignedF0[frameIdx] = baseLinguistic.f0Contour[srcIdx]
-                        alignedVoiced[frameIdx] = baseLinguistic.voicedFlags[srcIdx]
-                    }
-                    s += 1
+            var alignedEnergy = [Float](repeating: 0.0, count: targetFrames)
+            var f = 0
+            while f < targetFrames {
+                if f < pitchResult.frameCount {
+                    alignedF0[f] = pitchResult.f0[f]
+                    alignedVoiced[f] = pitchResult.voiced[f]
+                    alignedEnergy[f] = pitchResult.energy[f]
                 }
+                f += 1
             }
 
             var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
@@ -471,6 +475,7 @@ func main() {
                 durations: int32Durations,
                 f0Contour: alignedF0,
                 voicedFlags: alignedVoiced,
+                energyContour: alignedEnergy,
                 totalFrames: targetFrames
             )
 
@@ -488,19 +493,18 @@ func main() {
         }
 
         var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: finalCount)
+        var framePhoneIds = [Int](repeating: 1, count: finalCount)
         var curFrame = 0
         var pIdx = 0
         let pCount = min(fullPhoneIds.count, fullDurations.count)
-        var framePhoneIds = [Int](repeating: PhonemeVocabulary.silId, count: finalCount)
-
         while pIdx < pCount {
-            let pId = Int(fullPhoneIds[pIdx])
+            let pId = fullPhoneIds[pIdx]
             let d = fullDurations[pIdx]
             var f = 0
             while f < d {
                 let frameIdx = curFrame + f
                 if frameIdx < finalCount {
-                    framePhoneIds[frameIdx] = pId
+                    framePhoneIds[frameIdx] = Int(pId)
                 }
                 f += 1
             }
@@ -510,8 +514,12 @@ func main() {
 
         var t = 0
         while t < finalCount {
-            let pId = framePhoneIds[t]
-            let prior = engine.acousticPrior.getPriorMel(phoneId: pId)
+            let phoneId = framePhoneIds[t]
+            var prior = [Float](repeating: 0.0, count: AudioConfig.melChannels)
+            prior.withUnsafeMutableBufferPointer { dst in
+                engine.acousticPrior.copyPriorMel(phoneId: phoneId, dst: dst.baseAddress!)
+            }
+
             let melChannels = min(targetMel[t].count, AudioConfig.melChannels)
             var c = 0
             while c < melChannels {
@@ -523,6 +531,8 @@ func main() {
 
         return (features: safeFeatures, targets: safeTargets)
     }
+
+    let pitchTracker = PitchTracker()
 
     switch corpusDir {
     case .some(let cDir):
@@ -563,7 +573,8 @@ func main() {
                                 pcm16k: pcm16k,
                                 engine: engine,
                                 voiceProfile: voiceProfile,
-                                melExtractor: melExtractor
+                                melExtractor: melExtractor,
+                                pitchTracker: pitchTracker
                             ) {
                                 trainingData.append(pair)
                             }
@@ -585,7 +596,8 @@ func main() {
                 pcm16k: item.samples,
                 engine: engine,
                 voiceProfile: voiceProfile,
-                melExtractor: melExtractor
+                melExtractor: melExtractor,
+                pitchTracker: pitchTracker
             ) {
                 trainingData.append(pair)
             }

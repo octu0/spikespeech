@@ -150,6 +150,72 @@ public struct PhonemeVocabulary: Sendable {
         }
     }
 
+    /// 音素 ID が完全無音・休止・促音（気流遮断）であるか判定する
+    public func isPauseOrSilence(id: Int) -> Bool {
+        switch id {
+        case Self.silId, Self.pauId, Self.padId, Self.qId:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が無声破裂音（k, t, p, ky, py）であるか判定する
+    public func isUnvoicedStop(id: Int) -> Bool {
+        switch id {
+        case 10, 12, 23, 30, 38: // k, t, p, ky, py
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が有声破裂音（g, d, b, gy, by）であるか判定する
+    public func isVoicedStop(id: Int) -> Bool {
+        switch id {
+        case 19, 21, 22, 35, 37: // g, d, b, gy, by
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が破擦音（ch, ts）であるか判定する
+    public func isAffricate(id: Int) -> Bool {
+        switch id {
+        case 28, 29: // ch, ts
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が無声摩擦音（s, h, sh, hy）であるか判定する
+    /// なぜ hy を含めるか:
+    /// 「ひゃ」「ひゅ」「ひょ」の子音 hy は無声硬口蓋摩擦音 [ç] であり、
+    /// 有声音ではなく無声摩擦気流としてモデル化する必要があるため。
+    public func isUnvoicedFricative(id: Int) -> Bool {
+        switch id {
+        case 11, 14, 27, 32: // s, h, sh, hy
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が無声子音（無声破裂・無声摩擦・無声破擦）であるか判定する
+    /// なぜ hy を含めるか:
+    /// 音響モデルの無声子音コンテキスト判定およびボコーダー励起制御において、
+    /// 硬口蓋摩擦音 hy を漏れなく無声子音として扱うため。
+    public func isUnvoicedConsonant(id: Int) -> Bool {
+        switch id {
+        case 10, 11, 12, 14, 23, 27, 28, 29, 30, 32, 38: // k, s, t, h, p, sh, ch, ts, ky, hy, py
+            return true
+        default:
+            return false
+        }
+    }
+
     /// カタカナ文字をひらがなに正規化する。
     /// カタカナとひらがなは Unicode コードポイントが 0x60 オフセットで並行配置されており、
     /// 文字列置換ライブラリ呼び出しを排してスカラー演算のみで一括変換する。

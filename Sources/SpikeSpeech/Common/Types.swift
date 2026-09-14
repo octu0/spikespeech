@@ -142,6 +142,7 @@ public struct LinguisticFeatures: Sendable, Equatable {
     public let durations: [Int32]
     public let f0Contour: [Float]
     public let voicedFlags: [Float]
+    public let energyContour: [Float]
     public let totalFrames: Int
 
     public init(
@@ -149,12 +150,14 @@ public struct LinguisticFeatures: Sendable, Equatable {
         durations: [Int32],
         f0Contour: [Float],
         voicedFlags: [Float],
+        energyContour: [Float] = [],
         totalFrames: Int
     ) {
         self.phoneIds = phoneIds
         self.durations = durations
         self.f0Contour = f0Contour
         self.voicedFlags = voicedFlags
+        self.energyContour = energyContour
         self.totalFrames = totalFrames
     }
 }
