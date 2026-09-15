@@ -382,38 +382,17 @@ final class AcousticDiagnosticTests: XCTestCase {
         XCTAssertTrue(0.10 <= frameRmsList[oVowelFrame], "母音 /o/ のフォルマント共鳴エネルギーが不足しています: RMS=\(frameRmsList[oVowelFrame])")
     }
 
-    /// JSUT 実音声のエネルギー分布、前後無音区間、Prior フォルマントピークの診断
-    func testDiagnoseJSUTSampleAndPrior() throws {
-        let fileManager = FileManager.default
-        let currentDir = fileManager.currentDirectoryPath
-        let candidates = [
-            currentDir + "/../spiketrans/.tmp/jsut_ver1.1/basic5000",
-            fileManager.homeDirectoryForCurrentUser.path + "/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000"
-        ]
-        var corpusDir: String? = nil
-        var cIdx = 0
-        while cIdx < candidates.count {
-            let cand = candidates[cIdx]
-            if fileManager.fileExists(atPath: cand + "/transcript_utf8.txt") {
-                corpusDir = cand
-                break
-            }
-            cIdx += 1
-        }
-
-        guard let cDir = corpusDir else {
-            print("[JSUT Diagnostic] コーパスディレクトリが見つかりません。")
-            return
-        }
-
-        let wavPath = cDir + "/wav/BASIC5000_0001.wav"
+    /// 音声サンプルのエネルギー分布、前後無音区間、および Prior フォルマントピークの診断
+    func testDiagnoseAudioSampleAndPrior() throws {
+        let currentDir = FileManager.default.currentDirectoryPath
+        let wavPath = currentDir + "/Tests/resources/test_female.wav"
         let reader = WavAudioReader()
         let pcm = try reader.loadWav16k(from: wavPath)
-        print("[JSUT Diagnostic] BASIC5000_0001 pcm count: \(pcm.count) (\(Float(pcm.count) / 16000.0) 秒)")
+        print("[Audio Diagnostic] test_female.wav pcm count: \(pcm.count) (\(Float(pcm.count) / 16000.0) 秒)")
 
         let extractor = MelSpectrogramExtractor()
         let mel = extractor.extractLogMel(pcm: pcm)
-        print("[JSUT Diagnostic] 実音声 Mel フレーム数: \(mel.count)")
+        print("[Audio Diagnostic] 実音声 Mel フレーム数: \(mel.count)")
 
         // フレームごとの RMS エネルギー推移を算出
         var frameRms = [Float](repeating: 0.0, count: mel.count)
@@ -453,9 +432,9 @@ final class AcousticDiagnosticTests: XCTestCase {
             tIdx -= 1
         }
 
-        print("[JSUT Diagnostic] 先頭無音フレーム数: \(leadSilence) (\(leadSilence * 10) ms)")
-        print("[JSUT Diagnostic] 発話有音フレーム数: \(mel.count - leadSilence - trailSilence) (\((mel.count - leadSilence - trailSilence) * 10) ms)")
-        print("[JSUT Diagnostic] 末尾無音フレーム数: \(trailSilence) (\(trailSilence * 10) ms)")
+        print("[Audio Diagnostic] 先頭無音フレーム数: \(leadSilence) (\(leadSilence * 10) ms)")
+        print("[Audio Diagnostic] 発話有音フレーム数: \(mel.count - leadSilence - trailSilence) (\((mel.count - leadSilence - trailSilence) * 10) ms)")
+        print("[Audio Diagnostic] 末尾無音フレーム数: \(trailSilence) (\(trailSilence * 10) ms)")
 
         // 実音声の無音区間 vs 有音区間の対数 Mel 平均
         var leadMelSum: Float = 0.0
@@ -471,8 +450,8 @@ final class AcousticDiagnosticTests: XCTestCase {
             }
             cIdx2 += 1
         }
-        print("[JSUT Diagnostic] 無音フレーム対数 Mel 平均: \(leadMelSum / Float(AudioConfig.melChannels))")
-        print("[JSUT Diagnostic] 有音フレーム対数 Mel 平均: \(voicedMelSum / Float(AudioConfig.melChannels))")
+        print("[Audio Diagnostic] 無音フレーム対数 Mel 平均: \(leadMelSum / Float(AudioConfig.melChannels))")
+        print("[Audio Diagnostic] 有音フレーム対数 Mel 平均: \(voicedMelSum / Float(AudioConfig.melChannels))")
 
         // 母音 Prior の LPC フォルマントピーク診断
         let engine = SpikeSpeechEngine()
@@ -512,7 +491,7 @@ final class AcousticDiagnosticTests: XCTestCase {
             var coeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
             let g = engine.melToLPC.convert(mel: pMel, isLogMel: true, outCoeffs: &coeffs)
             let peaks = findPeaks(coeffs: coeffs)
-            print("[JSUT Diagnostic] Prior [\(vName)] (phone=\(pId)): gain=\(g), formant peaks=\(peaks)")
+            print("[Audio Diagnostic] Prior [\(vName)] (phone=\(pId)): gain=\(g), formant peaks=\(peaks)")
         }
     }
 

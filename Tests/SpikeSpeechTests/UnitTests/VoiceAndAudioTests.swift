@@ -2,14 +2,14 @@ import XCTest
 import Foundation
 @testable import SpikeSpeech
 
-/// JSUT コーパス読み込み、実音声対数 Mel 特徴量抽出、および話者差し替え（VoiceProfile）検証テストスイート
-final class JSUTAndVoiceTests: XCTestCase {
+/// 音声特徴量抽出、WAV 読み込み、および話者差し替え（VoiceProfile）検証テストスイート
+final class VoiceAndAudioTests: XCTestCase {
 
     // MARK: - 1. VoiceProfile 単体検証
 
     /// 既定の話者プロファイル（女性、男性、中性、子供、重低音）の生理音響パラメータ整合性を検証
     func testVoiceProfilePresetsIntegrity() {
-        // 女性ボイス（JSUT 標準基準）
+        // 女性ボイス（標準基準）
         let female = VoiceProfile.female
         XCTAssertEqual(female.name, "female")
         XCTAssertEqual(female.baseF0, 220.0)
@@ -290,7 +290,7 @@ final class JSUTAndVoiceTests: XCTestCase {
     }
 
     /// 音声特徴量と目標スペクトログラムの時間軸整合性を実証
-    func testJSUTDatasetTrainingPairAlignment() throws {
+    func testSyntheticTrainingPairAlignment() throws {
         let engine = SpikeSpeechEngine()
         let sampleRate = 16000
         let audioSamples = 4800 // 300ms = 30 frames
@@ -303,7 +303,7 @@ final class JSUTAndVoiceTests: XCTestCase {
         }
 
         let tempDir = FileManager.default.temporaryDirectory
-        let tempWavPath = tempDir.appendingPathComponent("test_jsut_align.wav").path
+        let tempWavPath = tempDir.appendingPathComponent("test_audio_align.wav").path
         let wavData = WavEncoder.encode(samples: wave, sampleRate: sampleRate)
         try wavData.write(to: URL(fileURLWithPath: tempWavPath))
 
@@ -342,13 +342,13 @@ final class JSUTAndVoiceTests: XCTestCase {
     }
 
     /// 極短音声に対するアライメント安全性を検証
-    func testJSUTDatasetNegativeDiffAdjustmentAndF0Safety() throws {
+    func testShortAudioAlignmentAndF0Safety() throws {
         let sampleRate = 16000
         let audioSamples = 480
         let wave = [Float](repeating: 0.1, count: audioSamples)
 
         let tempDir = FileManager.default.temporaryDirectory
-        let tempWavPath = tempDir.appendingPathComponent("test_jsut_short.wav").path
+        let tempWavPath = tempDir.appendingPathComponent("test_audio_short.wav").path
         let wavData = WavEncoder.encode(samples: wave, sampleRate: sampleRate)
         try wavData.write(to: URL(fileURLWithPath: tempWavPath))
 
@@ -361,8 +361,8 @@ final class JSUTAndVoiceTests: XCTestCase {
         XCTAssertEqual(targetMel.count, expectedFrames)
     }
 
-    /// 先頭に '@' プレフィックスが付いたコーパスパスの正常解決を検証
-    func testJSUTDatasetLeadingAtSignResolution() {
+    /// 先頭に '@' プレフィックスが付いたパス文字列の正常解決を検証
+    func testPathLeadingAtSignResolution() {
         var cleanPath = "@/nonexistent/path/at"
         if cleanPath.hasPrefix("@") {
             cleanPath = String(cleanPath.dropFirst())
@@ -1020,7 +1020,7 @@ final class JSUTAndVoiceTests: XCTestCase {
         }
 
         XCTAssertEqual(checkedCount, targetPaths.count, "走査対象ファイル数が不一致です")
-        print("--- [JSUT & Voice Static Rule Check] ---")
+        print("--- [Voice & Audio Static Rule Check] ---")
         print("検証完了ファイル数: \(checkedCount) 件 (全ファイル規約適合)")
         print("----------------------------------------")
     }
