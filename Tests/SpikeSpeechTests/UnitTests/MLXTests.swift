@@ -250,4 +250,136 @@ final class MLXTests: XCTestCase {
         print("検証完了 MLX ファイル数: \(checkedFiles) 件 (全ファイル規約適合)")
         print("-------------------------------")
     }
+
+    // MARK: - 8. 学習率スケジューラ・Plateau ガード・シャッフル・チェックポイント検証
+
+    func testCosineWarmupScheduleValues() {
+        let schedule = CosineWarmupSchedule(
+            lrBase: 0.003,
+            lrMin: 1.0e-5,
+            warmupEpochs: 2,
+            totalEpochs: 15
+        )
+
+        // なぜ各エポックの計算値を検証するか:
+        // 仕様書で定めた数理テーブルと厳密に一致し、実効学習率の暴走や不連続変化がないことを保証するため
+        let expectedEpoch1: Float = 0.001505 // warmup step 1
+        let expectedEpoch2: Float = 0.003000 // warmup step 2 (peak)
+        let expectedEpoch3: Float = 0.002957 // cosine step
+        let expectedEpoch15: Float = 0.000010 // final step (lrMin)
+
+        let lr1 = schedule.learningRate(epoch: 0)
+        let lr2 = schedule.learningRate(epoch: 1)
+        let lr3 = schedule.learningRate(epoch: 2)
+        let lr15 = schedule.learningRate(epoch: 14)
+        let lrBeyond = schedule.learningRate(epoch: 20)
+
+        XCTAssertTrue(abs(lr1 - expectedEpoch1) < 1.0e-5, "Epoch 1 lr 不一致: \(lr1) vs \(expectedEpoch1)")
+        XCTAssertTrue(abs(lr2 - expectedEpoch2) < 1.0e-5, "Epoch 2 lr 不一致: \(lr2) vs \(expectedEpoch2)")
+        XCTAssertTrue(abs(lr3 - expectedEpoch3) < 1.0e-5, "Epoch 3 lr 不一致: \(lr3) vs \(expectedEpoch3)")
+        XCTAssertTrue(abs(lr15 - expectedEpoch15) < 1.0e-5, "Epoch 15 lr 不一致: \(lr15) vs \(expectedEpoch15)")
+        XCTAssertTrue(abs(lrBeyond - 1.0e-5) < 1.0e-6, "超過エポックで lrMin にクランプされていません: \(lrBeyond)")
+    }
+
+    func testPlateauGuardReaction() {
+        var guardState = PlateauGuard(patience: 2, factor: 0.5, relThreshold: 0.005)
+
+        // なぜ初期状態で 1.0 であることを確認するか: 最初は減衰がかかっていないことを保証するため
+        XCTAssertTrue(abs(guardState.decayMultiplier - 1.0) < 1.0e-6)
+
+        // 改善時は 1.0 を維持
+        let m1 = guardState.observe(epochLoss: 1.50)
+        XCTAssertTrue(abs(m1 - 1.0) < 1.0e-6)
+        let m2 = guardState.observe(epochLoss: 1.40)
+        XCTAssertTrue(abs(m2 - 1.0) < 1.0e-6)
+
+        // 1回目の悪化 (1.40 -> 1.45)
+        let m3 = guardState.observe(epochLoss: 1.45)
+        XCTAssertTrue(abs(m3 - 1.0) < 1.0e-6, "patience 未満で減衰してはならない")
+
+        // 2回目の悪化 (1.45 -> 1.48): patience=2 到達で 0.5 に減衰
+        let m4 = guardState.observe(epochLoss: 1.48)
+        XCTAssertTrue(abs(m4 - 0.5) < 1.0e-5, "patience 到達時に 0.5 に減衰していません: \(m4)")
+    }
+
+    func testTrainingShuffleDeterminismAndIntegrity() {
+        let baseSeed: UInt64 = 2026
+        let original = Array(0..<100)
+
+        var copy1 = original
+        var copy2 = original
+        var copy3 = original
+
+        let seedEp0 = TrainingShuffle.mixSeed(baseSeed: baseSeed, epoch: 0)
+        let seedEp1 = TrainingShuffle.mixSeed(baseSeed: baseSeed, epoch: 1)
+
+        TrainingShuffle.shuffleInPlace(&copy1, seed: seedEp0)
+        TrainingShuffle.shuffleInPlace(&copy2, seed: seedEp0)
+        TrainingShuffle.shuffleInPlace(&copy3, seed: seedEp1)
+
+        // なぜ決定論性を検証するか: 同じシード・エポックであれば全く同一の並び替えが再現されることを保証するため
+        XCTAssertEqual(copy1, copy2, "同一シードでのシャッフル結果が一致しません")
+        XCTAssertNotEqual(copy1, copy3, "異なるエポックでのシャッフル結果が変化していません")
+
+        // なぜ要素集合を検証するか: シャッフルによって要素が欠損・重複せず完全に保存されていることを保証するため
+        XCTAssertEqual(copy1.sorted(), original, "シャッフルによって要素が損なわれました")
+        XCTAssertEqual(copy3.sorted(), original, "シャッフルによって要素が損なわれました")
+    }
+
+    func testWeightCheckpointPathAndNaming() {
+        let name1 = WeightCheckpoint.epochFileName(epochOneIndexed: 1)
+        let name10 = WeightCheckpoint.epochFileName(epochOneIndexed: 10)
+        XCTAssertEqual(name1, "weights.ep01.json")
+        XCTAssertEqual(name10, "weights.ep10.json")
+
+        let path = WeightCheckpoint.resolvePath(directory: "Models", fileName: name1)
+        XCTAssertTrue(path.path.hasSuffix("Models/weights.ep01.json"))
+    }
+
+    func testBPTTTrainerWithAdamWAndNorms() {
+        let inDim = 16
+        let maxHidden = 32
+        let outDim = 16
+        let tSteps = 2
+
+        let network = MLXSpikingAcousticNetwork(
+            numLayers: 1,
+            inputDim: inDim,
+            maxHiddenDim: maxHidden,
+            outputDim: outDim,
+            timeSteps: tSteps,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1)
+        )
+
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            learningRate: 0.003,
+            bpttWindow: 16,
+            weightDecay: 1.0e-4
+        )
+
+        // 学習率の更新と取得の検証
+        trainer.setLearningRate(0.0015)
+        XCTAssertTrue(abs(trainer.currentLearningRate() - 0.0015) < 1.0e-6, "学習率の動的更新が反映されていません")
+
+        // 重みノルムの取得検証
+        let norms = trainer.weightNorms()
+        XCTAssertTrue(0.0 < norms.wIn, "wIn ノルムが正数ではありません")
+        XCTAssertTrue(0.0 < norms.wRec, "wRec ノルムが正数ではありません")
+        XCTAssertTrue(0.0 < norms.wOut, "wOut ノルムが正数ではありません")
+
+        // AdamW による損失減少検証
+        let seqLen = 32
+        let featSeq = [[Float]](repeating: [Float](repeating: 0.4, count: inDim), count: seqLen)
+        let targetSeq = [[Float]](repeating: [Float](repeating: 0.1, count: outDim), count: seqLen)
+
+        let initialLoss = trainer.trainSequence(features: featSeq, targets: targetSeq)
+        var stepLoss = initialLoss
+        var step = 0
+        while step < 15 {
+            stepLoss = trainer.trainSequence(features: featSeq, targets: targetSeq)
+            step += 1
+        }
+        XCTAssertTrue(stepLoss < initialLoss, "AdamW による BPTT 学習で損失が減少していません: initial=\(initialLoss), final=\(stepLoss)")
+    }
 }

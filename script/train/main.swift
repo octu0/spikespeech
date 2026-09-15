@@ -7,8 +7,13 @@ import SpikeSpeech
 /// SNN 音響モデル BPTT 学習 CLI
 func main() {
     let args = CommandLine.arguments
-    var epochs: Int = 30
-    var learningRate: Float = 0.005
+    var epochs: Int = 15
+    var learningRate: Float = 0.003
+    var lrMin: Float = 1.0e-5
+    var warmupEpochs: Int = 2
+    var weightDecay: Float = 1.0e-4
+    var shuffleSeed: UInt64 = 2026
+    var noShuffle: Bool = false
     var hiddenDim: Int = 256
     var numLayers: Int = 2
     var inDim: Int = 128
@@ -58,6 +63,40 @@ func main() {
                 }
                 i += 1
             }
+        case "--lr-min":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Float(args[nextIdx]) {
+                    lrMin = val
+                }
+                i += 1
+            }
+        case "--warmup-epochs":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Int(args[nextIdx]) {
+                    warmupEpochs = max(1, val)
+                }
+                i += 1
+            }
+        case "--wd", "--weight-decay":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Float(args[nextIdx]) {
+                    weightDecay = val
+                }
+                i += 1
+            }
+        case "--shuffle-seed":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = UInt64(args[nextIdx]) {
+                    shuffleSeed = val
+                }
+                i += 1
+            }
+        case "--no-shuffle":
+            noShuffle = true
         case "--hidden-dim":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -113,7 +152,7 @@ func main() {
         case "--fresh":
             forceFresh = true
         case "-h", "--help":
-            print("Usage: train [-d <jsut_dir>] [-s <samples>] [-e <epochs>] [--lr <learning_rate>] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
+            print("Usage: train [-d <jsut_dir>] [-s <samples>] [-e <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
             return
         default:
             break
@@ -165,12 +204,15 @@ func main() {
     print("==================================================")
     print("SpikeSpeech SNN 音響モデル BPTT 学習パイプライン")
     print("==================================================")
-    print("エポック数:   \(epochs)")
-    print("学習率:       \(learningRate)")
-    print("隠れ層次元:   \(hiddenDim)")
-    print("層数:         \(numLayers)")
-    print("教師音声基準: JSUT (女性単一話者 VoiceProfile.female.tract Prior)")
-    print("出力パス:     \(outputPath)")
+    print("エポック数:       \(epochs)")
+    print("学習率 (初期/下限): \(learningRate) / \(lrMin)")
+    print("ウォームアップ:   \(warmupEpochs) エポック")
+    print("Weight Decay:     \(weightDecay)")
+    print("シャッフルシード: \(shuffleSeed)")
+    print("隠れ層次元:       \(hiddenDim)")
+    print("層数:             \(numLayers)")
+    print("教師音声基準:     JSUT (女性単一話者 VoiceProfile.female.tract Prior)")
+    print("出力パス:         \(outputPath)")
     print("--------------------------------------------------")
 
     // 既存の学習済み重みが存在する場合はウォームスタートし、学習の蓄積と損失減少の継続性を確保する
@@ -337,18 +379,46 @@ func main() {
 
     let network = MLXSpikingAcousticNetwork(weights: weights)
 
+    let schedule = CosineWarmupSchedule(
+        lrBase: learningRate,
+        lrMin: lrMin,
+        warmupEpochs: warmupEpochs,
+        totalEpochs: epochs
+    )
+    var plateau = PlateauGuard(patience: 2, factor: 0.5, relThreshold: 0.005)
+
     let trainer = MLXAcousticBPTTTrainer(
         network: network,
-        learningRate: learningRate,
-        bpttWindow: 16
+        learningRate: schedule.learningRate(epoch: 0),
+        bpttWindow: 16,
+        weightDecay: weightDecay
     )
 
     print("BPTT 最適化ループを開始します...")
     var initialLoss: Float = 0.0
     var finalLoss: Float = 0.0
+    var bestLoss = Float.greatestFiniteMagnitude
+    var bestEpoch = -1
+
+    let outputURL = URL(fileURLWithPath: outputPath)
+    let outputDir = outputURL.deletingLastPathComponent().path
 
     var epoch = 0
     while epoch < epochs {
+        // なぜエポックごとにシャッフルするか:
+        // データセットの固定順序による周期的勾配ドリフトバイアスを排除するため
+        if noShuffle != true {
+            let seed = TrainingShuffle.mixSeed(baseSeed: shuffleSeed, epoch: epoch)
+            TrainingShuffle.shuffleInPlace(&trainingData, seed: seed)
+        }
+
+        let lr = resolvedLearningRate(
+            schedule: schedule,
+            epoch: epoch,
+            plateauMultiplier: plateau.decayMultiplier
+        )
+        trainer.setLearningRate(lr)
+
         var epochLossSum: Float = 0.0
         var batchCount = 0
 
@@ -374,19 +444,28 @@ func main() {
         }
         finalLoss = avgLoss
 
-        print("  [Epoch \(epoch + 1)/\(epochs)] 平均損失: \(String(format: "%.6f", avgLoss))")
+        plateau.observe(epochLoss: avgLoss)
+        let norms = trainer.weightNorms()
 
-        // 5エポックごとに中間チェックポイントを最新重みファイルへアトミック保存する。
-        if (epoch + 1) % 5 == 0 || epoch + 1 == epochs {
-            let intermediateWeights = network.exportWeights()
-            do {
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = .prettyPrinted
-                let intermediateData = try encoder.encode(intermediateWeights)
-                try intermediateData.write(to: URL(fileURLWithPath: outputPath))
-            } catch {
-                print("チェックポイント書き込み失敗: \(error)")
-            }
+        print("  [Epoch \(epoch + 1)/\(epochs)] 平均損失: \(String(format: "%.6f", avgLoss))  lr=\(String(format: "%.6g", lr))  ||wRec||=\(String(format: "%.4f", norms.wRec))  ||wOut||=\(String(format: "%.4f", norms.wOut))")
+
+        // なぜ最良エポックを記録するか: ログ上でどのエポックが最良だったか即座に判別できるようにするため
+        if avgLoss < bestLoss {
+            bestLoss = avgLoss
+            bestEpoch = epoch + 1
+        }
+
+        // なぜ毎エポックスナップショットを保存するか:
+        // 学習途中での最良パラメータが後続エポックで失われることを防ぎ、任意時点へのロールバックを可能にするため
+        let epURL = WeightCheckpoint.resolvePath(
+            directory: outputDir,
+            fileName: WeightCheckpoint.epochFileName(epochOneIndexed: epoch + 1)
+        )
+        let intermediateWeights = network.exportWeights()
+        do {
+            try WeightCheckpoint.atomicWritePretty(intermediateWeights, to: epURL)
+        } catch {
+            print("警告: エポックスナップショット保存失敗 (\(epURL.path)): \(error)")
         }
 
         epoch += 1
@@ -397,9 +476,10 @@ func main() {
     if 0.0 < initialLoss {
         reductionRate = (initialLoss - finalLoss) / initialLoss
     }
-    print("初期損失:   \(String(format: "%.6f", initialLoss))")
-    print("最終損失:   \(String(format: "%.6f", finalLoss))")
-    print("損失減少率: \(String(format: "%.2f", reductionRate * 100.0))%")
+    print("初期損失:     \(String(format: "%.6f", initialLoss))")
+    print("最良エポック: Epoch \(bestEpoch) (損失: \(String(format: "%.6f", bestLoss)))")
+    print("最終損失:     \(String(format: "%.6f", finalLoss))")
+    print("損失減少率:   \(String(format: "%.2f", reductionRate * 100.0))%")
 
     if 1 < epochs {
         if finalLoss < initialLoss {
@@ -413,14 +493,11 @@ func main() {
 
     let exportedWeights = network.exportWeights()
     do {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        let jsonData = try encoder.encode(exportedWeights)
-        let outputURL = URL(fileURLWithPath: outputPath)
-        try jsonData.write(to: outputURL)
-        print("モデル重みを保存しました: \(outputPath) (\(jsonData.count) バイト)")
+        try WeightCheckpoint.atomicWritePretty(exportedWeights, to: outputURL)
+        let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
+        print("最終モデル重みを保存しました: \(outputPath) (\(dataCount) バイト)")
     } catch {
-        print("エラー: 重みの書き出しに失敗しました: \(error)")
+        print("エラー: 最終重みの書き出しに失敗しました: \(error)")
         return
     }
 

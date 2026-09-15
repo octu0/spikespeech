@@ -255,21 +255,60 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
 /// Truncated BPTT と 32 アライメントを統合し、リソースリークを防ぎつつ最適化を行う。
 public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingAcousticNetwork
-    public let optimizer: Adam
+    public let optimizer: AdamW
     public let bpttWindow: Int
 
     public init(
         network: MLXSpikingAcousticNetwork,
-        learningRate: Float = 0.001,
-        bpttWindow: Int = 16
+        learningRate: Float = 0.003,
+        bpttWindow: Int = 16,
+        weightDecay: Float = 1.0e-4
     ) {
         self.network = network
-        self.optimizer = Adam(learningRate: learningRate)
+        // なぜ AdamW を採用し weightDecay 1e-4 を指定するか:
+        // オンライン学習における再帰重み・出力重みの過大成長と膜電位クランプ飽和を防ぎ、
+        // コサイン減衰スケジューラと整合する正則化を decoupled に効かせるため。
+        self.optimizer = AdamW(
+            learningRate: learningRate,
+            betas: (0.9, 0.999),
+            eps: 1e-8,
+            weightDecay: weightDecay,
+            biasCorrection: true
+        )
         if bpttWindow <= 1 {
             self.bpttWindow = 1
         } else {
             self.bpttWindow = bpttWindow
         }
+    }
+
+    /// スケジューラからのエポックごとの学習率更新を反映する。
+    /// なぜオプティマイザを再生成せず learningRate プロパティを直接更新するか:
+    /// Adam の蓄積された一次・二次モーメントを破棄せず連続性を維持するため。
+    public func setLearningRate(_ lr: Float) {
+        var safe = lr
+        if safe.isFinite != true || safe < 0.0 {
+            safe = 0.0
+        }
+        optimizer.learningRate = safe
+    }
+
+    public func currentLearningRate() -> Float {
+        return optimizer.learningRate
+    }
+
+    /// 各重み行列のフロベニウスノルムを算出し、学習中の重み肥大化・発散を診断する。
+    public func weightNorms() -> (wIn: Float, wRec: Float, wOut: Float, wLayer0: Float) {
+        eval(network.wIn, network.wRec, network.wOut)
+        let nIn = sqrt(sum(network.wIn * network.wIn).item(Float.self))
+        let nRec = sqrt(sum(network.wRec * network.wRec).item(Float.self))
+        let nOut = sqrt(sum(network.wOut * network.wOut).item(Float.self))
+        var nL0: Float = 0.0
+        if 0 < network.wLayers.count {
+            eval(network.wLayers[0])
+            nL0 = sqrt(sum(network.wLayers[0] * network.wLayers[0]).item(Float.self))
+        }
+        return (wIn: nIn, wRec: nRec, wOut: nOut, wLayer0: nL0)
     }
 
     /// 系列長を 32 の倍数に切り上げる。
