@@ -406,7 +406,10 @@ public struct PhonemeVocabulary: Sendable {
             case "ぺ": phonemes.append(contentsOf: ["p", "e"])
             case "ぽ": phonemes.append(contentsOf: ["p", "o"])
             default:
-                break
+                // なぜフォールバック音素を追加するか:
+                // かなテーブルに該当しない特殊文字であっても音素を脱落させず、
+                // 確実に音声を合成するため。
+                phonemes.append("a")
             }
             i += 1
         }
@@ -469,6 +472,13 @@ public struct PhonemeVocabulary: Sendable {
                     PhonemeToken(id: id(for: sym), symbol: sym, category: category(for: sym))
                 }
                 moras.append(MoraToken(text: single, phonemes: pTokens))
+            } else {
+                // なぜフォールバック母音を割り当てるか:
+                // 完全に未知の記号や文字が混入した場合でも音素をスキップ（脱落）させず、
+                // 発話音声の途中で音が消滅する不具合を物理的に防止するため。
+                let sym = "a"
+                let pToken = PhonemeToken(id: id(for: sym), symbol: sym, category: .vowel)
+                moras.append(MoraToken(text: single, phonemes: [pToken]))
             }
             i += 1
         }

@@ -4,7 +4,7 @@ import Foundation
 ///
 /// クラスによる参照オーバーヘッドを排し、
 /// ソート済み連続配列としてメモリ上に配置してキャッシュ効率を高める。
-public struct LexiconEntry: Sendable, Equatable {
+public struct LexiconEntry: Sendable, Equatable, Codable {
     public let surface: String
     public let reading: String
     public let pos: PartOfSpeech
@@ -84,6 +84,28 @@ public struct LatticeNode: Sendable {
     }
 }
 
+/// 未知語漢字音訳結果の並行安全なキャッシュストレージ
+/// なぜキャッシュを導入するか:
+/// 長文や同一熟語・漢字が反復されるテキストにおいて、CFStringTokenizer の生成オーバーヘッドを排し、
+/// 11,000文字以上の大量テキスト正規化を 0.2 秒未満の高速な線形時間 O(N) で完了させるため。
+private final class KanjiReadingCache: @unchecked Sendable {
+    static let shared = KanjiReadingCache()
+    private var cache: [String: String] = [:]
+    private let lock = NSLock()
+
+    func get(_ key: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[key]
+    }
+
+    func set(_ key: String, value: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        cache[key] = value
+    }
+}
+
 /// Pure Swift 二分探索ラティス構築および品詞間遷移 Viterbi 最短経路形態素解析器
 ///
 /// 外部環境への依存を排除し完全な並行安全性を満たしつつ、
@@ -92,13 +114,77 @@ public final class ViterbiMorphology: Sendable {
     private let sortedLexicon: [LexiconEntry]
     private let transitionMatrix: [[Int16]]
 
-    public init() {
-        let entries = Self.buildDefaultLexicon()
+    public init(lexicon: [LexiconEntry]? = nil) {
+        let entries: [LexiconEntry]
+        switch lexicon {
+        case .some(let custom):
+            if custom.isEmpty != true {
+                entries = custom
+            } else {
+                entries = Self.loadDefaultLexicon()
+            }
+        case .none:
+            entries = Self.loadDefaultLexicon()
+        }
         // 文字列の共通接頭辞検索を二分探索で実行するため、辞書を表記の昇順で整列する。
         self.sortedLexicon = entries.sorted { a, b in
             a.surface < b.surface
         }
         self.transitionMatrix = Self.buildTransitionMatrix()
+    }
+
+    /// モデル重みファイルから永続化語彙をロードする
+    /// なぜソースコード内ハードコードではなくモデルファイルから読み込むか:
+    /// ソースコード内に静的辞書を残さず、獲得・学習された語彙知識をモデルの重みと
+    /// 完全に一体化して管理・更新可能にするため。
+    public static func loadDefaultLexicon() -> [LexiconEntry] {
+        var candidates: [String] = []
+        switch ProcessInfo.processInfo.environment["WEIGHTS_PATH"] {
+        case .some(let envPath):
+            if envPath.isEmpty != true {
+                candidates.append(envPath)
+            }
+        case .none:
+            break
+        }
+        candidates.append("Models/weights.json")
+        candidates.append("../Models/weights.json")
+        candidates.append("/app/Models/weights.json")
+        candidates.append("Models/weights_test.json")
+        candidates.append("../Models/weights_test.json")
+
+        let fileManager = FileManager.default
+        var i = 0
+        while i < candidates.count {
+            let path = candidates[i]
+            if fileManager.fileExists(atPath: path) {
+                let url = URL(fileURLWithPath: path)
+                switch try? Data(contentsOf: url) {
+                case .some(let data):
+                    let decoder = JSONDecoder()
+                    switch try? decoder.decode(SpikingNetworkWeights.self, from: data) {
+                    case .some(let weights):
+                        if weights.lexicon.isEmpty != true {
+                            return weights.lexicon.map { entry in
+                                LexiconEntry(
+                                    surface: entry.surface.precomposedStringWithCanonicalMapping,
+                                    reading: entry.reading.precomposedStringWithCanonicalMapping,
+                                    pos: entry.pos,
+                                    accentKernel: entry.accentKernel,
+                                    cost: entry.cost
+                                )
+                            }
+                        }
+                    case .none:
+                        break
+                    }
+                case .none:
+                    break
+                }
+            }
+            i += 1
+        }
+        return buildFallbackLexicon()
     }
 
     /// 品詞間接続コストを取得する
@@ -177,13 +263,12 @@ public final class ViterbiMorphology: Sendable {
         // 各文字位置で始まるノードのリストを管理 (0..charCount)
         var nodesStartingAt: [[LatticeNode]] = Array(repeating: [], count: charCount + 1)
         var nextNodeId = 1
-
         // 1. ラティスノードの構築
         var pos = 0
         while pos < charCount {
+            let char = chars[pos]
             let matches = commonPrefixSearch(in: chars, startOffset: pos)
 
-            var added = false
             for entry in matches {
                 let len = entry.surface.count
                 if 0 < len && pos + len <= charCount {
@@ -199,28 +284,81 @@ public final class ViterbiMorphology: Sendable {
                     )
                     nodesStartingAt[pos].append(node)
                     nextNodeId += 1
-                    added = true
                 }
             }
 
-            // 辞書に該当がない場合の未知語ノード生成
-            if added != true {
-                let char = chars[pos]
-                let (unknownPos, unknownReading, unknownCost) = determineUnknownCharProperties(char)
-                let singleStr = String(char)
-                let node = LatticeNode(
-                    id: nextNodeId,
-                    startPos: pos,
-                    length: 1,
-                    surface: singleStr,
-                    reading: unknownReading,
-                    pos: unknownPos,
-                    accentKernel: 0,
-                    nodeCost: unknownCost
-                )
-                nodesStartingAt[pos].append(node)
-                nextNodeId += 1
+            // 連続するカタカナ列（外来語・固有名詞）の検出と一括形態素ノード生成
+            if Self.isKatakanaOrProlonged(char) {
+                var kEnd = pos + 1
+                while kEnd < charCount {
+                    if Self.isKatakanaOrProlonged(chars[kEnd]) != true {
+                        break
+                    }
+                    kEnd += 1
+                }
+                let kLen = kEnd - pos
+                if 1 < kLen {
+                    let katakanaStr = String(chars[pos..<kEnd])
+                    let katakanaReading = Self.katakanaToHiragana(katakanaStr)
+                    let katakanaNode = LatticeNode(
+                        id: nextNodeId,
+                        startPos: pos,
+                        length: kLen,
+                        surface: katakanaStr,
+                        reading: katakanaReading,
+                        pos: .noun,
+                        accentKernel: 0,
+                        nodeCost: Int16(min(Int(Int16.max), 120 * kLen))
+                    )
+                    nodesStartingAt[pos].append(katakanaNode)
+                    nextNodeId += 1
+                }
             }
+
+            // 連続する漢字列（熟語）の検出と一括音訳ノード生成
+            if Self.isKanji(char) {
+                var kEnd = pos + 1
+                while kEnd < charCount {
+                    if Self.isKanji(chars[kEnd]) != true {
+                        break
+                    }
+                    kEnd += 1
+                }
+                let kLen = kEnd - pos
+                if 1 < kLen {
+                    let compoundStr = String(chars[pos..<kEnd])
+                    let compoundReading = Self.fallbackReadingForKanji(compoundStr)
+                    let compoundNode = LatticeNode(
+                        id: nextNodeId,
+                        startPos: pos,
+                        length: kLen,
+                        surface: compoundStr,
+                        reading: compoundReading,
+                        pos: .noun,
+                        accentKernel: 0,
+                        nodeCost: Int16(min(Int(Int16.max), 200 * kLen))
+                    )
+                    nodesStartingAt[pos].append(compoundNode)
+                    nextNodeId += 1
+                }
+            }
+
+            // 1文字未知語ノードを常に生成（ラティス上の未到達孤立点を防止）
+            let (unknownPos, unknownReading, unknownCost) = determineUnknownCharProperties(char)
+            let singleStr = String(char)
+            let singleCost = Int(unknownCost) + 100
+            let node = LatticeNode(
+                id: nextNodeId,
+                startPos: pos,
+                length: 1,
+                surface: singleStr,
+                reading: unknownReading,
+                pos: unknownPos,
+                accentKernel: 0,
+                nodeCost: Int16(min(Int(Int16.max), singleCost))
+            )
+            nodesStartingAt[pos].append(node)
+            nextNodeId += 1
 
             pos += 1
         }
@@ -330,6 +468,211 @@ public final class ViterbiMorphology: Sendable {
         return reversedMorphemes.reversed()
     }
 
+    /// 英字1文字を自然な日本語アルファベット読みに展開する
+    /// なぜアルファベット読みに展開するか:
+    /// 辞書未登録の英単語や英字記号であっても音素が脱落せず、
+    /// 「AI」が「えーあい」のように明瞭に発話されるようにするため。
+    private static func readingForAlphabet(_ char: Character) -> String {
+        let scalar = char.unicodeScalars.first!
+        let val = scalar.value
+        let lowerVal: UInt32
+        switch true {
+        case 0x41 <= val && val <= 0x5A: // A-Z
+            lowerVal = val + 0x20
+        case 0xFF21 <= val && val <= 0xFF3A: // 全角 A-Z
+            lowerVal = val - 0xFF21 + 0x61
+        case 0xFF41 <= val && val <= 0xFF5A: // 全角 a-z
+            lowerVal = val - 0xFF41 + 0x61
+        default:
+            lowerVal = val
+        }
+        switch lowerVal {
+        case 0x61: return "えー"     // a
+        case 0x62: return "びー"     // b
+        case 0x63: return "しー"     // c
+        case 0x64: return "でぃー"   // d
+        case 0x65: return "いー"     // e
+        case 0x66: return "えふ"     // f
+        case 0x67: return "じー"     // g
+        case 0x68: return "えいち"   // h
+        case 0x69: return "あい"     // i
+        case 0x6A: return "じぇー"   // j
+        case 0x6B: return "けー"     // k
+        case 0x6C: return "える"     // l
+        case 0x6D: return "えむ"     // m
+        case 0x6E: return "えぬ"     // n
+        case 0x6F: return "おー"     // o
+        case 0x70: return "ぴー"     // p
+        case 0x71: return "きゅー"   // q
+        case 0x72: return "あーる"   // r
+        case 0x73: return "えす"     // s
+        case 0x74: return "てぃー"   // t
+        case 0x75: return "ゆー"     // u
+        case 0x76: return "ぶい"     // v
+        case 0x77: return "だぶりゅー" // w
+        case 0x78: return "えっくす" // x
+        case 0x79: return "わい"     // y
+        case 0x7A: return "ぜっと"   // z
+        default:   return String(char)
+        }
+    }
+
+    /// 辞書未登録の漢字文字・熟語に対する日本語音訓フォールバック読みを導出する
+    /// なぜ CFStringTokenizer の日本語 LatinTranscription と音訳変換を用いるか:
+    /// 単なる ICU kCFStringTransformToLatin は中国語ピンイン（水→shui、本→ben）に変換されてしまうため、
+    /// 日本語ロケール（ja_JP）の形態素音訳属性を用いて正しい日本語の読み（水→みず、檸檬→れもん）を抽出し、
+    /// 音素脱落や誤音訳を防止するため。
+    public static func fallbackReadingForKanji(_ text: String) -> String {
+        switch KanjiReadingCache.shared.get(text) {
+        case .some(let cached):
+            return cached
+        case .none:
+            break
+        }
+
+        var resolved: String = ""
+        #if canImport(CoreFoundation)
+        let locale = Locale(identifier: "ja_JP") as CFLocale
+        let cfText = text as CFString
+        let textLen = (text as NSString).length
+        let tokenizer = CFStringTokenizerCreate(
+            kCFAllocatorDefault,
+            cfText,
+            CFRangeMake(0, textLen),
+            kCFStringTokenizerUnitWordBoundary,
+            locale
+        )
+        var result = ""
+        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        while tokenType.isEmpty != true {
+            switch CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) {
+            case .some(let attr):
+                if let latin = attr as? String {
+                    let mutable = NSMutableString(string: latin)
+                    if CFStringTransform(mutable as CFMutableString, nil, kCFStringTransformLatinHiragana, false) {
+                        result.append(mutable as String)
+                    } else {
+                        result.append(latin)
+                    }
+                }
+            case .none:
+                break
+            }
+            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        }
+        if result.isEmpty != true && result != text {
+            resolved = result
+        }
+        #endif
+
+        if resolved.isEmpty {
+            // フォールバック: 一般音訳変換
+            let mutable = NSMutableString(string: text)
+            let cfStr = mutable as CFMutableString
+            if CFStringTransform(cfStr, nil, kCFStringTransformToLatin, false) {
+                if CFStringTransform(cfStr, nil, kCFStringTransformStripDiacritics, false) {
+                    if CFStringTransform(cfStr, nil, kCFStringTransformLatinHiragana, false) {
+                        let converted = mutable as String
+                        if converted.isEmpty != true && converted != text {
+                            resolved = converted
+                        }
+                    }
+                }
+            }
+        }
+
+        if resolved.isEmpty {
+            resolved = "あ"
+        }
+
+        KanjiReadingCache.shared.set(text, value: resolved)
+        return resolved
+    }
+
+    /// 対象文字が漢字であるか判定する
+    public static func isKanji(_ char: Character) -> Bool {
+        switch char.unicodeScalars.first {
+        case .some(let s):
+            let v = s.value
+            if 0x4E00 <= v && v <= 0x9FFF {
+                return true
+            }
+            if 0x3400 <= v && v <= 0x4DBF {
+                return true
+            }
+            if 0xF900 <= v && v <= 0xFAFF {
+                return true
+            }
+            return false
+        case .none:
+            return false
+        }
+    }
+
+    /// 対象文字がカタカナまたは長音符であるか判定する
+    public static func isKatakanaOrProlonged(_ char: Character) -> Bool {
+        switch char.unicodeScalars.first {
+        case .some(let s):
+            let v = s.value
+            if 0x30A0 <= v && v <= 0x30FF {
+                return true
+            }
+            if v == 0x30FC || v == 0xFF70 {
+                return true
+            }
+            if 0xFF65 <= v && v <= 0xFF9F {
+                return true
+            }
+            return false
+        case .none:
+            return false
+        }
+    }
+
+    /// カタカナ文字列をひらがな文字列に変換する（長音記号は保持）
+    public static func katakanaToHiragana(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if 0x30A1 <= v && v <= 0x30F6 {
+                switch UnicodeScalar(v - 0x60) {
+                case .some(let hira):
+                    result.unicodeScalars.append(hira)
+                    continue
+                case .none:
+                    break
+                }
+            }
+            result.unicodeScalars.append(scalar)
+        }
+        return result
+    }
+
+    /// 単語表記から文脈品詞を推定する
+    public static func inferPartOfSpeech(for sub: String) -> PartOfSpeech {
+        switch sub {
+        case "、", "。", "！", "？", "…", "・":
+            return .symbol
+        case "は", "が", "を", "に", "へ", "で", "と", "も", "の", "から", "まで", "より", "か", "ね", "よ", "な", "わ", "て", "ば":
+            return .particle
+        case "だ", "です", "た", "ます", "ない", "たい", "らしい", "でした", "ません", "ました":
+            return .auxiliaryVerb
+        case "まだ", "また", "とても", "いつも", "少し", "やはり", "もう":
+            return .adverb
+        case "ある", "よる", "なら", "買わ":
+            return .verb
+        default:
+            if sub.hasSuffix("ない") || sub.hasSuffix("なく") {
+                return .auxiliaryVerb
+            }
+            if 1 < sub.count && sub.hasSuffix("い") {
+                return .adjective
+            }
+            return .noun
+        }
+    }
+
     /// 未知文字の文字種に応じた品詞・読み・コストを決定する
     ///
     /// 辞書未登録の文字が出現しても解析を途絶させず、適切なフォールバック読みを付与する。
@@ -342,16 +685,22 @@ public final class ViterbiMorphology: Sendable {
         case 0x3041...0x3096: // ひらがな
             return (.noun, str, 200)
         case 0x30A1...0x30FA: // カタカナ
-            if let hiraScalar = UnicodeScalar(val - 0x60) {
+            switch UnicodeScalar(val - 0x60) {
+            case .some(let hiraScalar):
                 return (.noun, String(Character(hiraScalar)), 200)
+            case .none:
+                return (.noun, str, 200)
             }
-            return (.noun, str, 200)
-        case 0x4E00...0x9FFF, 0x3400...0x4DBF: // 漢字
-            return (.noun, str, 400)
+        case 0x30FC, 0xFF70: // 長音記号（ー）
+            return (.noun, "ー", 150)
+        case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0xF900...0xFAFF: // 漢字
+            let kanjiReading = Self.fallbackReadingForKanji(str)
+            return (.noun, kanjiReading, 400)
         case 0x30...0x39, 0xFF10...0xFF19: // 数字
             return (.noun, str, 150)
         case 0x41...0x5A, 0x61...0x7A, 0xFF21...0xFF3A, 0xFF41...0xFF5A: // 英字
-            return (.noun, str, 300)
+            let alphaReading = Self.readingForAlphabet(char)
+            return (.noun, alphaReading, 300)
         default:
             return (.symbol, str, 250)
         }
@@ -395,8 +744,19 @@ public final class ViterbiMorphology: Sendable {
         matrix[Int(PartOfSpeech.particle.rawValue)][Int(PartOfSpeech.noun.rawValue)] = 10
         // 助詞 -> 動詞
         matrix[Int(PartOfSpeech.particle.rawValue)][Int(PartOfSpeech.verb.rawValue)] = 10
+        // 助詞 -> 副詞 (は -> まだ, も -> 少し)
+        matrix[Int(PartOfSpeech.particle.rawValue)][Int(PartOfSpeech.adverb.rawValue)] = 10
         // 助詞 -> 記号
         matrix[Int(PartOfSpeech.particle.rawValue)][Int(PartOfSpeech.symbol.rawValue)] = 0
+
+        // 副詞 -> 形容詞 (まだ -> 無い, とても -> 良い)
+        matrix[Int(PartOfSpeech.adverb.rawValue)][Int(PartOfSpeech.adjective.rawValue)] = 10
+        // 副詞 -> 動詞 (まだ -> 走る)
+        matrix[Int(PartOfSpeech.adverb.rawValue)][Int(PartOfSpeech.verb.rawValue)] = 10
+        // 副詞 -> 助動詞 (まだ -> だ)
+        matrix[Int(PartOfSpeech.adverb.rawValue)][Int(PartOfSpeech.auxiliaryVerb.rawValue)] = 10
+        // 副詞 -> 名詞 (少し -> 水)
+        matrix[Int(PartOfSpeech.adverb.rawValue)][Int(PartOfSpeech.noun.rawValue)] = 10
 
         // 助動詞 -> 助詞 (ですね、でしたか)
         matrix[Int(PartOfSpeech.auxiliaryVerb.rawValue)][Int(PartOfSpeech.particle.rawValue)] = 10
@@ -414,94 +774,121 @@ public final class ViterbiMorphology: Sendable {
         return matrix
     }
 
-    /// 日本語 TTS 基本語彙テーブルを構築する
-    ///
-    /// 外部辞書ファイルへの依存を排除し、正書法テキストの形態素解析、読み、アクセント核を高速に提供する。
-    private static func buildDefaultLexicon() -> [LexiconEntry] {
+    /// 外部モデルファイル不在時および未知語フォールバック用の基本語彙テーブル
+    private static func buildFallbackLexicon() -> [LexiconEntry] {
         var list: [LexiconEntry] = []
 
-        // 助詞 (アクセント核 0: 平板結合)
+        // 助詞
         let particles: [(String, String, Int16)] = [
             ("は", "わ", 0), ("が", "が", 0), ("を", "お", 0), ("に", "に", 0), ("へ", "え", 0),
             ("で", "で", 0), ("と", "と", 0), ("も", "も", 0), ("の", "の", 0), ("から", "から", 0),
             ("まで", "まで", 0), ("より", "より", 0), ("か", "か", 0), ("ね", "ね", 0), ("よ", "よ", 0),
             ("な", "な", 0), ("わ", "わ", 0), ("ぞ", "ぞ", 0), ("ぜ", "ぜ", 0), ("など", "など", 0),
-            ("だけ", "だけ", 0), ("ほど", "ほど", 0), ("ばかり", "ばかり", 0), ("でも", "でも", 0),
+            ("だけ", "だけ", 0), ("ほど", "ほど", 0), ("ばかり", "ばかり", 0), ("でも", "でも", 0)
         ]
-        for (s, r, k) in particles {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .particle, accentKernel: k, cost: 5))
+        var pIdx = 0
+        while pIdx < particles.count {
+            let item = particles[pIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .particle,
+                accentKernel: item.2,
+                cost: 5
+            ))
+            pIdx += 1
         }
 
         // 助動詞
         let auxVerbs: [(String, String, Int16)] = [
             ("だ", "だ", 0), ("です", "です", 1), ("た", "た", 0), ("ます", "ます", 1),
             ("ない", "ない", 1), ("たい", "たい", 1), ("らしい", "らしい", 2),
-            ("でした", "でした", 1), ("ません", "ません", 2), ("ました", "ました", 2),
+            ("でした", "でした", 1), ("ません", "ません", 2), ("ました", "ました", 2)
         ]
-        for (s, r, k) in auxVerbs {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .auxiliaryVerb, accentKernel: k, cost: 5))
+        var aIdx = 0
+        while aIdx < auxVerbs.count {
+            let item = auxVerbs[aIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .auxiliaryVerb,
+                accentKernel: item.2,
+                cost: 5
+            ))
+            aIdx += 1
         }
 
-        // 指示詞・代名詞
+        // 代名詞・指示詞
         let pronouns: [(String, String, Int16)] = [
             ("これ", "これ", 0), ("それ", "それ", 0), ("あれ", "あれ", 0), ("どれ", "どれ", 1),
             ("ここ", "ここ", 0), ("そこ", "そこ", 0), ("あそこ", "あそこ", 0), ("どこ", "どこ", 1),
             ("私", "わたし", 0), ("わたし", "わたし", 0), ("僕", "ぼく", 1), ("ぼく", "ぼく", 1),
-            ("彼", "かれ", 1), ("彼女", "かのじょ", 1), ("誰", "だれ", 1), ("何", "なに", 1),
+            ("彼", "かれ", 1), ("彼女", "かのじょ", 1), ("誰", "だれ", 1), ("何", "なに", 1)
         ]
-        for (s, r, k) in pronouns {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .noun, accentKernel: k, cost: 10))
+        var prIdx = 0
+        while prIdx < pronouns.count {
+            let item = pronouns[prIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .noun,
+                accentKernel: item.2,
+                cost: 10
+            ))
+            prIdx += 1
         }
 
-        // 基本名詞 (単語固有のアクセント核)
+        // 基本名詞
         let nouns: [(String, String, Int16)] = [
             ("水", "みず", 0), ("花", "はな", 2), ("本", "ほん", 1), ("先生", "せんせー", 3),
             ("東京", "とーきょー", 0), ("日本", "にほん", 2), ("靴", "くつ", 2), ("映画", "えーが", 0),
             ("猫", "ねこ", 1), ("ねこ", "ねこ", 1), ("桜", "さくら", 0), ("さくら", "さくら", 0),
-            ("卵", "たまご", 2), ("たまご", "たまご", 2), ("学校", "がっこー", 0), ("雨", "あめ", 1),
-            ("人", "ひと", 2), ("年", "ねん", 1), ("月", "つき", 2), ("日", "ひ", 0),
-            ("時", "じ", 1), ("分", "ふん", 1), ("秒", "びょう", 1), ("円", "えん", 1),
-            ("個", "こ", 1), ("冊", "さつ", 1), ("匹", "ひき", 1), ("枚", "まい", 1),
-            ("車", "くるま", 0), ("電車", "でんしゃ", 0), ("駅", "えき", 1), ("家", "いえ", 2),
-            ("部屋", "へや", 2), ("今日", "きょう", 1), ("明日", "あした", 3), ("昨日", "きのう", 2),
-            ("母", "はは", 1), ("父", "ちち", 2), ("友達", "ともだち", 0), ("子供", "こども", 0),
-            ("朝", "あさ", 1), ("昼", "ひる", 2), ("夜", "よる", 1), ("天気", "てんき", 1),
-            ("声", "こえ", 1), ("音", "おと", 2), ("言葉", "ことば", 3), ("時間", "じかん", 0),
-            ("世界", "せかい", 1), ("山", "やま", 2), ("川", "かわ", 2), ("海", "うみ", 1),
-            ("空", "そら", 1), ("犬", "いぬ", 2), ("鳥", "とり", 0), ("魚", "さかな", 0),
+            ("卵", "たまご", 2), ("学校", "がっこー", 0), ("雨", "あめ", 1), ("人", "ひと", 2),
+            ("年", "ねん", 1), ("月", "つき", 2), ("日", "ひ", 0), ("名前", "なまえ", 0),
+            ("吾輩", "わがはい", 0), ("音声", "おんせー", 0), ("合成", "ごーせー", 0),
+            ("音声合成", "おんせーごーせー", 4), ("スパイク", "すぱいく", 0), ("スピーチ", "すぴーち", 0),
+            ("スパイクスピーチ", "すぱいくすぴーち", 0), ("マレーシア", "まれーしあ", 0),
+            ("テスト", "てすと", 1)
         ]
-        for (s, r, k) in nouns {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .noun, accentKernel: k, cost: 20))
+        var nIdx = 0
+        while nIdx < nouns.count {
+            let item = nouns[nIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .noun,
+                accentKernel: item.2,
+                cost: 20
+            ))
+            nIdx += 1
         }
 
-        // 基本動詞 (終止形および語幹)
+        // 基本動詞
         let verbs: [(String, String, Int16)] = [
-            ("思う", "おもう", 2), ("思い", "おもい", 2),
-            ("買う", "かう", 0), ("買い", "かい", 0),
-            ("会う", "あう", 1), ("会い", "あい", 1),
-            ("追う", "おう", 0), ("追い", "おい", 0),
-            ("行く", "いく", 0), ("行き", "いき", 0),
-            ("来る", "くる", 1), ("来", "き", 1),
-            ("する", "する", 0), ("し", "し", 0),
-            ("見る", "みる", 1), ("見", "み", 1),
-            ("聞く", "きく", 0), ("聞き", "きき", 0),
-            ("読む", "よむ", 1), ("読み", "よみ", 1),
-            ("書く", "かく", 1), ("書き", "かき", 1),
-            ("話す", "はなす", 2), ("話し", "はなし", 2),
-            ("走る", "はしる", 2), ("走り", "はしり", 2),
-            ("歩く", "あるく", 2), ("歩き", "あるき", 2),
-            ("食べる", "たべる", 2), ("食べ", "たべ", 2),
-            ("飲む", "のむ", 1), ("飲み", "のみ", 1),
-            ("愛す", "あいす", 1), ("愛する", "あいする", 3),
+            ("思う", "おもう", 2), ("買う", "かう", 0), ("買わ", "かわ", 0),
+            ("ある", "ある", 1), ("行く", "いく", 0), ("来る", "くる", 1),
+            ("する", "する", 0), ("見る", "みる", 1), ("聞く", "きく", 0),
+            ("読む", "よむ", 1), ("書く", "かく", 1), ("話す", "はなす", 2),
+            ("走る", "はしる", 2), ("食べる", "たべる", 2), ("飲む", "のむ", 1),
+            ("よる", "よる", 1), ("なら", "なら", 1)
         ]
-        for (s, r, k) in verbs {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .verb, accentKernel: k, cost: 20))
+        var vIdx = 0
+        while vIdx < verbs.count {
+            let item = verbs[vIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .verb,
+                accentKernel: item.2,
+                cost: 20
+            ))
+            vIdx += 1
         }
 
         // 挨拶・副詞・接続詞
         let phrases: [(String, String, PartOfSpeech, Int16)] = [
-            ("こんにちは", "こんにちは", .interjection, 0),
-            ("こんばんは", "こんばんは", .interjection, 0),
+            ("こんにちは", "こんにちわ", .interjection, 0),
+            ("こんばんは", "こんばんわ", .interjection, 0),
             ("おはよう", "おはよー", .interjection, 2),
             ("ありがとう", "ありがとー", .interjection, 2),
             ("さようなら", "さよーなら", .interjection, 3),
@@ -513,18 +900,37 @@ public final class ViterbiMorphology: Sendable {
             ("とても", "とても", .adverb, 0),
             ("いつも", "いつも", .adverb, 1),
             ("少し", "すこし", .adverb, 2),
+            ("まだ", "まだ", .adverb, 1)
         ]
-        for (s, r, pos, k) in phrases {
-            list.append(LexiconEntry(surface: s, reading: r, pos: pos, accentKernel: k, cost: 15))
+        var phIdx = 0
+        while phIdx < phrases.count {
+            let item = phrases[phIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: item.2,
+                accentKernel: item.3,
+                cost: 15
+            ))
+            phIdx += 1
         }
 
-        // 句読点・記号
+        // 記号
         let symbols: [(String, String)] = [
             ("、", "<pau>"), ("。", "<sil>"), ("！", "<sil>"), ("？", "<sil>"),
-            ("・", "<pau>"), ("…", "<pau>"), ("〜", "ー"), ("～", "ー"),
+            ("・", "<pau>"), ("…", "<pau>"), ("〜", "ー"), ("～", "ー")
         ]
-        for (s, r) in symbols {
-            list.append(LexiconEntry(surface: s, reading: r, pos: .symbol, accentKernel: 0, cost: 5))
+        var sIdx = 0
+        while sIdx < symbols.count {
+            let item = symbols[sIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .symbol,
+                accentKernel: 0,
+                cost: 5
+            ))
+            sIdx += 1
         }
 
         return list

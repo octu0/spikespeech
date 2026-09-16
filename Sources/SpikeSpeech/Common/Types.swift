@@ -12,11 +12,43 @@ public struct AudioConfig: Sendable {
     public static let melChannels: Int = 64
 }
 
+/// ホルマント共鳴周波数および帯域幅設定 (Klatt型カスケード音響管共鳴モデル)
+///
+/// 音響音声学（Fant音響管理論）に基づく声道伝達特性の4共鳴極 (F1〜F4) および
+/// 共鳴尖鋭度を司る帯域幅 (B1〜B4) を Hz 単位で物理的に規定する。
+public struct FormantConfig: Sendable, Equatable, Codable {
+    public var f1: Float
+    public var b1: Float
+    public var f2: Float
+    public var b2: Float
+    public var f3: Float
+    public var b3: Float
+    public var f4: Float
+    public var b4: Float
+
+    public init(
+        f1: Float, b1: Float,
+        f2: Float, b2: Float,
+        f3: Float, b3: Float,
+        f4: Float, b4: Float
+    ) {
+        self.f1 = f1
+        self.b1 = b1
+        self.f2 = f2
+        self.b2 = b2
+        self.f3 = f3
+        self.b3 = b3
+        self.f4 = f4
+        self.b4 = b4
+    }
+}
+
+
 /// 形態素解析における品詞分類
 ///
 /// Viterbi探索の連接コスト行列におけるインデックス参照を高速化し、
 /// 助詞置換やアクセント句境界の判定を分岐テーブルで即座に完了させる。
-public enum PartOfSpeech: UInt8, Sendable, CaseIterable {
+public enum PartOfSpeech: UInt8, Sendable, CaseIterable, Codable {
     case noun          = 0 // 名詞
     case verb          = 1 // 動詞
     case adjective     = 2 // 形容詞

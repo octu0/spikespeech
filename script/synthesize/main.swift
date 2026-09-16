@@ -115,8 +115,26 @@ func main() {
         }
     }
 
+    // なぜニューラルボコーダー重みを自動検出するか:
+    // SNN 音響モデル重みと対になる最新の学習済みニューラルボコーダー重みを自動ロードし、
+    // 追加オプションなしで最高品位な肉声波形合成を実行可能にするため。
+    var vocWeights: NeuralVocoderWeights? = nil
+    let defaultVocoderPath = "Models/vocoder_weights.json"
+    if FileManager.default.fileExists(atPath: defaultVocoderPath) {
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: defaultVocoderPath)) {
+            let loaded = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: data)
+            switch loaded {
+            case .some(let vw):
+                vocWeights = vw
+                print("学習済みニューラルボコーダー重みを自動検出・読み込みました: \(defaultVocoderPath)")
+            case .none:
+                break
+            }
+        }
+    }
+
     let voiceProfile = VoiceProfile.preset(named: voiceName)
-    let engine = SpikeSpeechEngine(weights: weights)
+    let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
     print("音声合成を開始します: 「\(text)」 (話者: \(voiceProfile.name), 速度: \(speed), ピッチ: \(pitch))")
 
     let startTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)

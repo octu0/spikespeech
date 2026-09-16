@@ -40,13 +40,19 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     /// リードアウトバイアス
     public var bOut: MLXArray
 
+    /// 学習・獲得された語彙知識（単語表記、読み、品詞、アクセント核、コスト）
+    /// なぜネットワーク内で保持するか:
+    /// BPTT 学習時および重みエクスポート時に、獲得された語彙知識が消失・初期化されることを防ぐため。
+    public var lexicon: [LexiconEntry]
+
     public init(
         numLayers: Int = 2,
         inputDim: Int = 128,
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
-        lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1)
+        lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
+        lexicon: [LexiconEntry] = []
     ) {
         let safeLayers = max(1, numLayers)
         self.numLayers = safeLayers
@@ -55,6 +61,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         self.outputDim = outputDim
         self.timeSteps = timeSteps
         self.lifConfig = lifConfig
+        self.lexicon = lexicon
 
         let scaleIn = sqrt(2.0 / Float(inputDim))
         let scaleRec = 0.1 / sqrt(Float(maxHiddenDim))
@@ -93,7 +100,8 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             maxHiddenDim: weights.maxHiddenDim,
             outputDim: weights.outputDim,
             timeSteps: weights.timeSteps,
-            lifConfig: weights.lifConfig
+            lifConfig: weights.lifConfig,
+            lexicon: weights.lexicon
         )
         self.importWeights(from: weights)
     }
@@ -101,6 +109,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     /// 多層重み構造体からパラメータをインポートする。
     /// 行優先配列から MLX の行優先形状に適合させるため転置を適用する。
     public func importWeights(from weights: SpikingNetworkWeights) {
+        self.lexicon = weights.lexicon
         let hSize = weights.maxHiddenDim
         self.wIn = MLXArray(weights.wIn, [hSize, weights.inputDim]).transposed()
         self.wRec = MLXArray(weights.wRec, [hSize, hSize]).transposed()
@@ -158,7 +167,8 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             bHLayers: bl,
             gammaRMS: gl,
             wOut: self.wOut.transposed().asArray(Float.self),
-            bOut: self.bOut.asArray(Float.self)
+            bOut: self.bOut.asArray(Float.self),
+            lexicon: self.lexicon
         )
     }
 

@@ -515,6 +515,16 @@ public final class TextNormalizer: Sendable {
             }
         }
 
+        // 慣用挨拶語の助詞 "は" の発音適正化
+        switch surface {
+        case "こんにちは":
+            return "こんにちわ"
+        case "こんばんは":
+            return "こんばんわ"
+        default:
+            break
+        }
+
         let chars = Array(reading)
         var result: [Character] = []
         result.reserveCapacity(chars.count)

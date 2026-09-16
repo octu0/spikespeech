@@ -16,33 +16,9 @@ public final class SyntheticAudioGenerator: @unchecked Sendable {
         case o = "o"
     }
 
-    /// ホルマント共鳴設定
-    public struct FormantConfig: Sendable, Equatable {
-        public let f1: Float
-        public let b1: Float
-        public let f2: Float
-        public let b2: Float
-        public let f3: Float
-        public let b3: Float
-        public let f4: Float
-        public let b4: Float
+    /// ホルマント共鳴設定（Types.swift に定義された FormantConfig へのエイリアス）
+    public typealias FormantConfig = SpikeSpeech.FormantConfig
 
-        public init(
-            f1: Float, b1: Float,
-            f2: Float, b2: Float,
-            f3: Float, b3: Float,
-            f4: Float, b4: Float
-        ) {
-            self.f1 = f1
-            self.b1 = b1
-            self.f2 = f2
-            self.b2 = b2
-            self.f3 = f3
-            self.b3 = b3
-            self.f4 = f4
-            self.b4 = b4
-        }
-    }
 
     public let sampleRate: Float
     private var rngState: UInt64 = 5489

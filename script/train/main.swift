@@ -249,14 +249,25 @@ func main() {
     let weights: SpikingNetworkWeights
     switch initialWeights {
     case .some(let w):
-        weights = w
+        // なぜ語彙が空の場合にデフォルト語彙を補完するか:
+        // 旧バージョンの重みファイルをロードした際にも語彙を補完し、学習エクスポート時に語彙が消失するのを防ぐため。
+        if w.lexicon.isEmpty != true {
+            weights = w
+        } else {
+            let defaultLex = ViterbiMorphology.loadDefaultLexicon()
+            weights = w.withLexicon(defaultLex)
+        }
     case .none:
+        // なぜ新規乱数重みにもデフォルト語彙を注入するか:
+        // 新規学習から開始した場合でも、モデル重みに語彙知識を保持・永続化させるため。
+        let defaultLex = ViterbiMorphology.loadDefaultLexicon()
         weights = SpikingNetworkWeights.randomWeights(
             inputDim: inDim,
             maxHiddenDim: hiddenDim,
             outputDim: outDim,
             timeSteps: timeSteps,
-            numLayers: numLayers
+            numLayers: numLayers,
+            lexicon: defaultLex
         )
         print("新規の決定論的ランダム重みで初期化しました。")
     }
@@ -499,6 +510,30 @@ func main() {
     } catch {
         print("エラー: 最終重みの書き出しに失敗しました: \(error)")
         return
+    }
+
+    // なぜニューラルボコーダー重みも出力ディレクトリへエクスポートするか:
+    // 再学習パイプラインにおいて SNN 音響モデル重み（weights.json）と
+    // ニューラルボコーダー重み（vocoder_weights.json）を一元同期し、
+    // 推論エンジンが最新の音響モデルおよびボコーダー構造を即座に利用可能にするため。
+    let vocoderURL = WeightCheckpoint.resolvePath(directory: outputDir, fileName: "vocoder_weights.json")
+    var needVocoderWrite = true
+    if fileManager.fileExists(atPath: vocoderURL.path) {
+        if let existingData = try? Data(contentsOf: vocoderURL) {
+            switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
+            case .some:
+                needVocoderWrite = false
+            case .none:
+                break
+            }
+        }
+    }
+    if needVocoderWrite {
+        let initialVocoderWeights = NeuralVocoderWeights.randomWeights()
+        if let encoded = try? JSONEncoder().encode(initialVocoderWeights) {
+            try? encoded.write(to: vocoderURL)
+            print("ニューラルボコーダー重みをエクスポートしました: \(vocoderURL.path) (\(encoded.count) バイト)")
+        }
     }
 
     print("学習処理が正常に完了しました。")

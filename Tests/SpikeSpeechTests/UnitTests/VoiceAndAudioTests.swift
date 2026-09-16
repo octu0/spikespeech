@@ -302,14 +302,12 @@ final class VoiceAndAudioTests: XCTestCase {
             s += 1
         }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempWavPath = tempDir.appendingPathComponent("test_audio_align.wav").path
+        // ディスクへの一時ファイル書き出しを排除し、オンメモリバイト列から直接パースして検証する。
         let wavData = WavEncoder.encode(samples: wave, sampleRate: sampleRate)
-        try wavData.write(to: URL(fileURLWithPath: tempWavPath))
 
         let reader = WavAudioReader()
         let extractor = MelSpectrogramExtractor()
-        let pcm = try reader.loadWav16k(from: tempWavPath)
+        let pcm = try reader.parseWav16k(bytes: [UInt8](wavData))
         let targetMel = extractor.extractLogMel(pcm: pcm)
 
         let linguistic = engine.lengthRegulator.processText(
@@ -347,14 +345,12 @@ final class VoiceAndAudioTests: XCTestCase {
         let audioSamples = 480
         let wave = [Float](repeating: 0.1, count: audioSamples)
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempWavPath = tempDir.appendingPathComponent("test_audio_short.wav").path
+        // ディスク書き出しを排除し、WavEncoder が生成したオンメモリバイナリを直接検証する。
         let wavData = WavEncoder.encode(samples: wave, sampleRate: sampleRate)
-        try wavData.write(to: URL(fileURLWithPath: tempWavPath))
 
         let reader = WavAudioReader()
         let extractor = MelSpectrogramExtractor()
-        let pcm = try reader.loadWav16k(from: tempWavPath)
+        let pcm = try reader.parseWav16k(bytes: [UInt8](wavData))
         let targetMel = extractor.extractLogMel(pcm: pcm)
 
         let expectedFrames = audioSamples / AudioConfig.hopSize // 3 frames

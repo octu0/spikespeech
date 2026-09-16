@@ -36,6 +36,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// リードアウト出力バイアス
     public let bOut: [Float]
 
+    /// 学習・獲得された語彙知識（単語表記、読み、品詞、アクセント核、コスト）
+    /// なぜ重みとともに記録するか:
+    /// ソースコード内に辞書データをハードコードすることを排し、教師データから学習した
+    /// 語彙知識をモデルの音響重みと一体化して永続化・更新可能にするため。
+    public let lexicon: [LexiconEntry]
+
     /// 総層数
     public var numLayers: Int {
         return 1 + wLayers.count
@@ -54,7 +60,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         bHLayers: [[Float]] = [],
         gammaRMS: [[Float]] = [],
         wOut: [Float],
-        bOut: [Float]
+        bOut: [Float],
+        lexicon: [LexiconEntry] = []
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -69,6 +76,78 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.gammaRMS = gammaRMS
         self.wOut = wOut
         self.bOut = bOut
+        self.lexicon = lexicon
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputDim, maxHiddenDim, outputDim, timeSteps, lifConfig
+        case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wOut, bOut
+        case lexicon
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.inputDim = try container.decode(Int.self, forKey: .inputDim)
+        self.maxHiddenDim = try container.decode(Int.self, forKey: .maxHiddenDim)
+        self.outputDim = try container.decode(Int.self, forKey: .outputDim)
+        self.timeSteps = try container.decode(Int.self, forKey: .timeSteps)
+        self.lifConfig = try container.decode(LIFConfig.self, forKey: .lifConfig)
+        self.wIn = try container.decode([Float].self, forKey: .wIn)
+        self.wRec = try container.decode([Float].self, forKey: .wRec)
+        self.bH = try container.decode([Float].self, forKey: .bH)
+        self.wLayers = try container.decode([[Float]].self, forKey: .wLayers)
+        self.bHLayers = try container.decode([[Float]].self, forKey: .bHLayers)
+        self.gammaRMS = try container.decode([[Float]].self, forKey: .gammaRMS)
+        self.wOut = try container.decode([Float].self, forKey: .wOut)
+        self.bOut = try container.decode([Float].self, forKey: .bOut)
+        // なぜ decodeIfPresent を用いるか:
+        // 既存の重みファイルに lexicon フィールドが含まれていない場合でも後方互換性を保ち、安全に空配列で初期化するため。
+        switch try container.decodeIfPresent([LexiconEntry].self, forKey: .lexicon) {
+        case .some(let lex):
+            self.lexicon = lex
+        case .none:
+            self.lexicon = []
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(inputDim, forKey: .inputDim)
+        try container.encode(maxHiddenDim, forKey: .maxHiddenDim)
+        try container.encode(outputDim, forKey: .outputDim)
+        try container.encode(timeSteps, forKey: .timeSteps)
+        try container.encode(lifConfig, forKey: .lifConfig)
+        try container.encode(wIn, forKey: .wIn)
+        try container.encode(wRec, forKey: .wRec)
+        try container.encode(bH, forKey: .bH)
+        try container.encode(wLayers, forKey: .wLayers)
+        try container.encode(bHLayers, forKey: .bHLayers)
+        try container.encode(gammaRMS, forKey: .gammaRMS)
+        try container.encode(wOut, forKey: .wOut)
+        try container.encode(bOut, forKey: .bOut)
+        try container.encode(lexicon, forKey: .lexicon)
+    }
+
+    /// 語彙知識を付与した新しい重みインスタンスを生成する
+    /// なぜ不変構造体のコピーとして返すか:
+    /// 並行安全性（Sendable）を維持しながら、学習済み語彙知識を動的に重みへ結合するため。
+    public func withLexicon(_ newLexicon: [LexiconEntry]) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: newLexicon
+        )
     }
 
     /// 発火ニューロンから各出力ニューロンへの流出結合重みをメモリ上で連続配置に変換し、推論時の SIMD8 ロードにおけるキャッシュミスを根絶する。
@@ -156,7 +235,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         timeSteps: Int = 4,
         numLayers: Int = 2,
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
-        seed: UInt64 = 42
+        seed: UInt64 = 42,
+        lexicon: [LexiconEntry] = []
     ) -> SpikingNetworkWeights {
         return standardInit(
             inputDim: inputDim,
@@ -165,7 +245,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             timeSteps: timeSteps,
             numLayers: numLayers,
             lifConfig: lifConfig,
-            seed: seed
+            seed: seed,
+            lexicon: lexicon
         )
     }
 
@@ -177,7 +258,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         timeSteps: Int = 4,
         numLayers: Int = 2,
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
-        seed: UInt64 = 42
+        seed: UInt64 = 42,
+        lexicon: [LexiconEntry] = []
     ) -> SpikingNetworkWeights {
         var rngState = seed
         let scaleIn = sqrt(2.0 / Float(inputDim))
@@ -250,7 +332,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bHLayers: bHLayers,
             gammaRMS: gammaRMS,
             wOut: wOut,
-            bOut: bOut
+            bOut: bOut,
+            lexicon: lexicon
         )
     }
 
