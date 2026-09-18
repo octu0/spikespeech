@@ -393,26 +393,52 @@ final class VoiceAndAudioTests: XCTestCase {
         XCTAssertTrue(0.01 < avgDiff, "女性ボイスと男性ボイスの合成波形に有意な差異が存在しません: diff=\(avgDiff)")
 
         // 3. ピッチ（周波数）特性の検証: 低い基音を持つ男性ボイスはゼロ交差数が女性ボイスより少なくなる
-        var femaleZeroCrossings = 0
-        var fIdx = 1
-        while fIdx < femaleSamples.count {
-            if (femaleSamples[fIdx - 1] < 0.0 && 0.0 <= femaleSamples[fIdx]) || (0.0 <= femaleSamples[fIdx - 1] && femaleSamples[fIdx] < 0.0) {
-                femaleZeroCrossings += 1
+        // なぜ基音成分（F0）を平滑化してゼロ交差数を測定するか:
+        // 生理学的な声道音響において、男性声帯の急峻な閉鎖波形や高調波・フォルマント共鳴の波形交差を除去し、
+        // 基音周期（男性 120Hz vs 女性 220Hz）本来のゼロ交差密度（男性 < 女性）を正確に評価するため。
+        func countBaseZeroCrossings(_ samples: [Float]) -> Int {
+            var filtered = [Float](repeating: 0.0, count: samples.count)
+            var prev: Float = 0.0
+            var i = 0
+            while i < samples.count {
+                prev = prev + (0.06 * (samples[i] - prev))
+                filtered[i] = prev
+                i += 1
             }
-            fIdx += 1
+            var crossings = 0
+            var idx = 1
+            while idx < filtered.count {
+                if (filtered[idx - 1] < 0.0 && 0.0 <= filtered[idx]) || (0.0 <= filtered[idx - 1] && filtered[idx] < 0.0) {
+                    crossings += 1
+                }
+                idx += 1
+            }
+            return crossings
         }
 
-        var maleZeroCrossings = 0
-        var mIdx = 1
-        while mIdx < maleSamples.count {
-            if (maleSamples[mIdx - 1] < 0.0 && 0.0 <= maleSamples[mIdx]) || (0.0 <= maleSamples[mIdx - 1] && maleSamples[mIdx] < 0.0) {
-                maleZeroCrossings += 1
+        let femaleZeroCrossings = countBaseZeroCrossings(femaleSamples)
+        let maleZeroCrossings = countBaseZeroCrossings(maleSamples)
+
+        var rawFemaleCrossings = 0
+        var fi = 1
+        while fi < femaleSamples.count {
+            if (femaleSamples[fi - 1] < 0.0 && 0.0 <= femaleSamples[fi]) || (0.0 <= femaleSamples[fi - 1] && femaleSamples[fi] < 0.0) {
+                rawFemaleCrossings += 1
             }
-            mIdx += 1
+            fi += 1
+        }
+        var rawMaleCrossings = 0
+        var mi = 1
+        while mi < maleSamples.count {
+            if (maleSamples[mi - 1] < 0.0 && 0.0 <= maleSamples[mi]) || (0.0 <= maleSamples[mi - 1] && maleSamples[mi] < 0.0) {
+                rawMaleCrossings += 1
+            }
+            mi += 1
         }
 
         // 低域ピッチの男性ボイスはゼロ交差密度が低下する
-        XCTAssertTrue(maleZeroCrossings < femaleZeroCrossings, "男性ボイスのゼロ交差数が女性ボイスを下回っていません: male=\(maleZeroCrossings), female=\(femaleZeroCrossings)")
+        XCTAssertTrue(rawMaleCrossings < rawFemaleCrossings, "男性ボイスの直接ゼロ交差数が女性ボイスを下回っていません: male=\(rawMaleCrossings), female=\(rawFemaleCrossings)")
+        XCTAssertTrue(maleZeroCrossings < femaleZeroCrossings, "男性ボイスの平滑化ゼロ交差数が女性ボイスを下回っていません: male=\(maleZeroCrossings), female=\(femaleZeroCrossings)")
     }
 
     /// 話者切り替え時において、話者基音の絶対値が変わっても「発音・アクセントの響き（相対 F0 輪郭）」が
@@ -790,36 +816,15 @@ final class VoiceAndAudioTests: XCTestCase {
         let frameCount = min(pair.targets.count, originalMel.count)
         XCTAssertTrue(0 < frameCount)
 
-        // 目標残差 targets[t] は targetMel[t] - blendedPrior[t] で定義される
-        // 推論時の合成: reconstructed[t] = blendedPrior[t] + (residualScale * targets[t])
-        // したがって targets[t] + blendedPrior[t] == targetMel[t] が厳密に成立することを、
-        // 女性 Prior（VoiceProfile.female.tract）から導出した blendedPriorSequence との間で検証
-        let femalePrior = engine.prior(for: VoiceProfile.female.tract)
-        var framePhoneIds = [Int](repeating: PhonemeVocabulary.silId, count: frameCount)
-        let boundaries = engine.detectSpeechBoundaries(pcm: wave, hopSize: AudioConfig.hopSize, totalFrames: originalMel.count)
-        let aId = engine.vocabulary.id(for: "a")
-        var f = 0
-        while f < frameCount {
-            if boundaries.leadSilence <= f && f < (boundaries.leadSilence + boundaries.speechFrames) {
-                framePhoneIds[f] = aId
-            }
-            f += 1
-        }
-
-        let blendedPriorSeq = engine.computeBlendedPriorSequence(
-            framePhoneIds: framePhoneIds,
-            activePrior: femalePrior,
-            melChannels: AudioConfig.melChannels
-        )
-
+        // なぜ targets[t] が直接 targetMel[t] と厳密に一致することを検証するか:
+        // 手書き Prior 残差学習の完全撤廃に伴い、SNN の目標系列が実音声の絶対対数 Mel スペクトル（targetMel）
+        // と同一であることを数学的に保証し、ボコーダーの学習 Mel 分布と推論 Mel 分布の同一性を担保するため。
         var t = 0
         while t < frameCount {
             var c = 0
             while c < AudioConfig.melChannels {
-                let targetResidual = pair.targets[t][c]
-                let priorVal = blendedPriorSeq[t][c]
-                let reconstructed = priorVal + (engine.residualScale * targetResidual)
-                XCTAssertEqual(reconstructed, originalMel[t][c], accuracy: 1e-4, "フレーム \(t) ch \(c) で往復復元スペクトルが targetMel と不一致です")
+                let targetVal = pair.targets[t][c]
+                XCTAssertEqual(targetVal, originalMel[t][c], accuracy: 1e-4, "フレーム \(t) ch \(c) で目標対数 Mel が originalMel と不一致です")
                 c += 1
             }
             t += 1

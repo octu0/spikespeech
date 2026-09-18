@@ -197,6 +197,54 @@ final class LinguisticTests: XCTestCase {
         }
     }
 
+    /// 「お好きな日本語テキストを入力してください」の形態素解析・アクセント句・ピッチ輪郭の診断テスト
+    func testTargetSentenceProsody() {
+        let text = "お好きな日本語テキストを入力してください"
+        let norm = normalizer.cleanText(text)
+        let morphemes = normalizer.normalize(text: norm)
+        print("--- [Morphology Result: \(text)] ---")
+        var mIdx = 0
+        while mIdx < morphemes.count {
+            let m = morphemes[mIdx]
+            print("  Surface: \(m.surface), Reading: \(m.reading), POS: \(m.pos), Kernel: \(m.accentKernel)")
+            mIdx += 1
+        }
+        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+        print("--- [Accent Phrases: \(phrases.count)] ---")
+        var pIdx = 0
+        while pIdx < phrases.count {
+            let p = phrases[pIdx]
+            var moraStr = ""
+            var mi = 0
+            while mi < p.moras.count {
+                let m = p.moras[mi]
+                moraStr += "\(m.text)(\(m.tone))-"
+                mi += 1
+            }
+            print("  Phrase \(pIdx): \(moraStr), pauseAfter: \(p.pauseAfter)")
+            pIdx += 1
+        }
+        let features = lengthRegulator.processText(
+            text: text,
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            baseF0: 220.0
+        )
+        print("--- [F0 Contour: \(features.totalFrames) frames] ---")
+        var f0Str = ""
+        var fi = 0
+        while fi < features.totalFrames {
+            if 0.5 <= features.voicedFlags[fi] {
+                f0Str += String(format: "%.1f, ", features.f0Contour[fi])
+            } else {
+                f0Str += "0, "
+            }
+            fi += 1
+        }
+        print("  F0: [\(f0Str)]")
+    }
+
     // MARK: - 7. Length Regulation フレーム展開および O(1) アロケーションテスト
 
     func testLengthRegulationExpansion() {

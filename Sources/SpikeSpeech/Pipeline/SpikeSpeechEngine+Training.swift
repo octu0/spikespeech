@@ -279,45 +279,19 @@ extension SpikeSpeechEngine {
         }
 
         var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: finalCount)
-        var curFrame = 0
-        var pIdx = 0
-        let pCount = min(fullPhoneIds.count, fullDurations.count)
-        var framePhoneIds = [Int](repeating: PhonemeVocabulary.silId, count: finalCount)
 
-        while pIdx < pCount {
-            let pId = Int(fullPhoneIds[pIdx])
-            let d = fullDurations[pIdx]
-            var f = 0
-            while f < d {
-                let frameIdx = curFrame + f
-                if frameIdx < finalCount {
-                    framePhoneIds[frameIdx] = pId
-                }
-                f += 1
-            }
-            curFrame += d
-            pIdx += 1
-        }
-
-        // なぜ女性声道固定 Prior（VoiceProfile.female.tract）を用いるか:
-        // 教師データの実録音波形（JSUT）は成人女性単一話者であり、実音声から差し引くべき基準スペクトルは
-        // 必ず実録音話者の声道特性（VoiceProfile.female.tract: lengthScale 1.0, bandwidthScale 1.0）でなければならない。
-        // 仮に推論時の話者切り替え（--voice male等）の Prior を差し引いてしまうと、実音声（女性）から男性 Prior を
-        // 差し引くことになり、SNN が「女性音声と男性声道の差」を残差として学習して汎化性が破壊されるため。
-        let activePrior = prior(for: VoiceProfile.female.tract)
-        let blendedPriorSeq = computeBlendedPriorSequence(
-            framePhoneIds: framePhoneIds,
-            activePrior: activePrior,
-            melChannels: AudioConfig.melChannels
-        )
-
-        // 目標残差 (targetMel - blendedPrior) を 1.0 スケールで算出
+        // 目標 Mel 系列を実音声の絶対対数 Mel スペクトル（targetMel）として直接設定
+        // なぜ手書き Prior（PhonemeAcousticPrior）の残差学習を完全撤廃するか:
+        // SNN 音響モデルが実音声データ（JSUT）の絶対対数 Mel スペクトルを直接予測するように学習することで、
+        // 手書きフォルマント表の不自然なロボット感・機械的歪みを排し、
+        // ニューラルボコーダーの学習 Mel 分布と推論 Mel 分布を完全に一致させるため。
+        let melCh = AudioConfig.melChannels
         var t = 0
         while t < finalCount {
-            var c = 0
-            while c < AudioConfig.melChannels {
-                safeTargets[t][c] = targetMel[t][c] - blendedPriorSeq[t][c]
-                c += 1
+            safeTargets[t].withUnsafeMutableBufferPointer { pDst in
+                targetMel[t].withUnsafeBufferPointer { pSrc in
+                    pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                }
             }
             t += 1
         }

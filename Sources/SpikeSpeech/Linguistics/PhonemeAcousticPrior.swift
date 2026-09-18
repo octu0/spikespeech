@@ -20,7 +20,8 @@ public final class PhonemeAcousticPrior: @unchecked Sendable {
         vocabSize: Int = 64,
         sampleRate: Float = 16000.0,
         fftBins: Int = 257,
-        tract: VocalTract = VocalTract()
+        tract: VocalTract = VocalTract(),
+        baseF0: Float = 220.0
     ) {
         self.melChannels = melChannels
         self.vocabSize = vocabSize
@@ -90,73 +91,163 @@ public final class PhonemeAcousticPrior: @unchecked Sendable {
             // Fant の音響音声学モデルに基づき、声道長比 α に応じて共鳴ピーク（F1, F2, F3）が周波数軸上で平行移動し、
             // 母音の音韻同一性（F2/F1 比）を 100% 保存しながら話者声道のサイズ差のみを正確に表現するため。
             switch pId {
-            case 5: // /a/ (あ): F1=800, F2=1300, F3=2600
+            case 5: // /a/ (あ): F0=baseF0, F1=850, F2=1350, F3=2850, F4=3800, F5=4700
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (800.0 * vtl, 90.0 * bwScale, 1.0),
-                        (1300.0 * vtl, 110.0 * bwScale, 0.6),
-                        (2600.0 * vtl, 160.0 * bwScale, 0.18)
+                        (baseF0, 40.0 * bwScale, 0.45),
+                        (850.0 * vtl, 80.0 * bwScale, 1.60),
+                        (1350.0 * vtl, 90.0 * bwScale, 0.60),
+                        (2850.0 * vtl, 140.0 * bwScale, 0.25),
+                        (3800.0 * vtl, 180.0 * bwScale, 0.10),
+                        (4700.0 * vtl, 220.0 * bwScale, 0.05)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
                     tiltDecay: 0.85
                 )
-            case 6: // /i/ (い): F1=300, F2=2300, F3=3000
+            case 6: // /i/ (い): F0=baseF0, F1=280, F2=2350, F3=3200, F4=4100
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (300.0 * vtl, 70.0 * bwScale, 0.9),
-                        (2300.0 * vtl, 130.0 * bwScale, 0.5),
-                        (3000.0 * vtl, 180.0 * bwScale, 0.18)
+                        (baseF0, 35.0 * bwScale, 0.45),
+                        (280.0 * vtl, 60.0 * bwScale, 1.50),
+                        (2350.0 * vtl, 110.0 * bwScale, 0.60),
+                        (3200.0 * vtl, 150.0 * bwScale, 0.25),
+                        (4100.0 * vtl, 200.0 * bwScale, 0.10)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
                     tiltDecay: 0.85
                 )
-            case 7: // /u/ (う): F1=360, F2=1200, F3=2400
+            case 7: // /u/ (う): F0=baseF0, F1=340, F2=1350, F3=2450, F4=3600
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (360.0 * vtl, 70.0 * bwScale, 0.85),
-                        (1200.0 * vtl, 100.0 * bwScale, 0.4),
-                        (2400.0 * vtl, 150.0 * bwScale, 0.12)
+                        (baseF0, 40.0 * bwScale, 0.45),
+                        (340.0 * vtl, 65.0 * bwScale, 1.30),
+                        (1350.0 * vtl, 95.0 * bwScale, 0.50),
+                        (2450.0 * vtl, 140.0 * bwScale, 0.22),
+                        (3600.0 * vtl, 180.0 * bwScale, 0.08)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
                     tiltDecay: 0.85
                 )
-            case 8: // /e/ (え): F1=500, F2=1900, F3=2600
+            case 8: // /e/ (え): F0=baseF0, F1=500, F2=1950, F3=2800, F4=3700
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (500.0 * vtl, 80.0 * bwScale, 0.95),
-                        (1900.0 * vtl, 120.0 * bwScale, 0.5),
-                        (2600.0 * vtl, 160.0 * bwScale, 0.18)
+                        (baseF0, 40.0 * bwScale, 0.45),
+                        (500.0 * vtl, 75.0 * bwScale, 1.50),
+                        (1950.0 * vtl, 110.0 * bwScale, 0.60),
+                        (2800.0 * vtl, 150.0 * bwScale, 0.25),
+                        (3700.0 * vtl, 190.0 * bwScale, 0.10)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
                     tiltDecay: 0.85
                 )
-            case 9: // /o/ (お): F1=500, F2=900, F3=2500
+            case 9: // /o/ (お): F0=baseF0, F1=500, F2=950, F3=2600, F4=3600
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (500.0 * vtl, 80.0 * bwScale, 0.95),
-                        (900.0 * vtl, 90.0 * bwScale, 0.65),
-                        (2500.0 * vtl, 150.0 * bwScale, 0.12)
+                        (baseF0, 40.0 * bwScale, 0.45),
+                        (500.0 * vtl, 75.0 * bwScale, 1.50),
+                        (950.0 * vtl, 85.0 * bwScale, 0.70),
+                        (2600.0 * vtl, 140.0 * bwScale, 0.22),
+                        (3600.0 * vtl, 180.0 * bwScale, 0.08)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
                     tiltDecay: 0.85
                 )
-            case 10, 11, 12, 14, 27, 28, 29: // 無声子音 (k, s, t, h, sh, ch, ts): 高域摩擦ノイズ
-                let cutoffFreq = 2000.0 * vtl
+            case 10: // /k/: 軟口蓋破裂音解放バースト (Release Burst)
+                let kCenter = 2600.0 * vtl
                 var b = 0
                 while b < fftBins {
                     let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
-                    if cutoffFreq <= freq {
-                        powerSpec[b] = 0.05 * (freq / maxFreq)
+                    let diff = freq - kCenter
+                    let normDiff = (diff * diff) / (350.0 * 350.0)
+                    var burst = 0.45 / (1.0 + (normDiff * normDiff))
+                    if 3500.0 * vtl <= freq {
+                        let norm = (freq - (3500.0 * vtl)) / (maxFreq - (3500.0 * vtl))
+                        burst += 0.20 * norm
+                    }
+                    powerSpec[b] = burst
+                    b += 1
+                }
+            case 11: // /s/: 歯茎摩擦音（4kHz〜8kHz の強力なヒスノイズ）
+                let sCutoff = 3800.0 * vtl
+                let sSpan = maxFreq - sCutoff
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    if sCutoff <= freq {
+                        let norm = (freq - sCutoff) / sSpan
+                        powerSpec[b] = 0.50 * norm
+                    }
+                    b += 1
+                }
+            case 12: // /t/: 歯茎破裂音解放バースト (Release Burst)
+                let tCenter = 4200.0 * vtl
+                let tCutoff = 3500.0 * vtl
+                let tSpan = maxFreq - tCutoff
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    let diff = freq - tCenter
+                    let normDiff = (diff * diff) / (500.0 * 500.0)
+                    var burst = 0.50 / (1.0 + (normDiff * normDiff))
+                    if tCutoff <= freq {
+                        let norm = (freq - tCutoff) / tSpan
+                        burst += 0.25 * norm
+                    }
+                    powerSpec[b] = burst
+                    b += 1
+                }
+            case 14: // /h/: 声門摩擦音（気息音）
+                let hCenter = 3000.0 * vtl
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    if 1200.0 * vtl <= freq && freq <= 5500.0 * vtl {
+                        let dev = abs(freq - hCenter) / (3000.0 * vtl)
+                        powerSpec[b] = 0.25 * (1.0 - dev)
+                    }
+                    b += 1
+                }
+            case 23: // /p/: 両唇破裂音解放バースト
+                let pCenter = 1200.0 * vtl
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    let diff = freq - pCenter
+                    let normDiff = (diff * diff) / (400.0 * 400.0)
+                    powerSpec[b] = 0.40 / (1.0 + (normDiff * normDiff))
+                    b += 1
+                }
+            case 27: // /sh/: 歯茎硬口蓋摩擦音
+                let shCutoff = 2600.0 * vtl
+                let shSpan = maxFreq - shCutoff
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    if shCutoff <= freq {
+                        let norm = (freq - shCutoff) / shSpan
+                        powerSpec[b] = 0.55 * norm
+                    }
+                    b += 1
+                }
+            case 28, 29: // /ch/, /ts/: 破擦音
+                let affCutoff = 2800.0 * vtl
+                let affSpan = maxFreq - affCutoff
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    if affCutoff <= freq {
+                        let norm = (freq - affCutoff) / affSpan
+                        powerSpec[b] = 0.50 * norm
                     }
                     b += 1
                 }
@@ -164,23 +255,47 @@ public final class PhonemeAcousticPrior: @unchecked Sendable {
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (250.0 * vtl, 100.0 * bwScale, 0.7),
-                        (1000.0 * vtl, 200.0 * bwScale, 0.15)
+                        (baseF0, 45.0 * bwScale, 0.60),
+                        (280.0 * vtl, 60.0 * bwScale, 1.30),
+                        (1000.0 * vtl, 180.0 * bwScale, 0.10)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
-                    tiltDecay: 0.7
+                    tiltDecay: 0.65
                 )
-            case 16, 17, 18, 19, 20, 21, 22, 23, 26, 30, 31, 32, 33, 34, 35, 36, 37, 38: // 有声子音・拗音・長音: 一般有声共鳴
+            case 20, 36: // /z/, /j/: 有声摩擦音
                 Self.synthesizeFormantSpectrum(
                     powerSpec: &powerSpec,
                     formants: [
-                        (450.0 * vtl, 120.0 * bwScale, 0.6),
-                        (1600.0 * vtl, 180.0 * bwScale, 0.25)
+                        (baseF0, 50.0 * bwScale, 0.50),
+                        (450.0 * vtl, 110.0 * bwScale, 0.45),
+                        (1800.0 * vtl, 160.0 * bwScale, 0.20)
                     ],
                     maxFreq: maxFreq,
                     fftBins: fftBins,
-                    tiltDecay: 0.8
+                    tiltDecay: 0.80
+                )
+                let zCutoff = 3500.0 * vtl
+                let zSpan = maxFreq - zCutoff
+                var b = 0
+                while b < fftBins {
+                    let freq = (Float(b) * maxFreq) / Float(fftBins - 1)
+                    if zCutoff <= freq {
+                        powerSpec[b] += 0.25 * ((freq - zCutoff) / zSpan)
+                    }
+                    b += 1
+                }
+            case 16, 17, 18, 19, 21, 22, 26, 30, 31, 32, 33, 34, 35, 37, 38: // 有声子音・拗音・長音: 一般有声共鳴
+                Self.synthesizeFormantSpectrum(
+                    powerSpec: &powerSpec,
+                    formants: [
+                        (baseF0, 50.0 * bwScale, 0.55),
+                        (450.0 * vtl, 110.0 * bwScale, 0.55),
+                        (1600.0 * vtl, 160.0 * bwScale, 0.22)
+                    ],
+                    maxFreq: maxFreq,
+                    fftBins: fftBins,
+                    tiltDecay: 0.80
                 )
             default:
                 // 無音・休止 (0, 1, 2, 3, 4, 25, 39..63): 実音声フロアのまま
@@ -210,10 +325,7 @@ public final class PhonemeAcousticPrior: @unchecked Sendable {
         self.priorTable = table
     }
 
-    /// 二次共鳴フィルタ伝達関数に基づくパワースペクトルの合成
-    ///
-    /// 音響音声学における声道音響伝達特性を忠実に再現し、
-    /// フォルマント周波数近傍の滑らかな共鳴山と声門気流のスペクトル傾斜を付与する。
+    /// 音響音声学に基づくパワースペクトルの合成（フォルマント急峻共鳴および深谷 antiresonance 特性）
     private static func synthesizeFormantSpectrum(
         powerSpec: inout [Float],
         formants: [(freq: Float, bw: Float, gain: Float)],
@@ -228,27 +340,37 @@ public final class PhonemeAcousticPrior: @unchecked Sendable {
             let fNorm = f / 100.0
             let tilt = 1.0 / (1.0 + (fNorm * (1.0 - tiltDecay)))
 
-            var resSum: Float = 0.001
+            var resSum: Float = 0.00005
             var fIdx = 0
             while fIdx < formants.count {
                 let fmt = formants[fIdx]
                 let f0 = fmt.freq
-                // 帯域幅が極端に小さい場合の 0/0 による NaN 発生を二重防護するため下限 10.0 Hz にクランプ
                 var safeBw = fmt.bw
                 if safeBw < 10.0 {
                     safeBw = 10.0
                 }
                 let g = fmt.gain
-                // Cauchy-Lorentz 共鳴形状
                 let diff = f - f0
-                let denom = 1.0 + ((diff * diff) / ((safeBw * 0.5) * (safeBw * 0.5)))
+                let halfBw = safeBw * 0.5
+                let normDiff = (diff * diff) / (halfBw * halfBw)
+                // 4次急峻共鳴減衰により、フォルマント山と谷（ゼロ点）の深さ（-6.0〜-7.5dB）を正確に再現
+                let denom = (1.0 + normDiff) * (1.0 + normDiff)
                 resSum += g / denom
                 fIdx += 1
             }
 
-            // 実音声の母音パワースペクトル水準（Mel対数値で +1.0〜+3.5）と整合させるためのエネルギースケール
-            let speechPowerScale: Float = 15.0
-            powerSpec[b] = resSum * tilt * speechPowerScale
+            // 母音パワースペクトル水準の調整
+            let speechPowerScale: Float = 12.0
+            var pVal = resSum * tilt * speechPowerScale
+
+            // 3500Hz 以上の有声帯域における自然な声帯呼気性気息成分（Aspiration Noise）
+            if 3500.0 <= f {
+                let normF = (f - 3500.0) / (maxFreq - 3500.0)
+                let breath = 0.016 * (1.0 - (normF * 0.35))
+                pVal += breath
+            }
+
+            powerSpec[b] = pVal
             b += 1
         }
     }

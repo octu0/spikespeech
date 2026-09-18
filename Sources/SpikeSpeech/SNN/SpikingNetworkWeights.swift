@@ -150,6 +150,28 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         )
     }
 
+    /// 出力層バイアスを置換した新しい重みインスタンスを生成する
+    /// なぜ実音声平均対数 Mel スペクトルで初期化するか:
+    /// SNN の出力基準値を実音声エネルギーレベルに一致させ、絶対対数 Mel への直接回帰を加速するため。
+    public func withBOut(_ newBOut: [Float]) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wOut: self.wOut,
+            bOut: newBOut,
+            lexicon: self.lexicon
+        )
+    }
+
     /// 発火ニューロンから各出力ニューロンへの流出結合重みをメモリ上で連続配置に変換し、推論時の SIMD8 ロードにおけるキャッシュミスを根絶する。
     public func makeWRecT() -> [Float] {
         let hSize = maxHiddenDim

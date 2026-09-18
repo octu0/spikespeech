@@ -1052,7 +1052,7 @@ final class Tier1FeatureTests: XCTestCase {
     func testF16_Engine_DefaultInit() {
         let eng = SpikeSpeechEngine()
         XCTAssertEqual(eng.sampleRate, 16000.0)
-        XCTAssertEqual(eng.weights.outputDim, 80)
+        XCTAssertEqual(eng.weights.outputDim, AudioConfig.melChannels)
     }
 
     func testF16_Engine_SynthesizePCM() {

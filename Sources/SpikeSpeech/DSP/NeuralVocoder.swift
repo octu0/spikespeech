@@ -2,9 +2,9 @@ import Foundation
 
 /// 現代的ニューラルボコーダー（Neural Vocoder）の設定パラメータ
 ///
-/// なぜ定数を構造体で一元管理するか:
 /// サンプリングレート、フレーム幅（Hop Size）、Mel チャンネル数、および
-/// 隠れ層チャンネル数と FIR 畳み込み受容野の構造を厳密に統制し、音響モデルとの完全な整合性を保証するため。
+/// 隠れ層チャンネル数（64ch）と多重受容野（MRF）畳み込み構造を一元管理し、
+/// 音響モデルおよび MLX 学習基盤との整合性を保証する。
 public struct NeuralVocoderConfig: Sendable, Codable, Equatable {
     /// 音声サンプリングレート [Hz] (16,000 Hz)
     public let sampleRate: Int
@@ -12,14 +12,18 @@ public struct NeuralVocoderConfig: Sendable, Codable, Equatable {
     public let hopSize: Int
     /// 入力 Mel スペクトログラムの周波数チャンネル数 (64ch)
     public let melChannels: Int
-    /// 隠れ層特徴量チャンネル数 (16ch)
+    /// 隠れ層特徴量チャンネル数 (64ch)
+    /// なぜ 64ch に設定するか:
+    /// 16ch の玩具規模では 64ch Mel の音響情報・フォルマント包絡を保持できず、
+    /// 64ch かつ SIMD8（8 レーン）ベクトル演算との整合性を最大化し、
+    /// 高速な Pure Swift 推論と豊かな肉声表現力を両立するため。
     public let hiddenChannels: Int
 
     public init(
         sampleRate: Int = AudioConfig.sampleRate,
         hopSize: Int = AudioConfig.hopSize,
         melChannels: Int = AudioConfig.melChannels,
-        hiddenChannels: Int = 16
+        hiddenChannels: Int = 64
     ) {
         self.sampleRate = sampleRate
         self.hopSize = hopSize
@@ -30,45 +34,78 @@ public struct NeuralVocoderConfig: Sendable, Codable, Equatable {
 
 /// 現代的ニューラルボコーダーの学習済み重みパラメータ
 ///
-/// なぜ構造体として平坦な Float 配列で保持するか:
-/// Pure Swift（CPU / SIMD）と MLX（GPU / Apple Silicon）の双方向でデータ転送・
-/// シリアライズのオーバーヘッドをゼロにし、JSON 永続化とメモリ局所性を最大化するため。
+/// Pure Swift（CPU / SIMD8）と MLX（GPU / Apple Silicon）の間で
+/// ゼロコピーかつ相互運用可能な平坦な Float 配列として保持し、
+/// JSON 永続化とキャッシュ局所性を最大化する。
 public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
     public let config: NeuralVocoderConfig
 
-    /// 初段 1D 畳み込み重み [hiddenChannels * (melChannels + 1) * 3]
+    /// 初段 1D 畳み込み重み [hiddenChannels * kernelPre * inChannels] (kernel 7, inChannels 66)
     public let convPreWeight: [Float]
-    /// 初段 1D 畳み込みバイアス [hiddenChannels]
     public let convPreBias: [Float]
 
-    /// 多重受容野（MRF）ResBlock 1 畳み込み 1 重み [hiddenChannels * hiddenChannels * 3]
+    /// アップサンプリング Stage 1 転置畳み込み重み [hiddenChannels * kernelUp1 * hiddenChannels] (stride 10, kernel 20)
+    public let up1Weight: [Float]
+    public let up1Bias: [Float]
+
+    /// MRF 1 ResBlock 1 (kernel 3, dilation 1, 3)
     public let res1Conv1Weight: [Float]
     public let res1Conv1Bias: [Float]
-    /// 多重受容野（MRF）ResBlock 1 畳み込み 2 重み [hiddenChannels * hiddenChannels * 3]
     public let res1Conv2Weight: [Float]
     public let res1Conv2Bias: [Float]
 
-    /// 多重受容野（MRF）ResBlock 2 畳み込み 1 重み [hiddenChannels * hiddenChannels * 7]
+    /// MRF 1 ResBlock 2 (kernel 7, dilation 1, 3)
     public let res2Conv1Weight: [Float]
     public let res2Conv1Bias: [Float]
-    /// 多重受容野（MRF）ResBlock 2 畳み込み 2 重み [hiddenChannels * hiddenChannels * 7]
     public let res2Conv2Weight: [Float]
     public let res2Conv2Bias: [Float]
 
-    /// 終段波形出力 1D 畳み込み重み [1 * hiddenChannels * 7]
+    /// アップサンプリング Stage 2 転置畳み込み重み [hiddenChannels * kernelUp2 * hiddenChannels] (stride 4, kernel 8)
+    public let up2Weight: [Float]
+    public let up2Bias: [Float]
+
+    /// MRF 2 ResBlock 1 (kernel 3, dilation 1, 3)
+    public let res3Conv1Weight: [Float]
+    public let res3Conv1Bias: [Float]
+    public let res3Conv2Weight: [Float]
+    public let res3Conv2Bias: [Float]
+
+    /// MRF 2 ResBlock 2 (kernel 7, dilation 1, 3)
+    public let res4Conv1Weight: [Float]
+    public let res4Conv1Bias: [Float]
+    public let res4Conv2Weight: [Float]
+    public let res4Conv2Bias: [Float]
+
+    /// アップサンプリング Stage 3 転置畳み込み重み [hiddenChannels * kernelUp3 * hiddenChannels] (stride 4, kernel 8)
+    public let up3Weight: [Float]
+    public let up3Bias: [Float]
+
+    /// MRF 3 ResBlock 1 (kernel 3, dilation 1, 3)
+    public let res5Conv1Weight: [Float]
+    public let res5Conv1Bias: [Float]
+    public let res5Conv2Weight: [Float]
+    public let res5Conv2Bias: [Float]
+
+    /// MRF 3 ResBlock 2 (kernel 7, dilation 1, 3)
+    public let res6Conv1Weight: [Float]
+    public let res6Conv1Bias: [Float]
+    public let res6Conv2Weight: [Float]
+    public let res6Conv2Bias: [Float]
+
+    /// 終段波形出力 1D 畳み込み重み [1 * kernelPost * hiddenChannels] (kernel 7)
     public let convPostWeight: [Float]
-    /// 終段波形出力バイアス [1]
     public let convPostBias: [Float]
 
-    /// 高調波音源変調結合重み [hiddenChannels]
+    /// 後方互換性用（推論では未使用）
     public let harmonicWeight: [Float]
-    /// 高調波音源バイアス
     public let harmonicBias: Float
 
     public init(
         config: NeuralVocoderConfig = NeuralVocoderConfig(),
         convPreWeight: [Float],
         convPreBias: [Float],
+        up1Weight: [Float],
+        up1Bias: [Float],
         res1Conv1Weight: [Float],
         res1Conv1Bias: [Float],
         res1Conv2Weight: [Float],
@@ -77,14 +114,36 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
         res2Conv1Bias: [Float],
         res2Conv2Weight: [Float],
         res2Conv2Bias: [Float],
+        up2Weight: [Float],
+        up2Bias: [Float],
+        res3Conv1Weight: [Float],
+        res3Conv1Bias: [Float],
+        res3Conv2Weight: [Float],
+        res3Conv2Bias: [Float],
+        res4Conv1Weight: [Float],
+        res4Conv1Bias: [Float],
+        res4Conv2Weight: [Float],
+        res4Conv2Bias: [Float],
+        up3Weight: [Float],
+        up3Bias: [Float],
+        res5Conv1Weight: [Float],
+        res5Conv1Bias: [Float],
+        res5Conv2Weight: [Float],
+        res5Conv2Bias: [Float],
+        res6Conv1Weight: [Float],
+        res6Conv1Bias: [Float],
+        res6Conv2Weight: [Float],
+        res6Conv2Bias: [Float],
         convPostWeight: [Float],
         convPostBias: [Float],
-        harmonicWeight: [Float],
-        harmonicBias: Float
+        harmonicWeight: [Float] = [],
+        harmonicBias: Float = 0.0
     ) {
         self.config = config
         self.convPreWeight = convPreWeight
         self.convPreBias = convPreBias
+        self.up1Weight = up1Weight
+        self.up1Bias = up1Bias
         self.res1Conv1Weight = res1Conv1Weight
         self.res1Conv1Bias = res1Conv1Bias
         self.res1Conv2Weight = res1Conv2Weight
@@ -93,6 +152,26 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
         self.res2Conv1Bias = res2Conv1Bias
         self.res2Conv2Weight = res2Conv2Weight
         self.res2Conv2Bias = res2Conv2Bias
+        self.up2Weight = up2Weight
+        self.up2Bias = up2Bias
+        self.res3Conv1Weight = res3Conv1Weight
+        self.res3Conv1Bias = res3Conv1Bias
+        self.res3Conv2Weight = res3Conv2Weight
+        self.res3Conv2Bias = res3Conv2Bias
+        self.res4Conv1Weight = res4Conv1Weight
+        self.res4Conv1Bias = res4Conv1Bias
+        self.res4Conv2Weight = res4Conv2Weight
+        self.res4Conv2Bias = res4Conv2Bias
+        self.up3Weight = up3Weight
+        self.up3Bias = up3Bias
+        self.res5Conv1Weight = res5Conv1Weight
+        self.res5Conv1Bias = res5Conv1Bias
+        self.res5Conv2Weight = res5Conv2Weight
+        self.res5Conv2Bias = res5Conv2Bias
+        self.res6Conv1Weight = res6Conv1Weight
+        self.res6Conv1Bias = res6Conv1Bias
+        self.res6Conv2Weight = res6Conv2Weight
+        self.res6Conv2Bias = res6Conv2Bias
         self.convPostWeight = convPostWeight
         self.convPostBias = convPostBias
         self.harmonicWeight = harmonicWeight
@@ -101,10 +180,9 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
 
     /// 決定論的疑似乱数による初期重みの生成
     ///
-    /// なぜ構造化された初期化を行うか:
-    /// 音響励起信号が初段投影と終段投影を通じてクリーンに通過することを保証しつつ、
-    /// MRF 残差ブロック（ResBlocks）を小さなスケールで初期化することで、
-    /// 学習初期から数値安定性と明瞭な音響フォルマントを両立させ、学習に伴って微細な位相・音色表現を獲得可能にするため。
+    /// なぜ He 正規分布初期化を採用するか:
+    /// 未学習状態であっても数値発散・勾配消失を防ぎ、
+    /// 多重受容野アップサンプリングにおいて振幅スケールを安定して維持するため。
     public static func randomWeights(
         config: NeuralVocoderConfig = NeuralVocoderConfig(),
         seed: UInt64 = 2026
@@ -122,104 +200,141 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
 
         let melCh = config.melChannels
         let hCh = config.hiddenChannels
-        let inCh = melCh + 1 // 励起 1ch + Mel 64ch
+        let inCh = melCh + 2 // Mel 64ch + F0 1ch + Voiced 1ch
 
-        // 1. 初段畳み込み (kernel 3)
-        // なぜ励起チャンネル（m=0）を主結合として初期化するか:
-        // 声門音源パルスが隠れ層に直接伝達され、Mel 特徴量による変調基盤を即座に形成するため。
-        let preKernel = 3
-        var preW = [Float](repeating: 0.0, count: hCh * inCh * preKernel)
-        let melScale = 0.08 / sqrtf(Float(melCh * preKernel))
-        var c = 0
-        while c < hCh {
-            var k = 0
-            while k < preKernel {
-                var m = 0
-                while m < inCh {
-                    let idx = (c * inCh * preKernel) + (m * preKernel) + k
-                    switch m {
-                    case 0:
-                        // 励起入力チャンネル: 中心タップ（k=1）で主結合
-                        if k == 1 {
-                            preW[idx] = (0.70 / sqrtf(Float(hCh))) + nextUniform(scale: 0.01)
-                        } else {
-                            preW[idx] = nextUniform(scale: 0.01)
-                        }
-                    default:
-                        // なぜ Mel 特徴量チャンネルをゼロ平均対称分布で初期化するか:
-                        // 対数 Mel 特徴量の多チャンネル加算による巨大な直流バイアス（活性化飽和）を防止し、
-                        // フォルマント周波数変動のみを出力スペクトルに自然に変調させるため。
-                        preW[idx] = nextUniform(scale: melScale)
-                    }
-                    m += 1
-                }
-                k += 1
-            }
-            c += 1
+        // 1. convPre: kernel 7, inCh -> hCh
+        let preK = 7
+        let preScale = sqrtf(2.0 / Float(inCh * preK)) * 1.0
+        var preW = [Float](repeating: 0.0, count: hCh * preK * inCh)
+        var i = 0
+        while i < preW.count {
+            preW[i] = nextUniform(scale: preScale)
+            i += 1
         }
         let preB = [Float](repeating: 0.0, count: hCh)
 
-        // 2. MRF ResBlock 1 (kernel 3)
-        let res1Scale = sqrtf(2.0 / Float(hCh * 3)) * 0.06
-        var r1c1W = [Float](repeating: 0.0, count: hCh * hCh * 3)
-        var r1c2W = [Float](repeating: 0.0, count: hCh * hCh * 3)
-        var i = 0
+        // 2. Stage 1: up1 (stride 10, kernel 20, padding 5)
+        let up1K = 20
+        let up1Scale = sqrtf(2.0 / Float(hCh * up1K)) * 1.0
+        var up1W = [Float](repeating: 0.0, count: hCh * up1K * hCh)
+        i = 0
+        while i < up1W.count {
+            up1W[i] = nextUniform(scale: up1Scale)
+            i += 1
+        }
+        let up1B = [Float](repeating: 0.0, count: hCh)
+
+        // MRF 1 ResBlock 1 (kernel 3)
+        let r1Scale = sqrtf(2.0 / Float(hCh * 3)) * 0.4
+        var r1c1W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        var r1c2W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        i = 0
         while i < r1c1W.count {
-            r1c1W[i] = nextUniform(scale: res1Scale)
-            r1c2W[i] = nextUniform(scale: res1Scale)
+            r1c1W[i] = nextUniform(scale: r1Scale)
+            r1c2W[i] = nextUniform(scale: r1Scale)
             i += 1
         }
         let r1c1B = [Float](repeating: 0.0, count: hCh)
         let r1c2B = [Float](repeating: 0.0, count: hCh)
 
-        // 3. MRF ResBlock 2 (kernel 7)
-        let res2Scale = sqrtf(2.0 / Float(hCh * 7)) * 0.06
-        var r2c1W = [Float](repeating: 0.0, count: hCh * hCh * 7)
-        var r2c2W = [Float](repeating: 0.0, count: hCh * hCh * 7)
+        // MRF 1 ResBlock 2 (kernel 7)
+        let r2Scale = sqrtf(2.0 / Float(hCh * 7)) * 0.4
+        var r2c1W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
+        var r2c2W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
         i = 0
         while i < r2c1W.count {
-            r2c1W[i] = nextUniform(scale: res2Scale)
-            r2c2W[i] = nextUniform(scale: res2Scale)
+            r2c1W[i] = nextUniform(scale: r2Scale)
+            r2c2W[i] = nextUniform(scale: r2Scale)
             i += 1
         }
         let r2c1B = [Float](repeating: 0.0, count: hCh)
         let r2c2B = [Float](repeating: 0.0, count: hCh)
 
-        // 4. 終段畳み込み (kernel 7)
-        // なぜ中心タップの重みを 1.25 に設定するか:
-        // ニューラルボコーダーの公称出力波形が適正音量（有声区間 RMS 約 0.11〜0.13）に自然に整流され、
-        // ストリーミング合成およびバッチ合成の双方で統一された安定したラウドネスを達成するため。
-        let postKernel = 7
-        var postW = [Float](repeating: 0.0, count: 1 * hCh * postKernel)
-        let postScale = 0.01
-        c = 0
-        while c < hCh {
-            var k = 0
-            while k < postKernel {
-                let idx = (c * postKernel) + k
-                if k == 3 {
-                    postW[idx] = (1.25 / Float(hCh)) + nextUniform(scale: Float(postScale))
-                } else {
-                    postW[idx] = nextUniform(scale: Float(postScale))
-                }
-                k += 1
-            }
-            c += 1
+        // 3. Stage 2: up2 (stride 4, kernel 8, padding 2)
+        let up2K = 8
+        let up2Scale = sqrtf(2.0 / Float(hCh * up2K)) * 1.0
+        var up2W = [Float](repeating: 0.0, count: hCh * up2K * hCh)
+        i = 0
+        while i < up2W.count {
+            up2W[i] = nextUniform(scale: up2Scale)
+            i += 1
+        }
+        let up2B = [Float](repeating: 0.0, count: hCh)
+
+        // MRF 2 ResBlock 1 (kernel 3)
+        var r3c1W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        var r3c2W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        i = 0
+        while i < r3c1W.count {
+            r3c1W[i] = nextUniform(scale: r1Scale)
+            r3c2W[i] = nextUniform(scale: r1Scale)
+            i += 1
+        }
+        let r3c1B = [Float](repeating: 0.0, count: hCh)
+        let r3c2B = [Float](repeating: 0.0, count: hCh)
+
+        // MRF 2 ResBlock 2 (kernel 7)
+        var r4c1W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
+        var r4c2W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
+        i = 0
+        while i < r4c1W.count {
+            r4c1W[i] = nextUniform(scale: r2Scale)
+            r4c2W[i] = nextUniform(scale: r2Scale)
+            i += 1
+        }
+        let r4c1B = [Float](repeating: 0.0, count: hCh)
+        let r4c2B = [Float](repeating: 0.0, count: hCh)
+
+        // 4. Stage 3: up3 (stride 4, kernel 8, padding 2)
+        var up3W = [Float](repeating: 0.0, count: hCh * up2K * hCh)
+        i = 0
+        while i < up3W.count {
+            up3W[i] = nextUniform(scale: up2Scale)
+            i += 1
+        }
+        let up3B = [Float](repeating: 0.0, count: hCh)
+
+        // MRF 3 ResBlock 1 (kernel 3)
+        var r5c1W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        var r5c2W = [Float](repeating: 0.0, count: hCh * 3 * hCh)
+        i = 0
+        while i < r5c1W.count {
+            r5c1W[i] = nextUniform(scale: r1Scale)
+            r5c2W[i] = nextUniform(scale: r1Scale)
+            i += 1
+        }
+        let r5c1B = [Float](repeating: 0.0, count: hCh)
+        let r5c2B = [Float](repeating: 0.0, count: hCh)
+
+        // MRF 3 ResBlock 2 (kernel 7)
+        var r6c1W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
+        var r6c2W = [Float](repeating: 0.0, count: hCh * 7 * hCh)
+        i = 0
+        while i < r6c1W.count {
+            r6c1W[i] = nextUniform(scale: r2Scale)
+            r6c2W[i] = nextUniform(scale: r2Scale)
+            i += 1
+        }
+        let r6c1B = [Float](repeating: 0.0, count: hCh)
+        let r6c2B = [Float](repeating: 0.0, count: hCh)
+
+        // 5. convPost: kernel 7, hCh -> 1
+        let postK = 7
+        let postScale = sqrtf(2.0 / Float(hCh * postK)) * 1.0
+        var postW = [Float](repeating: 0.0, count: 1 * postK * hCh)
+        i = 0
+        while i < postW.count {
+            postW[i] = nextUniform(scale: postScale)
+            i += 1
         }
         let postB = [Float](repeating: 0.0, count: 1)
-
-        // 5. 高調波結合
-        var harmW = [Float](repeating: 0.0, count: hCh)
-        c = 0
-        while c < hCh {
-            harmW[c] = 1.0 / Float(hCh)
-            c += 1
-        }
 
         return NeuralVocoderWeights(
             config: config,
             convPreWeight: preW,
             convPreBias: preB,
+            up1Weight: up1W,
+            up1Bias: up1B,
             res1Conv1Weight: r1c1W,
             res1Conv1Bias: r1c1B,
             res1Conv2Weight: r1c2W,
@@ -228,151 +343,93 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
             res2Conv1Bias: r2c1B,
             res2Conv2Weight: r2c2W,
             res2Conv2Bias: r2c2B,
+            up2Weight: up2W,
+            up2Bias: up2B,
+            res3Conv1Weight: r3c1W,
+            res3Conv1Bias: r3c1B,
+            res3Conv2Weight: r3c2W,
+            res3Conv2Bias: r3c2B,
+            res4Conv1Weight: r4c1W,
+            res4Conv1Bias: r4c1B,
+            res4Conv2Weight: r4c2W,
+            res4Conv2Bias: r4c2B,
+            up3Weight: up3W,
+            up3Bias: up3B,
+            res5Conv1Weight: r5c1W,
+            res5Conv1Bias: r5c1B,
+            res5Conv2Weight: r5c2W,
+            res5Conv2Bias: r5c2B,
+            res6Conv1Weight: r6c1W,
+            res6Conv1Bias: r6c1B,
+            res6Conv2Weight: r6c2W,
+            res6Conv2Bias: r6c2B,
             convPostWeight: postW,
-            convPostBias: postB,
-            harmonicWeight: harmW,
-            harmonicBias: 0.0
+            convPostBias: postB
         )
     }
 }
 
-/// 現代的ニューラルボコーダー（Neural Vocoder）推論エンジン
+/// 現代的ニューラルボコーダー（Neural Vocoder）Pure Swift 推論エンジン
 ///
-/// 音響特徴量（Mel スペクトル）および連続 F0 輪郭から、
-/// 声門パルス音響モデリング、多重受容野 FIR 畳み込みニューラルフィルタリング、
-/// および高域位相分散によって高品位な 16kHz PCM 波形を直接復元する。
+/// 従来の音響物理共鳴器（カスケード IIR フィルタ）や Rosenberg 声門パルス潜在加算を完全撤廃し、
+/// 64チャンネル絶対 log-Mel スペクトログラムおよび連続 F0 / 有声フラグから、
+/// 多重受容野（MRF: kernel 3, 7 × dilation 1, 3）残差ブロックと階層的転置畳み込みアップサンプリング
+/// （10x, 4x, 4x = 160倍）によって直接時間領域 16kHz PCM 波形を高速生成する。
 public final class NeuralVocoder: @unchecked Sendable {
     public let weights: NeuralVocoderWeights
     public let config: NeuralVocoderConfig
 
-    /// 声帯連続位相アキュムレータ [rad]
+    // 作業用メモリバッファ（ホットパスでのヒープ確保ゼロ化）
+    private var bufPre: [Float] = []
+    private var bufUp1: [Float] = []
+    private var bufMid1: [Float] = []
+    private var bufR1: [Float] = []
+    private var bufR2: [Float] = []
+    private var bufUp2: [Float] = []
+    private var bufMid2: [Float] = []
+    private var bufR3: [Float] = []
+    private var bufR4: [Float] = []
+    private var bufUp3: [Float] = []
+    private var bufMid3: [Float] = []
+    private var bufR5: [Float] = []
+    private var bufR6: [Float] = []
+
+    // NSF (Neural Source-Filter) 位相蓄積器、乱流気流ノイズ乱数シード、および平滑化包絡線
     private var phase: Float = 0.0
-    /// 呼気気流ノイズ低域通過フィルタ内部状態
-    private var noiseFilterState: Float = 0.0
-    /// 直前サンプルの声門容積速度（時間微分 dU/dt による口唇放射特性実現用）
-    private var prevRawPulse: Float = 0.0
-    /// DC ブロックフィルタ状態（直流ドリフト完全除去）
-    private var dcXPrev: Float = 0.0
-    private var dcYPrev: Float = 0.0
+    private var noiseRng: UInt32 = 20260917
+    private var smoothEnv: Float = 0.0
 
-    // 4段共鳴器の遅延状態メモリ（直前2サンプルの出力を保持）
-    private var y1_1: Float = 0.0
-    private var y1_2: Float = 0.0
-    private var y2_1: Float = 0.0
-    private var y2_2: Float = 0.0
-    private var y3_1: Float = 0.0
-    private var y3_2: Float = 0.0
-    private var y4_1: Float = 0.0
-    private var y4_2: Float = 0.0
-
-    /// ストリーミングフレーム間補間状態
-    private var hasLastFrame: Bool = false
-    private var lastF0: Float = 0.0
-    private var lastVoiced: Float = 1.0
-    private var lastActivity: Float = 1.0
-    private var lastMel: [Float] = []
-    private var lastF1: Float = 500.0
-    private var lastB1: Float = 80.0
-    private var lastF2: Float = 1500.0
-    private var lastB2: Float = 100.0
-    private var lastF3: Float = 2500.0
-    private var lastB3: Float = 130.0
-    private var lastF4: Float = 3500.0
-    private var lastB4: Float = 180.0
-    private var lastGain: Float = 0.65
-
-    /// Xorshift 乱数状態
-    private var rngState: UInt64 = 88172645463325252
-
-    // 高速 FIR 畳み込み用リングディレイバッファ（ホットパスでのヒープ確保ゼロ化）
-    private var inHistory: [Float] // [kernel 3 * inCh 65]
-    private var h0History: [Float] // [kernel 7 * hCh 16]
-    private var r1History: [Float] // [kernel 3 * hCh 16]
-    private var r2History: [Float] // [kernel 7 * hCh 16]
-    private var postHistory: [Float] // [kernel 7 * hCh 16]
-
-    public init(weights: NeuralVocoderWeights = NeuralVocoderWeights.randomWeights()) {
-        self.weights = weights
-        self.config = weights.config
-
-        let inCh = weights.config.melChannels + 1
-        let hCh = weights.config.hiddenChannels
-        self.inHistory = [Float](repeating: 0.0, count: 3 * inCh)
-        self.h0History = [Float](repeating: 0.0, count: 7 * hCh)
-        self.r1History = [Float](repeating: 0.0, count: 3 * hCh)
-        self.r2History = [Float](repeating: 0.0, count: 7 * hCh)
-        self.postHistory = [Float](repeating: 0.0, count: 7 * hCh)
+    public init(weights: NeuralVocoderWeights? = nil) {
+        let w: NeuralVocoderWeights
+        switch weights {
+        case .some(let explicit):
+            w = explicit
+        case .none:
+            let defaultVocoderPath = "Models/vocoder_weights.json"
+            var loaded: NeuralVocoderWeights? = nil
+            if FileManager.default.fileExists(atPath: defaultVocoderPath) {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: defaultVocoderPath)) {
+                    loaded = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: data)
+                }
+            }
+            switch loaded {
+            case .some(let vw):
+                w = vw
+            case .none:
+                w = NeuralVocoderWeights.randomWeights()
+            }
+        }
+        self.weights = w
+        self.config = w.config
     }
 
-    /// 内部位相、DC フィルタ、共鳴器状態、および履歴バッファをリセットする
+    /// 内部推論バッファのリセット
     public func reset() {
         phase = 0.0
-        noiseFilterState = 0.0
-        prevRawPulse = 0.0
-        dcXPrev = 0.0
-        dcYPrev = 0.0
-        y1_1 = 0.0
-        y1_2 = 0.0
-        y2_1 = 0.0
-        y2_2 = 0.0
-        y3_1 = 0.0
-        y3_2 = 0.0
-        y4_1 = 0.0
-        y4_2 = 0.0
-        hasLastFrame = false
-        lastF0 = 0.0
-        lastVoiced = 1.0
-        lastActivity = 1.0
-        lastMel.removeAll(keepingCapacity: true)
-        lastF1 = 500.0
-        lastB1 = 80.0
-        lastF2 = 1500.0
-        lastB2 = 100.0
-        lastF3 = 2500.0
-        lastB3 = 130.0
-        lastF4 = 3500.0
-        lastB4 = 180.0
-        lastGain = 0.65
-        rngState = 88172645463325252
-
-        var i = 0
-        while i < inHistory.count {
-            inHistory[i] = 0.0
-            i += 1
-        }
-        i = 0
-        while i < h0History.count {
-            h0History[i] = 0.0
-            i += 1
-        }
-        i = 0
-        while i < r1History.count {
-            r1History[i] = 0.0
-            i += 1
-        }
-        i = 0
-        while i < r2History.count {
-            r2History[i] = 0.0
-            i += 1
-        }
-        i = 0
-        while i < postHistory.count {
-            postHistory[i] = 0.0
-            i += 1
-        }
+        noiseRng = 20260917
+        smoothEnv = 0.0
     }
 
-    /// 高速 Xorshift64 疑似乱数生成
-    @inline(__always)
-    private func nextRandomFloat() -> Float {
-        rngState ^= (rngState << 13)
-        rngState ^= (rngState >> 7)
-        rngState ^= (rngState << 17)
-        let u = UInt32(truncatingIfNeeded: rngState)
-        return (Float(u) * (2.0 / 4294967295.0)) - 1.0
-    }
-
-    /// LeakyReLU 活性化関数（勾配消失を回避する傾き 0.1）
     @inline(__always)
     private static func leakyRelu(_ x: Float) -> Float {
         if x < 0.0 {
@@ -381,842 +438,932 @@ public final class NeuralVocoder: @unchecked Sendable {
         return x
     }
 
-    /// 高調波振幅事前計算テーブル（powf のリアルタイム呼び出しを完全排除）
-    private static let harmonicAmps: [Float] = [
-        1.0000000, 0.6155722, 0.4636952, 0.3789291,
-        0.3235654, 0.2842426, 0.2546416, 0.2314541,
-        0.2127271, 0.1972628, 0.1842485, 0.1731174,
-        0.1634676, 0.1550186, 0.1475513, 0.1408985
-    ]
 
-    /// Schroeder 位相分散型高調波加算音源の生成
+
+    /// 1D 畳み込み演算（ゼロパディングおよび膨張係数 Dilation 対応）
     ///
-    /// なぜ Schroeder 位相分散正弦波加算を用いるか:
-    /// 同位相正弦波（Dirac インパルス）特有のスパイク・金属的ブザー音を根絶しつつ、
-    /// 声道共鳴フィルタ（フォルマント F1〜F4）を励起する豊かな高調波エネルギーを
-    /// ピッチ周期全体にわたって均一かつ滑らかに供給するため。
-    @inline(__always)
-    private static func computeHarmonicOscillator(
-        phase: Float,
-        f0: Float,
-        sampleRate: Float
-    ) -> Float {
-        if f0 <= 10.0 {
-            return 0.0
+    /// なぜ Dilation（膨張畳み込み）を導入するか:
+    /// パラメータ数および積和演算量を増加させることなく受容野を指数関数的に拡大し、
+    /// 16kHz PCM におけるピッチ周期（40〜160サンプル）と音韻遷移の微細時間構造を完全にカバーするため。
+    /// 1D 畳み込み演算（ゼロパディングおよび膨張係数 Dilation 対応）
+    ///
+    /// なぜ境界領域と内部領域を分離（Hoist）し 64ch 展開を行うか:
+    /// ループ深部から if 条件分岐を完全排除し、Hot Path 指針（ボイラープレートを恐れず内部・境界分離）に
+    /// 従い、dotProduct64 の SIMD8 デュアルアキュムレータと組み合わせて演算スループットを最大化するため。
+    private static func conv1d(
+        input: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>,
+        T: Int,
+        inC: Int,
+        outC: Int,
+        kernel: Int,
+        padding: Int,
+        dilation: Int = 1,
+        weights: UnsafePointer<Float>,
+        bias: UnsafePointer<Float>,
+        applyActivation: Bool
+    ) {
+        let span = (kernel - 1) * dilation
+        let innerStart = min(T, max(0, padding))
+        let innerEnd = max(innerStart, min(T, max(0, T + padding - span)))
+
+        // 1. 左境界（0 <= t < innerStart）: 境界検査付き
+        var t = 0
+        while t < innerStart {
+            let outRow = t * outC
+            var c = 0
+            while c < outC {
+                var sum = bias[c]
+                let wRow = c * kernel * inC
+                var k = 0
+                while k < kernel {
+                    let inT = t + (k * dilation) - padding
+                    if 0 <= inT && inT < T {
+                        let inRow = inT * inC
+                        let wOffset = wRow + (k * inC)
+                        sum += VectorOperations.dotProduct(
+                            a: input.advanced(by: inRow),
+                            b: weights.advanced(by: wOffset),
+                            count: inC
+                        )
+                    }
+                    k += 1
+                }
+                if applyActivation {
+                    sum = leakyRelu(sum)
+                }
+                output[outRow + c] = sum
+                c += 1
+            }
+            t += 1
         }
-        let maxHarm = min(8, max(1, Int((sampleRate * 0.25) / f0)))
-        let invK = 1.0 / Float(maxHarm)
-        var sum: Float = 0.0
-        var k = 1
-        while k <= maxHarm {
-            let fk = Float(k)
-            let amp = harmonicAmps[k - 1]
-            let schroederPhase = -Float.pi * (fk * (fk - 1.0)) * invK
-            sum += amp * sinf((fk * phase) + schroederPhase)
-            k += 1
+
+        // 2. 内部領域（innerStart <= t < innerEnd）: 条件分岐完全排除
+        if inC == 64 {
+            switch (kernel, outC) {
+            case (3, 64):
+                let d0 = 0 - padding
+                let d1 = dilation - padding
+                let d2 = (2 * dilation) - padding
+                while t < innerEnd {
+                    let inK0 = SIMD64Float(from: input.advanced(by: (t + d0) * 64))
+                    let inK1 = SIMD64Float(from: input.advanced(by: (t + d1) * 64))
+                    let inK2 = SIMD64Float(from: input.advanced(by: (t + d2) * 64))
+                    let outRow = t * 64
+                    var c = 0
+                    while c < 64 {
+                        let wRow = c * 192
+                        var sum = bias[c]
+                        sum += inK0.dot(with: weights.advanced(by: wRow))
+                        sum += inK1.dot(with: weights.advanced(by: wRow + 64))
+                        sum += inK2.dot(with: weights.advanced(by: wRow + 128))
+                        if applyActivation {
+                            sum = leakyRelu(sum)
+                        }
+                        output[outRow + c] = sum
+                        c += 1
+                    }
+                    t += 1
+                }
+            case (7, 64):
+                let d0 = 0 - padding
+                let d1 = dilation - padding
+                let d2 = (2 * dilation) - padding
+                let d3 = (3 * dilation) - padding
+                let d4 = (4 * dilation) - padding
+                let d5 = (5 * dilation) - padding
+                let d6 = (6 * dilation) - padding
+                while t < innerEnd {
+                    let inK0 = SIMD64Float(from: input.advanced(by: (t + d0) * 64))
+                    let inK1 = SIMD64Float(from: input.advanced(by: (t + d1) * 64))
+                    let inK2 = SIMD64Float(from: input.advanced(by: (t + d2) * 64))
+                    let inK3 = SIMD64Float(from: input.advanced(by: (t + d3) * 64))
+                    let inK4 = SIMD64Float(from: input.advanced(by: (t + d4) * 64))
+                    let inK5 = SIMD64Float(from: input.advanced(by: (t + d5) * 64))
+                    let inK6 = SIMD64Float(from: input.advanced(by: (t + d6) * 64))
+                    let outRow = t * 64
+                    var c = 0
+                    while c < 64 {
+                        let wRow = c * 448
+                        var sum = bias[c]
+                        sum += inK0.dot(with: weights.advanced(by: wRow))
+                        sum += inK1.dot(with: weights.advanced(by: wRow + 64))
+                        sum += inK2.dot(with: weights.advanced(by: wRow + 128))
+                        sum += inK3.dot(with: weights.advanced(by: wRow + 192))
+                        sum += inK4.dot(with: weights.advanced(by: wRow + 256))
+                        sum += inK5.dot(with: weights.advanced(by: wRow + 320))
+                        sum += inK6.dot(with: weights.advanced(by: wRow + 384))
+                        if applyActivation {
+                            sum = leakyRelu(sum)
+                        }
+                        output[outRow + c] = sum
+                        c += 1
+                    }
+                    t += 1
+                }
+            default:
+                while t < innerEnd {
+                    let outRow = t * outC
+                    var c = 0
+                    while c < outC {
+                        var sum = bias[c]
+                        let wRow = c * kernel * inC
+                        var k = 0
+                        while k < kernel {
+                            let inT = t + (k * dilation) - padding
+                            let inRow = inT * inC
+                            let wOffset = wRow + (k * inC)
+                            sum += VectorOperations.dotProduct64(
+                                a: input.advanced(by: inRow),
+                                b: weights.advanced(by: wOffset)
+                            )
+                            k += 1
+                        }
+                        if applyActivation {
+                            sum = leakyRelu(sum)
+                        }
+                        output[outRow + c] = sum
+                        c += 1
+                    }
+                    t += 1
+                }
+            }
+        } else {
+            while t < innerEnd {
+                let outRow = t * outC
+                var c = 0
+                while c < outC {
+                    var sum = bias[c]
+                    let wRow = c * kernel * inC
+                    var k = 0
+                    while k < kernel {
+                        let inT = t + (k * dilation) - padding
+                        let inRow = inT * inC
+                        let wOffset = wRow + (k * inC)
+                        sum += VectorOperations.dotProduct(
+                            a: input.advanced(by: inRow),
+                            b: weights.advanced(by: wOffset),
+                            count: inC
+                        )
+                        k += 1
+                    }
+                    if applyActivation {
+                        sum = leakyRelu(sum)
+                    }
+                    output[outRow + c] = sum
+                    c += 1
+                }
+                t += 1
+            }
         }
-        let norm = sqrtf(invK) * 0.75
-        return sum * norm
+
+        // 3. 右境界（innerEnd <= t < T）: 境界検査付き
+        while t < T {
+            let outRow = t * outC
+            var c = 0
+            while c < outC {
+                var sum = bias[c]
+                let wRow = c * kernel * inC
+                var k = 0
+                while k < kernel {
+                    let inT = t + (k * dilation) - padding
+                    if 0 <= inT && inT < T {
+                        let inRow = inT * inC
+                        let wOffset = wRow + (k * inC)
+                        sum += VectorOperations.dotProduct(
+                            a: input.advanced(by: inRow),
+                            b: weights.advanced(by: wOffset),
+                            count: inC
+                        )
+                    }
+                    k += 1
+                }
+                if applyActivation {
+                    sum = leakyRelu(sum)
+                }
+                output[outRow + c] = sum
+                c += 1
+            }
+            t += 1
+        }
     }
 
-    /// 2次 IIR 共鳴器の1ステップ実行
+    /// 1D 転置畳み込み演算（階層的アップサンプリング）
     ///
-    /// 直流 z = 1 における伝達関数の絶対利得を 1.0 (0dB) に正規化し、
-    /// 4段直列接続時の低域増幅や発散を防止する。
-    @inline(__always)
-    private static func stepResonator(
-        inVal: Float,
-        freq: Float,
-        bw: Float,
-        sampleRate: Float,
-        y1: inout Float,
-        y2: inout Float
-    ) -> Float {
-        let r = expf(-Float.pi * bw / sampleRate)
-        let theta = 2.0 * Float.pi * freq / sampleRate
-        let a1 = 2.0 * r * cosf(theta)
-        let a2 = -(r * r)
-        let b0 = 1.0 - a1 - a2
-        let y0 = (b0 * inVal) + (a1 * y1) + (a2 * y2)
-        y2 = y1
-        y1 = y0
-        return y0
+    /// なぜ偶数カーネルかつ 2 * stride の線形補間型転置畳み込みを採用するか:
+    /// 奇数カーネルや不整合なストライドで発生するチェッカーボード歪み（エイリアシングノイズ）を物理的に抑制し、
+    /// 境界分離および dotProduct64 によりリアルタイム係数を大幅に削減するため。
+    private static func convTransposed1d(
+        input: UnsafePointer<Float>,
+        output: UnsafeMutablePointer<Float>,
+        inT: Int,
+        stride: Int,
+        inC: Int,
+        outC: Int,
+        weights: UnsafePointer<Float>,
+        bias: UnsafePointer<Float>,
+        applyActivation: Bool
+    ) {
+        let outT = inT * stride
+        let padding = stride / 2
+        let K = 2 * stride
+
+        let innerStart = min(outT, max(0, stride - padding))
+        let innerEnd = max(innerStart, min(outT, max(0, outT - padding)))
+
+        var tau = 0
+        // 1. 左境界
+        while tau < innerStart {
+            let q = (tau + padding) / stride
+            let r = (tau + padding) % stride
+            let t0 = q
+            let k0 = r
+            let t1 = q - 1
+            let k1 = r + stride
+            let outRow = tau * outC
+            var c = 0
+            while c < outC {
+                var sum = bias[c]
+                let wBase = c * K * inC
+                if 0 <= t0 && t0 < inT {
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: t0 * inC), b: weights.advanced(by: wBase + (k0 * inC)), count: inC)
+                }
+                if 0 <= t1 && t1 < inT {
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: t1 * inC), b: weights.advanced(by: wBase + (k1 * inC)), count: inC)
+                }
+                if applyActivation { sum = leakyRelu(sum) }
+                output[outRow + c] = sum
+                c += 1
+            }
+            tau += 1
+        }
+
+        // 2. 内部領域（境界検査不要）
+        switch (inC, outC) {
+        case (64, 64):
+            let kStride = K * 64
+            while tau < innerEnd {
+                let q = (tau + padding) / stride
+                let r = (tau + padding) % stride
+                let in0 = SIMD64Float(from: input.advanced(by: q * 64))
+                let in1 = SIMD64Float(from: input.advanced(by: (q - 1) * 64))
+                let k0Offset = r * 64
+                let k1Offset = (r + stride) * 64
+                let outRow = tau * 64
+                var c = 0
+                while c < 64 {
+                    let wBase = c * kStride
+                    var sum = bias[c]
+                    sum += in0.dot(with: weights.advanced(by: wBase + k0Offset))
+                    sum += in1.dot(with: weights.advanced(by: wBase + k1Offset))
+                    if applyActivation { sum = leakyRelu(sum) }
+                    output[outRow + c] = sum
+                    c += 1
+                }
+                tau += 1
+            }
+        case (64, _):
+            while tau < innerEnd {
+                let q = (tau + padding) / stride
+                let r = (tau + padding) % stride
+                let t0 = q
+                let k0 = r
+                let t1 = q - 1
+                let k1 = r + stride
+                let inRow0 = t0 * inC
+                let inRow1 = t1 * inC
+                let outRow = tau * outC
+                var c = 0
+                while c < outC {
+                    let wBase = c * K * inC
+                    var sum = bias[c]
+                    sum += VectorOperations.dotProduct64(a: input.advanced(by: inRow0), b: weights.advanced(by: wBase + (k0 * inC)))
+                    sum += VectorOperations.dotProduct64(a: input.advanced(by: inRow1), b: weights.advanced(by: wBase + (k1 * inC)))
+                    if applyActivation { sum = leakyRelu(sum) }
+                    output[outRow + c] = sum
+                    c += 1
+                }
+                tau += 1
+            }
+        default:
+            while tau < innerEnd {
+                let q = (tau + padding) / stride
+                let r = (tau + padding) % stride
+                let t0 = q
+                let k0 = r
+                let t1 = q - 1
+                let k1 = r + stride
+                let inRow0 = t0 * inC
+                let inRow1 = t1 * inC
+                let outRow = tau * outC
+                var c = 0
+                while c < outC {
+                    let wBase = c * K * inC
+                    var sum = bias[c]
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: inRow0), b: weights.advanced(by: wBase + (k0 * inC)), count: inC)
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: inRow1), b: weights.advanced(by: wBase + (k1 * inC)), count: inC)
+                    if applyActivation { sum = leakyRelu(sum) }
+                    output[outRow + c] = sum
+                    c += 1
+                }
+                tau += 1
+            }
+        }
+
+        // 3. 右境界
+        while tau < outT {
+            let q = (tau + padding) / stride
+            let r = (tau + padding) % stride
+            let t0 = q
+            let k0 = r
+            let t1 = q - 1
+            let k1 = r + stride
+            let outRow = tau * outC
+            var c = 0
+            while c < outC {
+                var sum = bias[c]
+                let wBase = c * K * inC
+                if 0 <= t0 && t0 < inT {
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: t0 * inC), b: weights.advanced(by: wBase + (k0 * inC)), count: inC)
+                }
+                if 0 <= t1 && t1 < inT {
+                    sum += VectorOperations.dotProduct(a: input.advanced(by: t1 * inC), b: weights.advanced(by: wBase + (k1 * inC)), count: inC)
+                }
+                if applyActivation { sum = leakyRelu(sum) }
+                output[outRow + c] = sum
+                c += 1
+            }
+            tau += 1
+        }
     }
 
-    /// 複数フレームの Mel スペクトログラムおよび F0 輪郭から 16kHz PCM 波形を一括合成する
-    ///
-    /// なぜ Neural Source-Filter (NSF) + FIR MRF 畳み込みを採用するか:
-    /// 1. 同位相正弦波の単純加算による電子ブザー音（Dirac comb）を根絶し、
-    ///    声門パルス音響モデリングと高域位相分散により肉声の温かみを復元する。
-    /// 2. Mel スペクトログラムのフォルマント共鳴エネルギーによって励起信号を周波数変調し、
-    ///    日本語言語の母音・子音の調音特徴を鮮明に再現する。
-    /// 3. NeuralVocoderWeights の各層重み（convPre, res1, res2, convPost）を
-    ///    推論ホットパス上で実際に評価・畳み込み演算し、ニューラルボコーダーとしての真のモデル表現力を発揮させる。
+    /// Mel スペクトログラム系列および F0 輪郭から時間領域 16kHz PCM 波形を直接合成する
     public func synthesize(
         mel: [[Float]],
         f0Contour: [Float] = [],
         voicedFlags: [Float] = [],
-        voice: VoiceProfile = .female,
-        resonatorFrames: [ResonatorFrame] = []
+        voice: VoiceProfile = .female
     ) -> [Float] {
         let totalFrames = mel.count
         if totalFrames <= 0 {
             return []
         }
 
+        // なぜ 250 フレーム単位でチャンク分割推論を行うか:
+        // 超長文合成時（数万フレーム）に内部テンソルバッファの過大確保を抑制し、
+        // メモリ制約を確実に遵守しながら受容野境界を滑らかに接続するため。
+        let maxChunkFrames = 250
+        if totalFrames <= maxChunkFrames {
+            return synthesizeChunk(
+                mel: mel,
+                f0Contour: f0Contour,
+                voicedFlags: voicedFlags,
+                voice: voice
+            )
+        }
+
         let hopSize = config.hopSize
         let totalSamples = totalFrames * hopSize
-        var outputSamples = [Float](repeating: 0.0, count: totalSamples)
+        var outputAudio = [Float](repeating: 0.0, count: totalSamples)
+
+        let padFrames = 4
+        var chunkStart = 0
+        while chunkStart < totalFrames {
+            let validStart = chunkStart
+            let validEnd = min(totalFrames, chunkStart + maxChunkFrames)
+
+            let padLeft = max(0, validStart - padFrames)
+            let padRight = min(totalFrames, validEnd + padFrames)
+
+            var chunkMel = [[Float]]()
+            chunkMel.reserveCapacity(padRight - padLeft)
+            var chunkF0 = [Float]()
+            chunkF0.reserveCapacity(padRight - padLeft)
+            var chunkVoiced = [Float]()
+            chunkVoiced.reserveCapacity(padRight - padLeft)
+
+            var f = padLeft
+            while f < padRight {
+                chunkMel.append(mel[f])
+                var f0Val = voice.baseF0
+                if f < f0Contour.count {
+                    let fVal = f0Contour[f]
+                    if 0.0 < fVal { f0Val = fVal }
+                }
+                chunkF0.append(f0Val)
+
+                var vVal: Float = 1.0
+                if f < voicedFlags.count {
+                    vVal = voicedFlags[f]
+                }
+                chunkVoiced.append(vVal)
+                f += 1
+            }
+
+            let chunkAudio = synthesizeChunk(
+                mel: chunkMel,
+                f0Contour: chunkF0,
+                voicedFlags: chunkVoiced,
+                voice: voice
+            )
+
+            let trimStartSamples = (validStart - padLeft) * hopSize
+            let validCount = (validEnd - validStart) * hopSize
+            let outStartSamples = validStart * hopSize
+
+            var s = 0
+            while s < validCount {
+                let srcIdx = trimStartSamples + s
+                let dstIdx = outStartSamples + s
+                if srcIdx < chunkAudio.count && dstIdx < totalSamples {
+                    outputAudio[dstIdx] = chunkAudio[srcIdx]
+                }
+                s += 1
+            }
+
+            chunkStart += maxChunkFrames
+        }
+
+        return outputAudio
+    }
+
+    /// 単一チャンクに対する現代的ニューラルボコーダー推論
+    private func synthesizeChunk(
+        mel: [[Float]],
+        f0Contour: [Float] = [],
+        voicedFlags: [Float] = [],
+        voice: VoiceProfile = .female
+    ) -> [Float] {
+        let totalFrames = mel.count
+        if totalFrames <= 0 {
+            return []
+        }
 
         let melCh = config.melChannels
         let hCh = config.hiddenChannels
-        let inCh = melCh + 1
-        let srFloat = Float(config.sampleRate)
-        let invSr = 1.0 / srFloat
-        let twoPi = 2.0 * Float.pi
-        let invTwoPi = 1.0 / twoPi
+        let inCh = melCh + 2 // Mel 64ch + F0 1ch + Voiced 1ch
 
-        let minMel: Float = 0.0
-        let maxFreq: Float = Float(config.sampleRate) * 0.5
-        let maxMel: Float = 2595.0 * log10f(1.0 + (maxFreq / 700.0))
-        let melStep: Float = (maxMel - minMel) / Float(melCh + 1)
-        let invMelStep: Float = 1.0 / melStep
+        // 1. 入力特徴量テンソルの平坦化 [totalFrames * inCh]
+        var inputFeats = [Float](repeating: 0.0, count: totalFrames * inCh)
+        var t = 0
+        while t < totalFrames {
+            let rowStart = t * inCh
+            let frameMel = mel[t]
 
-        var curF0 = voice.baseF0
-        var curVoiced: Float = 1.0
-        var curActivity: Float = 1.0
-        var curMel = [Float](repeating: -8.0, count: melCh)
-        var curF1 = 500.0 * voice.tract.lengthScale
-        var curB1 = 80.0 * voice.tract.bandwidthScale
-        var curF2 = 1500.0 * voice.tract.lengthScale
-        var curB2 = 100.0 * voice.tract.bandwidthScale
-        var curF3 = 2500.0 * voice.tract.lengthScale
-        var curB3 = 130.0 * voice.tract.bandwidthScale
-        var curF4 = 3500.0 * voice.tract.lengthScale
-        var curB4 = 180.0 * voice.tract.bandwidthScale
-        var curGain: Float = 0.65
-
-        if hasLastFrame {
-            curF0 = lastF0
-            curVoiced = lastVoiced
-            curActivity = lastActivity
-            curMel = lastMel
-            curF1 = lastF1
-            curB1 = lastB1
-            curF2 = lastF2
-            curB2 = lastB2
-            curF3 = lastF3
-            curB3 = lastB3
-            curF4 = lastF4
-            curB4 = lastB4
-            curGain = lastGain
-        } else {
-            if 0 < mel.count {
-                curMel = mel[0]
-                if 0 < f0Contour.count {
-                    let f = f0Contour[0]
-                    if 0.0 < f {
-                        curF0 = f
-                    }
-                }
-                if 0 < voicedFlags.count {
-                    curVoiced = voicedFlags[0]
-                }
-                var initEnergy: Float = 0.0
-                var ic = 0
-                while ic < curMel.count {
-                    initEnergy += curMel[ic]
-                    ic += 1
-                }
-                let avgInit = initEnergy / Float(max(1, curMel.count))
-                if avgInit < -7.0 {
-                    curVoiced = 0.0
-                    curActivity = 0.0
-                }
+            var c = 0
+            let copyLimit = min(melCh, frameMel.count)
+            while c < copyLimit {
+                inputFeats[rowStart + c] = frameMel[c]
+                c += 1
             }
-            if 0 < resonatorFrames.count {
-                let rf0 = resonatorFrames[0]
-                curF1 = rf0.formants.f1 * voice.tract.lengthScale
-                curB1 = rf0.formants.b1 * voice.tract.bandwidthScale
-                curF2 = rf0.formants.f2 * voice.tract.lengthScale
-                curB2 = rf0.formants.b2 * voice.tract.bandwidthScale
-                curF3 = rf0.formants.f3 * voice.tract.lengthScale
-                curB3 = rf0.formants.b3 * voice.tract.bandwidthScale
-                curF4 = rf0.formants.f4 * voice.tract.lengthScale
-                curB4 = rf0.formants.b4 * voice.tract.bandwidthScale
-                curGain = rf0.gain
+
+            var vVal: Float = 1.0
+            if t < voicedFlags.count {
+                vVal = voicedFlags[t]
             }
-        }
+            if vVal < 0.0 { vVal = 0.0 }
+            if 1.0 < vVal { vVal = 1.0 }
 
-        // サンプルごとの入力ベクトル用ワークスペース [inCh]
-        var curInput = [Float](repeating: 0.0, count: inCh)
-        var curCentered = [Float](repeating: 0.0, count: melCh)
-        var tgtCentered = [Float](repeating: 0.0, count: melCh)
-        var initCh = 0
-        while initCh < melCh {
-            curCentered[initCh] = (curMel[initCh] + 4.0) * 0.25
-            initCh += 1
-        }
-
-        var curH0 = [Float](repeating: 0.0, count: hCh)
-        var curR1Mid = [Float](repeating: 0.0, count: hCh)
-        var curR1Out = [Float](repeating: 0.0, count: hCh)
-        var curR2Mid = [Float](repeating: 0.0, count: hCh)
-        var curR2Out = [Float](repeating: 0.0, count: hCh)
-        var curHmrf = [Float](repeating: 0.0, count: hCh)
-        let bPostVal = weights.convPostBias[0]
-
-        outputSamples.withUnsafeMutableBufferPointer { outBuf in
-        inHistory.withUnsafeMutableBufferPointer { inHistBuf in
-        h0History.withUnsafeMutableBufferPointer { h0HistBuf in
-        r1History.withUnsafeMutableBufferPointer { r1HistBuf in
-        r2History.withUnsafeMutableBufferPointer { r2HistBuf in
-        postHistory.withUnsafeMutableBufferPointer { postHistBuf in
-        curInput.withUnsafeMutableBufferPointer { curInBuf in
-        curH0.withUnsafeMutableBufferPointer { curH0Buf in
-        curR1Mid.withUnsafeMutableBufferPointer { curR1MidBuf in
-        curR1Out.withUnsafeMutableBufferPointer { curR1OutBuf in
-        curR2Mid.withUnsafeMutableBufferPointer { curR2MidBuf in
-        curR2Out.withUnsafeMutableBufferPointer { curR2OutBuf in
-        curHmrf.withUnsafeMutableBufferPointer { curHmrfBuf in
-        curCentered.withUnsafeMutableBufferPointer { curCenBuf in
-        tgtCentered.withUnsafeMutableBufferPointer { tgtCenBuf in
-        weights.convPreWeight.withUnsafeBufferPointer { wPreBuf in
-        weights.convPreBias.withUnsafeBufferPointer { bPreBuf in
-        weights.res1Conv1Weight.withUnsafeBufferPointer { wR1C1Buf in
-        weights.res1Conv1Bias.withUnsafeBufferPointer { bR1C1Buf in
-        weights.res1Conv2Weight.withUnsafeBufferPointer { wR1C2Buf in
-        weights.res1Conv2Bias.withUnsafeBufferPointer { bR1C2Buf in
-        weights.res2Conv1Weight.withUnsafeBufferPointer { wR2C1Buf in
-        weights.res2Conv1Bias.withUnsafeBufferPointer { bR2C1Buf in
-        weights.res2Conv2Weight.withUnsafeBufferPointer { wR2C2Buf in
-        weights.res2Conv2Bias.withUnsafeBufferPointer { bR2C2Buf in
-        weights.convPostWeight.withUnsafeBufferPointer { wPostBuf in
-
-            let pOut = outBuf.baseAddress!
-            let pInHist = inHistBuf.baseAddress!
-            let pH0Hist = h0HistBuf.baseAddress!
-            let pR1Hist = r1HistBuf.baseAddress!
-            let pR2Hist = r2HistBuf.baseAddress!
-            let pPostHist = postHistBuf.baseAddress!
-            let pCurIn = curInBuf.baseAddress!
-            let pCurH0 = curH0Buf.baseAddress!
-            let pCurR1Mid = curR1MidBuf.baseAddress!
-            let pCurR1Out = curR1OutBuf.baseAddress!
-            let pCurR2Mid = curR2MidBuf.baseAddress!
-            let pCurR2Out = curR2OutBuf.baseAddress!
-            let pCurHmrf = curHmrfBuf.baseAddress!
-            let pCurCen = curCenBuf.baseAddress!
-            let pTgtCen = tgtCenBuf.baseAddress!
-            let pWPre = wPreBuf.baseAddress!
-            let pBPre = bPreBuf.baseAddress!
-            let pWR1C1 = wR1C1Buf.baseAddress!
-            let pBR1C1 = bR1C1Buf.baseAddress!
-            let pWR1C2 = wR1C2Buf.baseAddress!
-            let pBR1C2 = bR1C2Buf.baseAddress!
-            let pWR2C1 = wR2C1Buf.baseAddress!
-            let pBR2C1 = bR2C1Buf.baseAddress!
-            let pWR2C2 = wR2C2Buf.baseAddress!
-            let pBR2C2 = bR2C2Buf.baseAddress!
-            let pWPost = wPostBuf.baseAddress!
-
-            let invHop = 1.0 / Float(hopSize)
-            var t = 0
-            while t < totalFrames {
-                var targetF0 = voice.baseF0
+            var normF0: Float = 0.0
+            if 0.5 <= vVal {
+                var f0Val: Float = voice.baseF0
                 if t < f0Contour.count {
                     let f = f0Contour[t]
                     if 0.0 < f {
-                        targetF0 = f
+                        f0Val = f
                     }
                 }
-
-                var targetVoiced: Float = 1.0
-                if t < voicedFlags.count {
-                    targetVoiced = voicedFlags[t]
-                }
-
-                let targetMel = mel[t]
-                var tgtCh = 0
-                while tgtCh < melCh {
-                    pTgtCen[tgtCh] = (targetMel[tgtCh] + 4.0) * 0.25
-                    tgtCh += 1
-                }
-
-                // 無音判定および音響アクティビティ
-                var melEnergySum: Float = 0.0
-                var cIdx = 0
-                while cIdx < targetMel.count {
-                    melEnergySum += targetMel[cIdx]
-                    cIdx += 1
-                }
-                let avgMelEnergy = melEnergySum / Float(max(1, targetMel.count))
-                var targetActivity: Float = 1.0
-                if avgMelEnergy < -7.0 {
-                    targetVoiced = 0.0
-                    targetActivity = 0.0
-                } else {
-                    let act = (avgMelEnergy + 7.0) * (1.0 / 3.0)
-                    if act < 1.0 {
-                        targetActivity = max(0.0, act)
-                    } else {
-                        targetActivity = 1.0
-                    }
-                }
-
-                var targetF1 = 500.0 * voice.tract.lengthScale
-                var targetB1 = 80.0 * voice.tract.bandwidthScale
-                var targetF2 = 1500.0 * voice.tract.lengthScale
-                var targetB2 = 100.0 * voice.tract.bandwidthScale
-                var targetF3 = 2500.0 * voice.tract.lengthScale
-                var targetB3 = 130.0 * voice.tract.bandwidthScale
-                var targetF4 = 3500.0 * voice.tract.lengthScale
-                var targetB4 = 180.0 * voice.tract.bandwidthScale
-                var targetGain: Float = 0.65
-
-                if t < resonatorFrames.count {
-                    let rf = resonatorFrames[t]
-                    targetF1 = rf.formants.f1 * voice.tract.lengthScale
-                    targetB1 = rf.formants.b1 * voice.tract.bandwidthScale
-                    targetF2 = rf.formants.f2 * voice.tract.lengthScale
-                    targetB2 = rf.formants.b2 * voice.tract.bandwidthScale
-                    targetF3 = rf.formants.f3 * voice.tract.lengthScale
-                    targetB3 = rf.formants.b3 * voice.tract.bandwidthScale
-                    targetF4 = rf.formants.f4 * voice.tract.lengthScale
-                    targetB4 = rf.formants.b4 * voice.tract.bandwidthScale
-                    targetGain = rf.gain * 1.25
-                } else {
-                    var melESum: Float = 0.0
-                    var mc = 0
-                    while mc < targetMel.count {
-                        let v = targetMel[mc]
-                        var clamped = v
-                        if clamped < -20.0 { clamped = -20.0 }
-                        if 20.0 < clamped { clamped = 20.0 }
-                        melESum += expf(clamped)
-                        mc += 1
-                    }
-                    let melRms = sqrtf(melESum / Float(max(1, targetMel.count)))
-                    var relGain = melRms / 2.2
-                    if relGain < 0.2 {
-                        relGain = 0.2
-                    }
-                    if 1.6 < relGain {
-                        relGain = 1.6
-                    }
-                    targetGain = relGain * targetActivity
-                }
-
-                // 共鳴器 1〜4 のフィルタ係数事前計算（サンプルループ内での expf / cosf 演算を完全根絶）
-                let r1_cur = expf(-Float.pi * curB1 * invSr)
-                let th1_cur = twoPi * curF1 * invSr
-                let a1_1_cur = 2.0 * r1_cur * cosf(th1_cur)
-                let a2_1_cur = -(r1_cur * r1_cur)
-                let b0_1_cur = 1.0 - a1_1_cur - a2_1_cur
-
-                let r1_tgt = expf(-Float.pi * targetB1 * invSr)
-                let th1_tgt = twoPi * targetF1 * invSr
-                let a1_1_tgt = 2.0 * r1_tgt * cosf(th1_tgt)
-                let a2_1_tgt = -(r1_tgt * r1_tgt)
-                let b0_1_tgt = 1.0 - a1_1_tgt - a2_1_tgt
-
-                let d_a1_1 = (a1_1_tgt - a1_1_cur) * invHop
-                let d_a2_1 = (a2_1_tgt - a2_1_cur) * invHop
-                let d_b0_1 = (b0_1_tgt - b0_1_cur) * invHop
-
-                let r2_cur = expf(-Float.pi * curB2 * invSr)
-                let th2_cur = twoPi * curF2 * invSr
-                let a1_2_cur = 2.0 * r2_cur * cosf(th2_cur)
-                let a2_2_cur = -(r2_cur * r2_cur)
-                let b0_2_cur = 1.0 - a1_2_cur - a2_2_cur
-
-                let r2_tgt = expf(-Float.pi * targetB2 * invSr)
-                let th2_tgt = twoPi * targetF2 * invSr
-                let a1_2_tgt = 2.0 * r2_tgt * cosf(th2_tgt)
-                let a2_2_tgt = -(r2_tgt * r2_tgt)
-                let b0_2_tgt = 1.0 - a1_2_tgt - a2_2_tgt
-
-                let d_a1_2 = (a1_2_tgt - a1_2_cur) * invHop
-                let d_a2_2 = (a2_2_tgt - a2_2_cur) * invHop
-                let d_b0_2 = (b0_2_tgt - b0_2_cur) * invHop
-
-                let r3_cur = expf(-Float.pi * curB3 * invSr)
-                let th3_cur = twoPi * curF3 * invSr
-                let a1_3_cur = 2.0 * r3_cur * cosf(th3_cur)
-                let a2_3_cur = -(r3_cur * r3_cur)
-                let b0_3_cur = 1.0 - a1_3_cur - a2_3_cur
-
-                let r3_tgt = expf(-Float.pi * targetB3 * invSr)
-                let th3_tgt = twoPi * targetF3 * invSr
-                let a1_3_tgt = 2.0 * r3_tgt * cosf(th3_tgt)
-                let a2_3_tgt = -(r3_tgt * r3_tgt)
-                let b0_3_tgt = 1.0 - a1_3_tgt - a2_3_tgt
-
-                let d_a1_3 = (a1_3_tgt - a1_3_cur) * invHop
-                let d_a2_3 = (a2_3_tgt - a2_3_cur) * invHop
-                let d_b0_3 = (b0_3_tgt - b0_3_cur) * invHop
-
-                let r4_cur = expf(-Float.pi * curB4 * invSr)
-                let th4_cur = twoPi * curF4 * invSr
-                let a1_4_cur = 2.0 * r4_cur * cosf(th4_cur)
-                let a2_4_cur = -(r4_cur * r4_cur)
-                let b0_4_cur = 1.0 - a1_4_cur - a2_4_cur
-
-                let r4_tgt = expf(-Float.pi * targetB4 * invSr)
-                let th4_tgt = twoPi * targetF4 * invSr
-                let a1_4_tgt = 2.0 * r4_tgt * cosf(th4_tgt)
-                let a2_4_tgt = -(r4_tgt * r4_tgt)
-                let b0_4_tgt = 1.0 - a1_4_tgt - a2_4_tgt
-
-                let d_a1_4 = (a1_4_tgt - a1_4_cur) * invHop
-                let d_a2_4 = (a2_4_tgt - a2_4_cur) * invHop
-                let d_b0_4 = (b0_4_tgt - b0_4_cur) * invHop
-
-                // フレーム代表値に基づく VTLN フォルマント Mel サンプリング事前計算
-                let midF0 = 0.5 * (curF0 + targetF0)
-                let tractScale = max(0.5, min(2.0, Float(voice.tract.lengthScale)))
-                let hMel0 = 2595.0 * log10f(1.0 + ((midF0 / tractScale) / 700.0))
-                let hMel1 = 2595.0 * log10f(1.0 + (((midF0 * 2.5) / tractScale) / 700.0))
-                let mBin0 = min(melCh - 1, max(0, Int((hMel0 * invMelStep) - 1.0)))
-                let mBin1 = min(melCh - 1, max(0, Int((hMel1 * invMelStep) - 1.0)))
-                let curAmp0 = expf(curMel[mBin0])
-                let curAmp1 = expf(curMel[mBin1])
-                let tgtAmp0 = expf(targetMel[mBin0])
-                let tgtAmp1 = expf(targetMel[mBin1])
-
-                let d_f0 = (targetF0 - curF0) * invHop
-                let d_voiced = (targetVoiced - curVoiced) * invHop
-                let d_act = (targetActivity - curActivity) * invHop
-                let d_gain = (targetGain - curGain) * invHop
-                let d_amp0 = (tgtAmp0 - curAmp0) * invHop
-                let d_amp1 = (tgtAmp1 - curAmp1) * invHop
-
-                let startSample = t * hopSize
-
-                var s = 0
-                while s < hopSize {
-                    let sf = Float(s)
-                    let frac = sf * invHop
-                    let interpF0 = curF0 + (sf * d_f0)
-                    let interpVoiced = curVoiced + (sf * d_voiced)
-                    let interpActivity = curActivity + (sf * d_act)
-                    let interpGain = curGain + (sf * d_gain)
-
-                    // 1. 声帯連続位相の積算
-                    let phaseInc = interpF0 * invSr * twoPi
-                    phase += phaseInc
-                    if twoPi <= phase {
-                        phase -= twoPi
-                    }
-
-                    // 2. 声門パルス音響モデリング (Rosenberg + Schroeder 高調波加算)
-                    var excitation: Float = 0.0
-                    if 0.01 < interpVoiced {
-                        let tau = phase * invTwoPi
-                        let oq = voice.glottal.openQuotient
-                        let rq = voice.glottal.returnQuotient
-                        let tp = oq * (1.0 - rq)
-                        let tn = oq * rq
-
-                        var rawPulse: Float = 0.0
-                        switch true {
-                        case tau < tp:
-                            let openFrac = (Float.pi * tau) / max(1e-4, tp)
-                            rawPulse = 0.5 * (1.0 - cosf(openFrac))
-                        case tau < (tp + tn):
-                            let closeFrac = (0.5 * Float.pi * (tau - tp)) / max(1e-4, tn)
-                            rawPulse = cosf(closeFrac)
-                        default:
-                            rawPulse = 0.0
-                        }
-
-                        // 口唇放射（Lip Radiation, +6dB/oct）の音響物理モデリング
-                        let diffPulse = rawPulse - prevRawPulse
-                        prevRawPulse = rawPulse
-
-                        // Schroeder 位相分散型高調波加算音源による豊かな倍音スペクトルの付与
-                        let harmOsc = Self.computeHarmonicOscillator(
-                            phase: phase,
-                            f0: interpF0,
-                            sampleRate: srFloat
-                        )
-
-                        let glottalCombined = (harmOsc * 0.60) + (diffPulse * 2.2)
-
-                        // 事前計算済み Mel 振幅の線形補間
-                        let melAmp0 = curAmp0 + (sf * d_amp0)
-                        let melAmp1 = curAmp1 + (sf * d_amp1)
-                        let safeGain = min(2.0, max(0.40, (0.6 * melAmp0) + (0.4 * melAmp1)))
-
-                        excitation = glottalCombined * safeGain * 1.76
-                    } else {
-                        prevRawPulse = 0.0
-                    }
-
-                    // 3. 呼気息漏れ気流および無声摩擦ノイズ（高域乱流微分モデリング）
-                    let rawNoise = nextRandomFloat()
-                    let diffNoise = (rawNoise - (0.45 * noiseFilterState)) * 0.55
-                    noiseFilterState = rawNoise
-
-                    let aspMix = voice.glottal.aspirationMix
-                    let aspNoise = rawNoise * 0.20
-                    let voicedIn = (excitation * (1.0 - aspMix)) + (aspNoise * aspMix)
-                    let voicedSample = voicedIn * interpGain
-
-                    let unvoicedWeight = 1.0 - interpVoiced
-                    let unvoicedIn = diffNoise * interpGain * unvoicedWeight * 0.14
-
-                    // 4. 4段カスケード 2次 IIR 声道共鳴フィルタリング (F1 -> F2 -> F3 -> F4)
-                    if interpGain <= 1e-4 && interpActivity <= 1e-4 {
-                        y1_1 = 0.0
-                        y1_2 = 0.0
-                        y2_1 = 0.0
-                        y2_2 = 0.0
-                        y3_1 = 0.0
-                        y3_2 = 0.0
-                        y4_1 = 0.0
-                        y4_2 = 0.0
-                    }
-
-                    let a1_1 = a1_1_cur + (sf * d_a1_1)
-                    let a2_1 = a2_1_cur + (sf * d_a2_1)
-                    let b0_1 = b0_1_cur + (sf * d_b0_1)
-                    let s1 = (b0_1 * voicedSample) + (a1_1 * y1_1) + (a2_1 * y1_2)
-                    y1_2 = y1_1
-                    y1_1 = s1
-
-                    let a1_2 = a1_2_cur + (sf * d_a1_2)
-                    let a2_2 = a2_2_cur + (sf * d_a2_2)
-                    let b0_2 = b0_2_cur + (sf * d_b0_2)
-                    let s2 = (b0_2 * s1) + (a1_2 * y2_1) + (a2_2 * y2_2)
-                    y2_2 = y2_1
-                    y2_1 = s2
-
-                    let in3 = s2 + (unvoicedIn * 0.60)
-
-                    let a1_3 = a1_3_cur + (sf * d_a1_3)
-                    let a2_3 = a2_3_cur + (sf * d_a2_3)
-                    let b0_3 = b0_3_cur + (sf * d_b0_3)
-                    let s3 = (b0_3 * in3) + (a1_3 * y3_1) + (a2_3 * y3_2)
-                    y3_2 = y3_1
-                    y3_1 = s3
-
-                    let a1_4 = a1_4_cur + (sf * d_a1_4)
-                    let a2_4 = a2_4_cur + (sf * d_a2_4)
-                    let b0_4 = b0_4_cur + (sf * d_b0_4)
-                    let s4 = (b0_4 * s3) + (a1_4 * y4_1) + (a2_4 * y4_2)
-                    y4_2 = y4_1
-                    y4_1 = s4
-
-                    let unvoicedDirect = unvoicedIn * 0.40
-                    var resWave = s4 + unvoicedDirect
-
-                    let absWave = abs(resWave)
-                    if 0.85 < absWave {
-                        let excess = absWave - 0.85
-                        let compressed = 0.85 + (0.15 * tanhf(excess * 4.0))
-                        if resWave < 0.0 {
-                            resWave = -compressed
-                        } else {
-                            resWave = compressed
-                        }
-                    }
-
-                    // 5. 入力ベクトル [s, M_0, ..., M_63] の構築
-                    pCurIn[0] = resWave
-                    let oneMinusFrac = 1.0 - frac
-                    var ch = 0
-                    while ch < melCh {
-                        pCurIn[1 + ch] = (((oneMinusFrac * pCurCen[ch]) + (frac * pTgtCen[ch])) * interpActivity)
-                        pCurIn[2 + ch] = (((oneMinusFrac * pCurCen[ch + 1]) + (frac * pTgtCen[ch + 1])) * interpActivity)
-                        pCurIn[3 + ch] = (((oneMinusFrac * pCurCen[ch + 2]) + (frac * pTgtCen[ch + 2])) * interpActivity)
-                        pCurIn[4 + ch] = (((oneMinusFrac * pCurCen[ch + 3]) + (frac * pTgtCen[ch + 3])) * interpActivity)
-                        ch += 4
-                    }
-
-                    // 6. 入力履歴バッファ（kernel 3）のインラインシフト更新
-                    var shiftIn = (2 * inCh) - 1
-                    while 0 <= shiftIn {
-                        pInHist[shiftIn + inCh] = pInHist[shiftIn]
-                        shiftIn -= 1
-                    }
-                    var cIn = 0
-                    while cIn < inCh {
-                        pInHist[cIn] = pCurIn[cIn]
-                        cIn += 1
-                    }
-
-                    // 7. 初段 1D 畳み込み (`convPre`) の実評価（4x Loop Unrolled SIMD 内積）
-                    let totalPre = 3 * inCh
-                    let unrollPreLimit = totalPre - 3
-                    var hIdx = 0
-                    while hIdx < hCh {
-                        var acc0 = pBPre[hIdx]
-                        var acc1: Float = 0.0
-                        var acc2: Float = 0.0
-                        var acc3: Float = 0.0
-                        let wBase = hIdx * totalPre
-                        var i = 0
-                        while i < unrollPreLimit {
-                            acc0 += pWPre[wBase + i] * pInHist[i]
-                            acc1 += pWPre[wBase + i + 1] * pInHist[i + 1]
-                            acc2 += pWPre[wBase + i + 2] * pInHist[i + 2]
-                            acc3 += pWPre[wBase + i + 3] * pInHist[i + 3]
-                            i += 4
-                        }
-                        while i < totalPre {
-                            acc0 += pWPre[wBase + i] * pInHist[i]
-                            i += 1
-                        }
-                        pCurH0[hIdx] = Self.leakyRelu((acc0 + acc1) + (acc2 + acc3))
-                        hIdx += 1
-                    }
-
-                    // 8. h0 履歴バッファ（kernel 7）のインラインシフト更新
-                    var shiftH0 = (6 * hCh) - 1
-                    while 0 <= shiftH0 {
-                        pH0Hist[shiftH0 + hCh] = pH0Hist[shiftH0]
-                        shiftH0 -= 1
-                    }
-                    var cH0 = 0
-                    while cH0 < hCh {
-                        pH0Hist[cH0] = pCurH0[cH0]
-                        cH0 += 1
-                    }
-
-                    // 9. 多重受容野 MRF ResBlock 1 (kernel 3) の実評価（4x Loop Unrolled 内積）
-                    let totalR1 = 3 * hCh
-                    hIdx = 0
-                    while hIdx < hCh {
-                        var acc0 = pBR1C1[hIdx]
-                        var acc1: Float = 0.0
-                        var acc2: Float = 0.0
-                        var acc3: Float = 0.0
-                        let wBase = hIdx * totalR1
-                        var i = 0
-                        while i < totalR1 {
-                            acc0 += pWR1C1[wBase + i] * pH0Hist[i]
-                            acc1 += pWR1C1[wBase + i + 1] * pH0Hist[i + 1]
-                            acc2 += pWR1C1[wBase + i + 2] * pH0Hist[i + 2]
-                            acc3 += pWR1C1[wBase + i + 3] * pH0Hist[i + 3]
-                            i += 4
-                        }
-                        pCurR1Mid[hIdx] = Self.leakyRelu((acc0 + acc1) + (acc2 + acc3))
-                        hIdx += 1
-                    }
-
-                    var shiftR1 = (2 * hCh) - 1
-                    while 0 <= shiftR1 {
-                        pR1Hist[shiftR1 + hCh] = pR1Hist[shiftR1]
-                        shiftR1 -= 1
-                    }
-                    var cR1 = 0
-                    while cR1 < hCh {
-                        pR1Hist[cR1] = pCurR1Mid[cR1]
-                        cR1 += 1
-                    }
-
-                    hIdx = 0
-                    while hIdx < hCh {
-                        var acc0 = pBR1C2[hIdx]
-                        var acc1: Float = 0.0
-                        var acc2: Float = 0.0
-                        var acc3: Float = 0.0
-                        let wBase = hIdx * totalR1
-                        var i = 0
-                        while i < totalR1 {
-                            acc0 += pWR1C2[wBase + i] * pR1Hist[i]
-                            acc1 += pWR1C2[wBase + i + 1] * pR1Hist[i + 1]
-                            acc2 += pWR1C2[wBase + i + 2] * pR1Hist[i + 2]
-                            acc3 += pWR1C2[wBase + i + 3] * pR1Hist[i + 3]
-                            i += 4
-                        }
-                        pCurR1Out[hIdx] = (acc0 + acc1) + (acc2 + acc3)
-                        hIdx += 1
-                    }
-
-                    // 10. 多重受容野 MRF ResBlock 2 (kernel 7) の実評価（4x Loop Unrolled 内積）
-                    let totalR2 = 7 * hCh
-                    hIdx = 0
-                    while hIdx < hCh {
-                        var acc0 = pBR2C1[hIdx]
-                        var acc1: Float = 0.0
-                        var acc2: Float = 0.0
-                        var acc3: Float = 0.0
-                        let wBase = hIdx * totalR2
-                        var i = 0
-                        while i < totalR2 {
-                            acc0 += pWR2C1[wBase + i] * pH0Hist[i]
-                            acc1 += pWR2C1[wBase + i + 1] * pH0Hist[i + 1]
-                            acc2 += pWR2C1[wBase + i + 2] * pH0Hist[i + 2]
-                            acc3 += pWR2C1[wBase + i + 3] * pH0Hist[i + 3]
-                            i += 4
-                        }
-                        pCurR2Mid[hIdx] = Self.leakyRelu((acc0 + acc1) + (acc2 + acc3))
-                        hIdx += 1
-                    }
-
-                    var shiftR2 = (6 * hCh) - 1
-                    while 0 <= shiftR2 {
-                        pR2Hist[shiftR2 + hCh] = pR2Hist[shiftR2]
-                        shiftR2 -= 1
-                    }
-                    var cR2 = 0
-                    while cR2 < hCh {
-                        pR2Hist[cR2] = pCurR2Mid[cR2]
-                        cR2 += 1
-                    }
-
-                    hIdx = 0
-                    while hIdx < hCh {
-                        var acc0 = pBR2C2[hIdx]
-                        var acc1: Float = 0.0
-                        var acc2: Float = 0.0
-                        var acc3: Float = 0.0
-                        let wBase = hIdx * totalR2
-                        var i = 0
-                        while i < totalR2 {
-                            acc0 += pWR2C2[wBase + i] * pR2Hist[i]
-                            acc1 += pWR2C2[wBase + i + 1] * pR2Hist[i + 1]
-                            acc2 += pWR2C2[wBase + i + 2] * pR2Hist[i + 2]
-                            acc3 += pWR2C2[wBase + i + 3] * pR2Hist[i + 3]
-                            i += 4
-                        }
-                        pCurR2Out[hIdx] = (acc0 + acc1) + (acc2 + acc3)
-                        hIdx += 1
-                    }
-
-                    // 11. MRF 残差結合: H_mrf = H_0 + ResBlock1 + ResBlock2
-                    hIdx = 0
-                    while hIdx < hCh {
-                        pCurHmrf[hIdx] = pCurH0[hIdx] + pCurR1Out[hIdx] + pCurR2Out[hIdx]
-                        hIdx += 1
-                    }
-
-                    var shiftPost = (6 * hCh) - 1
-                    while 0 <= shiftPost {
-                        pPostHist[shiftPost + hCh] = pPostHist[shiftPost]
-                        shiftPost -= 1
-                    }
-                    var cPost = 0
-                    while cPost < hCh {
-                        pPostHist[cPost] = pCurHmrf[cPost]
-                        cPost += 1
-                    }
-
-                    // 12. 終段 1D 畳み込み (`convPost`) の実評価（4x Loop Unrolled 内積）
-                    var postAcc0 = bPostVal
-                    var postAcc1: Float = 0.0
-                    var postAcc2: Float = 0.0
-                    var postAcc3: Float = 0.0
-                    var iPost = 0
-                    while iPost < totalR2 {
-                        postAcc0 += pWPost[iPost] * pPostHist[iPost]
-                        postAcc1 += pWPost[iPost + 1] * pPostHist[iPost + 1]
-                        postAcc2 += pWPost[iPost + 2] * pPostHist[iPost + 2]
-                        postAcc3 += pWPost[iPost + 3] * pPostHist[iPost + 3]
-                        iPost += 4
-                    }
-                    let finalOut = (postAcc0 + postAcc1) + (postAcc2 + postAcc3)
-
-                    // 13. NSF 音響物理共鳴とニューラル残差の統合
-                    let neuralWave = finalOut * 0.35
-                    let combined = (resWave * 1.0) + neuralWave
-                    let rawVal = tanhf(combined * voice.energyScale * 1.25)
-                    let dcR: Float = 0.995
-                    let dcOut = rawVal - dcXPrev + (dcR * dcYPrev)
-                    dcXPrev = rawVal
-                    dcYPrev = dcOut
-
-                    var sampleVal = dcOut
-                    if sampleVal < -1.0 {
-                        sampleVal = -1.0
-                    }
-                    if 1.0 < sampleVal {
-                        sampleVal = 1.0
-                    }
-
-                    if interpVoiced <= 0.001 && interpActivity <= 0.001 {
-                        pOut[startSample + s] = 0.0
-                        dcXPrev = 0.0
-                        dcYPrev = 0.0
-                    } else {
-                        pOut[startSample + s] = sampleVal
-                    }
-
-                    s += 1
-                }
-
-                curF0 = targetF0
-                curVoiced = targetVoiced
-                curActivity = targetActivity
-                curMel = targetMel
-                curF1 = targetF1
-                curB1 = targetB1
-                curF2 = targetF2
-                curB2 = targetB2
-                curF3 = targetF3
-                curB3 = targetB3
-                curF4 = targetF4
-                curB4 = targetB4
-                curGain = targetGain
-
-                var chC = 0
-                while chC < melCh {
-                    pCurCen[chC] = pTgtCen[chC]
-                    chC += 1
-                }
-                t += 1
+                var nF0 = f0Val / 500.0
+                if nF0 < 0.0 { nF0 = 0.0 }
+                if 1.0 < nF0 { nF0 = 1.0 }
+                normF0 = nF0
             }
-        }}}}}}}}}}}}}}}}}}}}}}}}}}
 
-        // 次回フレーム合成時の補間連続性を維持
-        hasLastFrame = true
-        lastF0 = curF0
-        lastVoiced = curVoiced
-        lastActivity = curActivity
-        lastMel = curMel
-        lastF1 = curF1
-        lastB1 = curB1
-        lastF2 = curF2
-        lastB2 = curB2
-        lastF3 = curF3
-        lastB3 = curB3
-        lastF4 = curF4
-        lastB4 = curB4
-        lastGain = curGain
+            inputFeats[rowStart + melCh] = normF0
+            inputFeats[rowStart + melCh + 1] = vVal
 
-        return outputSamples
+            t += 1
+        }
+
+        let totalSamples = totalFrames * config.hopSize
+        var outputAudio = [Float](repeating: 0.0, count: totalSamples)
+
+        // 2. メモリバッファの確保（ゼロアロケーション）
+        let lenPre = totalFrames * hCh
+        if bufPre.count < lenPre { bufPre = [Float](repeating: 0.0, count: lenPre) }
+
+        let T1 = totalFrames * 10
+        let lenUp1 = T1 * hCh
+        if bufUp1.count < lenUp1 { bufUp1 = [Float](repeating: 0.0, count: lenUp1) }
+        if bufMid1.count < lenUp1 { bufMid1 = [Float](repeating: 0.0, count: lenUp1) }
+        if bufR1.count < lenUp1 { bufR1 = [Float](repeating: 0.0, count: lenUp1) }
+        if bufR2.count < lenUp1 { bufR2 = [Float](repeating: 0.0, count: lenUp1) }
+
+        let T2 = T1 * 4
+        let lenUp2 = T2 * hCh
+        if bufUp2.count < lenUp2 { bufUp2 = [Float](repeating: 0.0, count: lenUp2) }
+        if bufMid2.count < lenUp2 { bufMid2 = [Float](repeating: 0.0, count: lenUp2) }
+        if bufR3.count < lenUp2 { bufR3 = [Float](repeating: 0.0, count: lenUp2) }
+        if bufR4.count < lenUp2 { bufR4 = [Float](repeating: 0.0, count: lenUp2) }
+
+        let T3 = T2 * 4 // totalSamples
+        let lenUp3 = T3 * hCh
+        if bufUp3.count < lenUp3 { bufUp3 = [Float](repeating: 0.0, count: lenUp3) }
+        if bufMid3.count < lenUp3 { bufMid3 = [Float](repeating: 0.0, count: lenUp3) }
+        if bufR5.count < lenUp3 { bufR5 = [Float](repeating: 0.0, count: lenUp3) }
+        if bufR6.count < lenUp3 { bufR6 = [Float](repeating: 0.0, count: lenUp3) }
+
+        inputFeats.withUnsafeBufferPointer { pIn in
+            bufPre.withUnsafeMutableBufferPointer { pPre in
+                bufUp1.withUnsafeMutableBufferPointer { pUp1 in
+                    bufMid1.withUnsafeMutableBufferPointer { pMid1 in
+                        bufR1.withUnsafeMutableBufferPointer { pR1 in
+                            bufR2.withUnsafeMutableBufferPointer { pR2 in
+                                bufUp2.withUnsafeMutableBufferPointer { pUp2 in
+                                    bufMid2.withUnsafeMutableBufferPointer { pMid2 in
+                                        bufR3.withUnsafeMutableBufferPointer { pR3 in
+                                            bufR4.withUnsafeMutableBufferPointer { pR4 in
+                                                bufUp3.withUnsafeMutableBufferPointer { pUp3 in
+                                                    bufMid3.withUnsafeMutableBufferPointer { pMid3 in
+                                                        bufR5.withUnsafeMutableBufferPointer { pR5 in
+                                                            bufR6.withUnsafeMutableBufferPointer { pR6 in
+                                                                outputAudio.withUnsafeMutableBufferPointer { pOut in
+                                                                    let w = self.weights
+
+                                                                    // 1. convPre: kernel 7, inCh -> hCh, LeakyReLU
+                                                                    w.convPreWeight.withUnsafeBufferPointer { pWPre in
+                                                                        w.convPreBias.withUnsafeBufferPointer { pBPre in
+                                                                            Self.conv1d(
+                                                                                input: pIn.baseAddress!,
+                                                                                output: pPre.baseAddress!,
+                                                                                T: totalFrames,
+                                                                                inC: inCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 3,
+                                                                                dilation: 1,
+                                                                                weights: pWPre.baseAddress!,
+                                                                                bias: pBPre.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // 2. Stage 1: up1 (stride 10, kernel 20, padding 5, hCh -> hCh)
+                                                                    w.up1Weight.withUnsafeBufferPointer { pWUp1 in
+                                                                        w.up1Bias.withUnsafeBufferPointer { pBUp1 in
+                                                                            Self.convTransposed1d(
+                                                                                input: pPre.baseAddress!,
+                                                                                output: pUp1.baseAddress!,
+                                                                                inT: totalFrames,
+                                                                                stride: 10,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                weights: pWUp1.baseAddress!,
+                                                                                bias: pBUp1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 1 ResBlock 1 (kernel 3, dilation 1, 3)
+                                                                    w.res1Conv1Weight.withUnsafeBufferPointer { pWR1C1 in
+                                                                        w.res1Conv1Bias.withUnsafeBufferPointer { pBR1C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp1.baseAddress!,
+                                                                                output: pMid1.baseAddress!,
+                                                                                T: T1,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 1,
+                                                                                dilation: 1,
+                                                                                weights: pWR1C1.baseAddress!,
+                                                                                bias: pBR1C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res1Conv2Weight.withUnsafeBufferPointer { pWR1C2 in
+                                                                        w.res1Conv2Bias.withUnsafeBufferPointer { pBR1C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid1.baseAddress!,
+                                                                                output: pR1.baseAddress!,
+                                                                                T: T1,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 3,
+                                                                                dilation: 3,
+                                                                                weights: pWR1C2.baseAddress!,
+                                                                                bias: pBR1C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 1 ResBlock 2 (kernel 7, dilation 1, 3)
+                                                                    w.res2Conv1Weight.withUnsafeBufferPointer { pWR2C1 in
+                                                                        w.res2Conv1Bias.withUnsafeBufferPointer { pBR2C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp1.baseAddress!,
+                                                                                output: pMid1.baseAddress!,
+                                                                                T: T1,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 3,
+                                                                                dilation: 1,
+                                                                                weights: pWR2C1.baseAddress!,
+                                                                                bias: pBR2C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res2Conv2Weight.withUnsafeBufferPointer { pWR2C2 in
+                                                                        w.res2Conv2Bias.withUnsafeBufferPointer { pBR2C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid1.baseAddress!,
+                                                                                output: pR2.baseAddress!,
+                                                                                T: T1,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 9,
+                                                                                dilation: 3,
+                                                                                weights: pWR2C2.baseAddress!,
+                                                                                bias: pBR2C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 1 残差結合: h1 = h1 + 0.5 * (r1 + r2)
+                                                                    var idx = 0
+                                                                    while idx < lenUp1 {
+                                                                        pUp1[idx] = pUp1[idx] + (0.5 * (pR1[idx] + pR2[idx]))
+                                                                        idx += 1
+                                                                    }
+
+                                                                    // 3. Stage 2: up2 (stride 4, kernel 8, padding 2, hCh -> hCh)
+                                                                    w.up2Weight.withUnsafeBufferPointer { pWUp2 in
+                                                                        w.up2Bias.withUnsafeBufferPointer { pBUp2 in
+                                                                            Self.convTransposed1d(
+                                                                                input: pUp1.baseAddress!,
+                                                                                output: pUp2.baseAddress!,
+                                                                                inT: T1,
+                                                                                stride: 4,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                weights: pWUp2.baseAddress!,
+                                                                                bias: pBUp2.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 2 ResBlock 1 (kernel 3, dilation 1, 3)
+                                                                    w.res3Conv1Weight.withUnsafeBufferPointer { pWR3C1 in
+                                                                        w.res3Conv1Bias.withUnsafeBufferPointer { pBR3C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp2.baseAddress!,
+                                                                                output: pMid2.baseAddress!,
+                                                                                T: T2,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 1,
+                                                                                dilation: 1,
+                                                                                weights: pWR3C1.baseAddress!,
+                                                                                bias: pBR3C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res3Conv2Weight.withUnsafeBufferPointer { pWR3C2 in
+                                                                        w.res3Conv2Bias.withUnsafeBufferPointer { pBR3C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid2.baseAddress!,
+                                                                                output: pR3.baseAddress!,
+                                                                                T: T2,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 3,
+                                                                                dilation: 3,
+                                                                                weights: pWR3C2.baseAddress!,
+                                                                                bias: pBR3C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 2 ResBlock 2 (kernel 7, dilation 1, 3)
+                                                                    w.res4Conv1Weight.withUnsafeBufferPointer { pWR4C1 in
+                                                                        w.res4Conv1Bias.withUnsafeBufferPointer { pBR4C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp2.baseAddress!,
+                                                                                output: pMid2.baseAddress!,
+                                                                                T: T2,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 3,
+                                                                                dilation: 1,
+                                                                                weights: pWR4C1.baseAddress!,
+                                                                                bias: pBR4C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res4Conv2Weight.withUnsafeBufferPointer { pWR4C2 in
+                                                                        w.res4Conv2Bias.withUnsafeBufferPointer { pBR4C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid2.baseAddress!,
+                                                                                output: pR4.baseAddress!,
+                                                                                T: T2,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 9,
+                                                                                dilation: 3,
+                                                                                weights: pWR4C2.baseAddress!,
+                                                                                bias: pBR4C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 2 残差結合: h2 = h2 + 0.5 * (r3 + r4)
+                                                                    idx = 0
+                                                                    while idx < lenUp2 {
+                                                                        pUp2[idx] = pUp2[idx] + (0.5 * (pR3[idx] + pR4[idx]))
+                                                                        idx += 1
+                                                                    }
+
+                                                                    // 4. Stage 3: up3 (stride 4, kernel 8, padding 2, hCh -> hCh)
+                                                                    w.up3Weight.withUnsafeBufferPointer { pWUp3 in
+                                                                        w.up3Bias.withUnsafeBufferPointer { pBUp3 in
+                                                                            Self.convTransposed1d(
+                                                                                input: pUp2.baseAddress!,
+                                                                                output: pUp3.baseAddress!,
+                                                                                inT: T2,
+                                                                                stride: 4,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                weights: pWUp3.baseAddress!,
+                                                                                bias: pBUp3.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 3 ResBlock 1 (kernel 3, dilation 1, 3)
+                                                                    w.res5Conv1Weight.withUnsafeBufferPointer { pWR5C1 in
+                                                                        w.res5Conv1Bias.withUnsafeBufferPointer { pBR5C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp3.baseAddress!,
+                                                                                output: pMid3.baseAddress!,
+                                                                                T: T3,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 1,
+                                                                                dilation: 1,
+                                                                                weights: pWR5C1.baseAddress!,
+                                                                                bias: pBR5C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res5Conv2Weight.withUnsafeBufferPointer { pWR5C2 in
+                                                                        w.res5Conv2Bias.withUnsafeBufferPointer { pBR5C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid3.baseAddress!,
+                                                                                output: pR5.baseAddress!,
+                                                                                T: T3,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 3,
+                                                                                padding: 3,
+                                                                                dilation: 3,
+                                                                                weights: pWR5C2.baseAddress!,
+                                                                                bias: pBR5C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 3 ResBlock 2 (kernel 7, dilation 1, 3)
+                                                                    w.res6Conv1Weight.withUnsafeBufferPointer { pWR6C1 in
+                                                                        w.res6Conv1Bias.withUnsafeBufferPointer { pBR6C1 in
+                                                                            Self.conv1d(
+                                                                                input: pUp3.baseAddress!,
+                                                                                output: pMid3.baseAddress!,
+                                                                                T: T3,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 3,
+                                                                                dilation: 1,
+                                                                                weights: pWR6C1.baseAddress!,
+                                                                                bias: pBR6C1.baseAddress!,
+                                                                                applyActivation: true
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    w.res6Conv2Weight.withUnsafeBufferPointer { pWR6C2 in
+                                                                        w.res6Conv2Bias.withUnsafeBufferPointer { pBR6C2 in
+                                                                            Self.conv1d(
+                                                                                input: pMid3.baseAddress!,
+                                                                                output: pR6.baseAddress!,
+                                                                                T: T3,
+                                                                                inC: hCh,
+                                                                                outC: hCh,
+                                                                                kernel: 7,
+                                                                                padding: 9,
+                                                                                dilation: 3,
+                                                                                weights: pWR6C2.baseAddress!,
+                                                                                bias: pBR6C2.baseAddress!,
+                                                                                applyActivation: false
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    // MRF 3 残差結合: h3 = h3 + 0.5 * (r5 + r6)
+                                                                    idx = 0
+                                                                    while idx < lenUp3 {
+                                                                        pUp3[idx] = pUp3[idx] + (0.5 * (pR5[idx] + pR6[idx]))
+                                                                        idx += 1
+                                                                    }
+
+                                                                    // 5. 終段波形出力 1D 畳み込み層（純粋 HiFi-GAN MRF ニューラル波形生成）
+                                                                    // なぜ正弦波やパルスの直接加算を完全撤廃するか:
+                                                                    // 人工的な電子ビープ音・モデム音・発振音を根絶し、Mel 特徴量および F0 輪郭から
+                                                                    // 畳み込みネットワークの受容野結合によって人間の自然な肉声波形を直接生成するため。
+                                                                    w.convPostWeight.withUnsafeBufferPointer { pWPost in
+                                                                        w.convPostBias.withUnsafeBufferPointer { pBPost in
+                                                                            var s = 0
+                                                                            while s < T3 {
+                                                                                var sum = pBPost[0]
+                                                                                var k = 0
+                                                                                while k < 7 {
+                                                                                    let inS = s + k - 3
+                                                                                    if 0 <= inS && inS < T3 {
+                                                                                        let inRow = inS * hCh
+                                                                                        let wRow = k * hCh
+                                                                                        sum += VectorOperations.dotProduct(
+                                                                                            a: pUp3.baseAddress!.advanced(by: inRow),
+                                                                                            b: pWPost.baseAddress!.advanced(by: wRow),
+                                                                                            count: hCh
+                                                                                        )
+                                                                                    }
+                                                                                    k += 1
+                                                                                }
+                                                                                pOut[s] = tanhf(sum)
+                                                                                s += 1
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return outputAudio
     }
 
-    /// 1フレーム単位の逐次合成（低遅延ストリーミング対応）
+    /// 単一フレームの逐次波形合成（低遅延ストリーミング出力用）
     public func synthesizeFrame(
         melFrame: [Float],
-        f0: Float = 0.0,
+        f0: Float = 220.0,
         voiced: Float = 1.0,
         voice: VoiceProfile = .female,
-        resonatorFrame: ResonatorFrame? = nil,
         dst: UnsafeMutablePointer<Float>
     ) {
-        let rFrames: [ResonatorFrame]
-        switch resonatorFrame {
-        case .some(let rf):
-            rFrames = [rf]
-        case .none:
-            rFrames = []
-        }
-        let frameSamples = synthesize(
+        let pcm = synthesize(
             mel: [melFrame],
             f0Contour: [f0],
             voicedFlags: [voiced],
-            voice: voice,
-            resonatorFrames: rFrames
+            voice: voice
         )
-        let copyCount = min(config.hopSize, frameSamples.count)
+        let copyCount = min(config.hopSize, pcm.count)
         var i = 0
         while i < copyCount {
-            dst[i] = frameSamples[i]
+            dst[i] = pcm[i]
             i += 1
         }
     }
 }
+

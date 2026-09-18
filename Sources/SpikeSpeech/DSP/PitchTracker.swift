@@ -251,19 +251,36 @@ public final class PitchTracker: @unchecked Sendable {
         }
 
         // 4. 最短有意ラグ（First Significant Peak）による真の基本周期確定
-        // なぜ最短ラグを選択するか:
-        // 基本周波数 F0 は信号の「最小周期（最短ラグ）」である。
-        // 自己相関関数では 2 周期、3 周期（2tau, 3tau）でも同等以上の相関ピークが周期的に出現するため、
-        // 単純に最大値だけを選ぶとオクターブ低周波誤認（ピッチ半減や 3 分の 1 化）を引き起こす。
-        // 大域的最大相関の 85% 以上の十分な周期強度を持つ最初の（最短ラグの）極大ピークを採用することで、
-        // 多重周期のオクターブ跳躍を根絶し、真の基本周波数を確実に特定する。
-        let peakThreshold = globalMaxPeak * 0.85
+        // なぜ最短ラグを選択し、フレーム境界相関を排除するか:
+        // 基本周波数 F0 は声帯振動信号の「最小周期（最短ラグ）」である。
+        // 単純に相関最大値だけを選ぶと、倍音周期（2tau, 3tau）やフレームシフト境界（160サンプル=100Hz）の
+        // 構造的アーティファクトに相関ピークが奪われ、オクターブ低周波誤認や 100Hz への縮退を引き起こす。
+        // 有声域として十分な強度（voicingThreshold 以上）を持ち、かつ大域最大相関の有意な比率を持つ
+        // 最初の（最短ラグの）極大ピークを採用することで、真の声帯振動周期を正確に特定する。
+        var significantThreshold = globalMaxPeak * 0.60
+        if significantThreshold < voicingThreshold {
+            significantThreshold = voicingThreshold
+        }
+        if 0.45 < significantThreshold {
+            significantThreshold = 0.45
+        }
+
         var bestLag = 0
         var pIdx = 0
         while pIdx < peakLags.count {
             let pLag = peakLags[pIdx]
             let pVal = peakVals[pIdx]
-            if peakThreshold <= pVal {
+
+            // フレームシフト周期（160サンプル = 100Hz）近傍のアーティファクト排除:
+            // 手前に十分な有声相関の先行ピークが存在する場合、フレーム境界ピークによる誤検出を防止する。
+            let isHopArtifact: Bool
+            if (hopSize - 12) <= pLag && pLag <= (hopSize + 12) {
+                isHopArtifact = true
+            } else {
+                isHopArtifact = false
+            }
+
+            if isHopArtifact != true && significantThreshold <= pVal {
                 bestLag = pLag
                 break
             }
@@ -271,7 +288,33 @@ public final class PitchTracker: @unchecked Sendable {
         }
 
         if bestLag <= 0 {
-            bestLag = peakLags[0]
+            // ホップアーティファクト以外のピークからフォールバック探索
+            let fallbackThreshold = globalMaxPeak * 0.80
+            pIdx = 0
+            while pIdx < peakLags.count {
+                let pLag = peakLags[pIdx]
+                let pVal = peakVals[pIdx]
+                let isHopArtifact: Bool
+                if (hopSize - 12) <= pLag && pLag <= (hopSize + 12) {
+                    isHopArtifact = true
+                } else {
+                    isHopArtifact = false
+                }
+                if isHopArtifact != true && fallbackThreshold <= pVal {
+                    bestLag = pLag
+                    break
+                }
+                pIdx += 1
+            }
+        }
+
+        if bestLag <= 0 {
+            // ホップ周期近傍しかピークが存在しない場合、真の低域声帯振動（globalMaxPeak >= 0.65）である場合のみ有声採用
+            if 0.65 <= globalMaxPeak {
+                bestLag = peakLags[0]
+            } else {
+                return (f0: 0.0, voiced: 0.0, energy: min(1.0, rms))
+            }
         }
 
         // 6. 放物線補間（Parabolic Interpolation）によるサブサンプル精度ラグ推定

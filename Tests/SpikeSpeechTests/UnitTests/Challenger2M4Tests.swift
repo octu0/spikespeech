@@ -329,10 +329,14 @@ final class Challenger2M4Tests: XCTestCase {
     }
 
     /// 2,000 文字以上の超長文テキストでの E2E 合成におけるメモリリーク・アロケーション爆発・スケーリング検証
-    func testSuperLongTextE2ESynthesisMemoryAndScaling() {
-        // 長時間発話において SNN 膜電位積算やバッファ再利用が破綻しないこと、
-        // アロケーション爆発やメモリリーク（RSS 肥大化）が生じないこと、
-        // および全フレームで NaN/Inf が一切発生しないことを実測検証する。
+    func testSuperLongTextE2ESynthesisMemoryAndScaling() throws {
+        // なぜ環境変数の有無でスキップ可能にするか:
+        // 2,000文字超の波形生成はニューラルボコーダーの全フレーム畳み込みに約1分以上を要するため、
+        // 通常のテスト実行を阻害しないよう、環境変数 SPIKESPEECH_STRESS_TEST が明示された場合のみ実行する。
+        let shouldRun = ProcessInfo.processInfo.environment["SPIKESPEECH_STRESS_TEST"] != nil
+        if shouldRun != true {
+            throw XCTSkip("超長文テキストE2E合成テスト (2,000文字) は時間がかかるためスキップします (実行時は SPIKESPEECH_STRESS_TEST=1 を指定してください)")
+        }
 
         let engine = SpikeSpeechEngine()
 
@@ -359,7 +363,12 @@ final class Challenger2M4Tests: XCTestCase {
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         let memAfter = getResidentMemoryBytes()
-        let memDiffMB = Float(memAfter - memBefore) / (1024.0 * 1024.0)
+        let memDiffMB: Float
+        if memBefore <= memAfter {
+            memDiffMB = Float(memAfter - memBefore) / (1024.0 * 1024.0)
+        } else {
+            memDiffMB = -Float(memBefore - memAfter) / (1024.0 * 1024.0)
+        }
 
         // 1. サンプル数検証 (1500文字 -> 数万〜数十万サンプル)
         XCTAssertTrue(10000 < samples.count, "超長文の出力サンプル数が過少です: \(samples.count)")

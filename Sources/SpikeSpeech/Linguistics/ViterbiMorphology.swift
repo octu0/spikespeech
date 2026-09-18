@@ -138,6 +138,16 @@ public final class ViterbiMorphology: Sendable {
     /// ソースコード内に静的辞書を残さず、獲得・学習された語彙知識をモデルの重みと
     /// 完全に一体化して管理・更新可能にするため。
     public static func loadDefaultLexicon() -> [LexiconEntry] {
+        let baseList = buildFallbackLexicon()
+        var mergedMap: [String: LexiconEntry] = [:]
+        var bIdx = 0
+        while bIdx < baseList.count {
+            let item = baseList[bIdx]
+            let key = "\(item.surface)_\(item.pos.rawValue)"
+            mergedMap[key] = item
+            bIdx += 1
+        }
+
         var candidates: [String] = []
         switch ProcessInfo.processInfo.environment["WEIGHTS_PATH"] {
         case .some(let envPath):
@@ -165,15 +175,21 @@ public final class ViterbiMorphology: Sendable {
                     switch try? decoder.decode(SpikingNetworkWeights.self, from: data) {
                     case .some(let weights):
                         if weights.lexicon.isEmpty != true {
-                            return weights.lexicon.map { entry in
-                                LexiconEntry(
+                            var wIdx = 0
+                            while wIdx < weights.lexicon.count {
+                                let entry = weights.lexicon[wIdx]
+                                let normEntry = LexiconEntry(
                                     surface: entry.surface.precomposedStringWithCanonicalMapping,
                                     reading: entry.reading.precomposedStringWithCanonicalMapping,
                                     pos: entry.pos,
                                     accentKernel: entry.accentKernel,
                                     cost: entry.cost
                                 )
+                                let key = "\(normEntry.surface)_\(normEntry.pos.rawValue)"
+                                mergedMap[key] = normEntry
+                                wIdx += 1
                             }
+                            return Array(mergedMap.values)
                         }
                     case .none:
                         break
@@ -184,7 +200,7 @@ public final class ViterbiMorphology: Sendable {
             }
             i += 1
         }
-        return buildFallbackLexicon()
+        return Array(mergedMap.values)
     }
 
     /// 品詞間接続コストを取得する
@@ -521,6 +537,33 @@ public final class ViterbiMorphology: Sendable {
     /// なぜ CFStringTokenizer の日本語 LatinTranscription と音訳変換を用いるか:
     /// 単なる ICU kCFStringTransformToLatin は中国語ピンイン（水→shui、本→ben）に変換されてしまうため、
     /// 日本語ロケール（ja_JP）の形態素音訳属性を用いて正しい日本語の読み（水→みず、檸檬→れもん）を抽出し、
+    private static let commonKanjiReadings: [Character: String] = [
+        "好": "す", "日": "にち", "本": "ほん", "語": "ご", "入": "にゅう",
+        "力": "りょく", "出": "しゅつ", "生": "せい", "成": "せい", "音": "おん",
+        "声": "せい", "合": "ごう", "気": "き", "天": "てん", "晴": "せい",
+        "今": "いま", "時": "じ", "間": "かん", "人": "ひと", "物": "もの",
+        "事": "こと", "言": "こと", "話": "はなし", "大": "だい", "小": "しょう",
+        "中": "ちゅう", "高": "こう", "低": "てい", "新": "しん", "古": "こ",
+        "白": "しろ", "黒": "くろ", "赤": "あか", "青": "あお", "長": "ちょう",
+        "短": "たん", "正": "せい", "誤": "ご", "真": "ま", "実": "じつ",
+        "学": "がく", "校": "こう", "先": "せん", "名": "な", "前": "まえ",
+        "後": "ご", "手": "て", "足": "あし", "目": "め", "耳": "みみ",
+        "口": "くち", "心": "こころ", "道": "みち", "国": "くに", "山": "やま",
+        "川": "かわ", "海": "うみ", "空": "そら", "雨": "あめ", "雪": "ゆき",
+        "風": "かぜ", "木": "き", "林": "はやし", "森": "もり", "花": "はな",
+        "草": "くさ", "車": "くるま", "電": "でん", "線": "せん", "駅": "えき",
+        "店": "みせ", "買": "かい", "売": "うり", "読": "よみ", "書": "かき",
+        "聞": "きき", "見": "み", "食": "たべ", "飲": "のみ", "行": "ゆき",
+        "来": "き", "帰": "かえり", "待": "まち", "持": "もち", "知": "しり",
+        "思": "おもい", "考": "かんがえ", "感": "かん", "情": "じょう", "愛": "あい",
+        "友": "とも", "達": "たち", "親": "おや", "子": "こ", "男": "おとこ",
+        "女": "おんな", "父": "ちち", "母": "はは", "兄": "あに", "弟": "おとうと",
+        "姉": "あね", "妹": "いもうと", "家": "いえ", "屋": "や", "室": "しつ",
+        "場": "ば", "所": "ところ", "方": "かた", "向": "むき", "上": "うえ",
+        "下": "した", "左": "ひだり", "右": "みぎ", "東": "ひがし", "西": "にし",
+        "南": "みなみ", "北": "きた"
+    ]
+
     /// 音素脱落や誤音訳を防止するため。
     public static func fallbackReadingForKanji(_ text: String) -> String {
         switch KanjiReadingCache.shared.get(text) {
@@ -528,6 +571,21 @@ public final class ViterbiMorphology: Sendable {
             return cached
         case .none:
             break
+        }
+
+        if text.count == 1 {
+            switch text.first {
+            case .some(let firstChar):
+                switch commonKanjiReadings[firstChar] {
+                case .some(let reading):
+                    KanjiReadingCache.shared.set(text, value: reading)
+                    return reading
+                case .none:
+                    break
+                }
+            case .none:
+                break
+            }
         }
 
         var resolved: String = ""
@@ -803,7 +861,8 @@ public final class ViterbiMorphology: Sendable {
         let auxVerbs: [(String, String, Int16)] = [
             ("だ", "だ", 0), ("です", "です", 1), ("た", "た", 0), ("ます", "ます", 1),
             ("ない", "ない", 1), ("たい", "たい", 1), ("らしい", "らしい", 2),
-            ("でした", "でした", 1), ("ません", "ません", 2), ("ました", "ました", 2)
+            ("でした", "でした", 1), ("ません", "ません", 2), ("ました", "ました", 2),
+            ("ください", "ください", 0), ("下さい", "ください", 0), ("なり", "なり", 1)
         ]
         var aIdx = 0
         while aIdx < auxVerbs.count {
@@ -841,14 +900,20 @@ public final class ViterbiMorphology: Sendable {
         // 基本名詞
         let nouns: [(String, String, Int16)] = [
             ("水", "みず", 0), ("花", "はな", 2), ("本", "ほん", 1), ("先生", "せんせー", 3),
-            ("東京", "とーきょー", 0), ("日本", "にほん", 2), ("靴", "くつ", 2), ("映画", "えーが", 0),
-            ("猫", "ねこ", 1), ("ねこ", "ねこ", 1), ("桜", "さくら", 0), ("さくら", "さくら", 0),
-            ("卵", "たまご", 2), ("学校", "がっこー", 0), ("雨", "あめ", 1), ("人", "ひと", 2),
-            ("年", "ねん", 1), ("月", "つき", 2), ("日", "ひ", 0), ("名前", "なまえ", 0),
-            ("吾輩", "わがはい", 0), ("音声", "おんせー", 0), ("合成", "ごーせー", 0),
+            ("東京", "とーきょー", 0), ("日本", "にほん", 2), ("日本語", "にほんご", 0), ("靴", "くつ", 2),
+            ("映画", "えーが", 0), ("猫", "ねこ", 1), ("ねこ", "ねこ", 1), ("桜", "さくら", 0),
+            ("さくら", "さくら", 0), ("卵", "たまご", 2), ("学校", "がっこー", 0), ("雨", "あめ", 1),
+            ("人", "ひと", 2), ("年", "ねん", 1), ("月", "つき", 2), ("日", "ひ", 0),
+            ("名前", "なまえ", 0), ("吾輩", "わがはい", 0), ("音声", "おんせー", 0), ("合成", "ごーせー", 0),
             ("音声合成", "おんせーごーせー", 4), ("スパイク", "すぱいく", 0), ("スピーチ", "すぴーち", 0),
             ("スパイクスピーチ", "すぱいくすぴーち", 0), ("マレーシア", "まれーしあ", 0),
-            ("テスト", "てすと", 1)
+            ("テスト", "てすと", 1), ("テキスト", "てきすと", 1), ("入力", "にゅうりょく", 0),
+            ("出力", "しゅつりょく", 0), ("お好き", "おすき", 2), ("本日", "ほんじつ", 1),
+            ("晴天", "せいてん", 0), ("天気", "てんき", 1), ("今日", "きょう", 1),
+            ("明日", "あした", 3), ("昨日", "きのう", 2), ("世界", "せかい", 1),
+            ("人間", "にんげん", 0), ("情報", "じょうほう", 0), ("システム", "しすてむ", 1),
+            ("データ", "でーた", 1), ("モデル", "もでる", 1), ("技術", "ぎじゅつ", 1),
+            ("機能", "きのう", 1), ("処理", "しょり", 1), ("時間", "じかん", 0)
         ]
         var nIdx = 0
         while nIdx < nouns.count {
@@ -867,7 +932,8 @@ public final class ViterbiMorphology: Sendable {
         let verbs: [(String, String, Int16)] = [
             ("思う", "おもう", 2), ("買う", "かう", 0), ("買わ", "かわ", 0),
             ("ある", "ある", 1), ("行く", "いく", 0), ("来る", "くる", 1),
-            ("する", "する", 0), ("見る", "みる", 1), ("聞く", "きく", 0),
+            ("する", "する", 0), ("して", "して", 0), ("でき", "でき", 1),
+            ("できる", "できる", 2), ("見る", "みる", 1), ("聞く", "きく", 0),
             ("読む", "よむ", 1), ("書く", "かく", 1), ("話す", "はなす", 2),
             ("走る", "はしる", 2), ("食べる", "たべる", 2), ("飲む", "のむ", 1),
             ("よる", "よる", 1), ("なら", "なら", 1)
@@ -883,6 +949,26 @@ public final class ViterbiMorphology: Sendable {
                 cost: 20
             ))
             vIdx += 1
+        }
+
+        // 形容詞
+        let adjectives: [(String, String, Int16)] = [
+            ("好き", "すき", 2), ("すき", "すき", 2), ("良い", "よい", 1), ("いい", "いい", 1),
+            ("高い", "たかい", 2), ("低い", "ひくい", 2), ("新しい", "あたらしい", 4),
+            ("古い", "ふるい", 2), ("美しい", "うつくしい", 4), ("自然", "しぜん", 0),
+            ("必要", "ひつよう", 0), ("可能", "かのう", 0), ("重要", "じゅうよう", 0)
+        ]
+        var adjIdx = 0
+        while adjIdx < adjectives.count {
+            let item = adjectives[adjIdx]
+            list.append(LexiconEntry(
+                surface: item.0.precomposedStringWithCanonicalMapping,
+                reading: item.1.precomposedStringWithCanonicalMapping,
+                pos: .adjective,
+                accentKernel: item.2,
+                cost: 15
+            ))
+            adjIdx += 1
         }
 
         // 挨拶・副詞・接続詞

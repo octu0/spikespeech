@@ -153,6 +153,45 @@ func main() {
         let outputURL = URL(fileURLWithPath: outputPath)
         try wavData.write(to: outputURL)
         print("WAV 音声ファイルを出力しました: \(outputPath) (\(wavData.count) バイト)")
+        let pcmBytes = wavData.subdata(in: 44..<wavData.count)
+        var maxAbs: Float = 0.0
+        var sumSq: Double = 0.0
+        var clipCount: Int = 0
+        let sCount = pcmBytes.count / 2
+        pcmBytes.withUnsafeBytes { rawPtr in
+            let ptr16 = rawPtr.bindMemory(to: Int16.self)
+            var s = 0
+            while s < sCount {
+                let v = Float(ptr16[s]) / 32767.0
+                let absV = abs(v)
+                if maxAbs < absV {
+                    maxAbs = absV
+                }
+                if 0.95 <= absV {
+                    clipCount += 1
+                }
+                sumSq += Double(v * v)
+                s += 1
+            }
+        }
+        var rms: Float = 0.0
+        if 0 < sCount {
+            rms = Float(sqrt(sumSq / Double(sCount)))
+        }
+        print("波形統計: サンプル数=\(sCount), 最大絶対振幅=\(String(format: "%.4f", maxAbs)), RMS=\(String(format: "%.4f", rms)), クリップ率=\(String(format: "%.2f", Float(clipCount) / Float(max(1, sCount)) * 100.0))%")
+        if 20060 < sCount {
+            var sampleStr = ""
+            pcmBytes.withUnsafeBytes { rawPtr in
+                let ptr16 = rawPtr.bindMemory(to: Int16.self)
+                var k = 20000
+                while k < 20060 {
+                    let v = Float(ptr16[k]) / 32767.0
+                    sampleStr += String(format: "%.3f, ", v)
+                    k += 1
+                }
+            }
+            print("中間部サンプル (20000-20059): [\(sampleStr)]")
+        }
     } catch {
         print("エラー: WAV ファイルの書き込みに失敗しました: \(error)")
         return

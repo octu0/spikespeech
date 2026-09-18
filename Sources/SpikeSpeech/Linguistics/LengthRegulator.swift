@@ -28,14 +28,14 @@ public final class LengthRegulator: Sendable {
                 baseFrames = 8.5
             }
         case .consonant:
-            // 摩擦音 (s, sh, h) は気流維持のため長め (約 50ms)、破裂音 (k, t, p) は急峻な破裂のため短め (約 35ms)
+            // 摩擦音 (s, sh, h) は十分な乱流気流知覚のため長め (約 60ms)、破裂音 (k, t, p) は閉鎖期無音 (約 30ms) と急峻な解放バースト (約 15ms) を確保するため 4.5 フレーム (約 45ms)
             switch symbol {
             case "s", "sh", "h", "z", "j":
-                baseFrames = 5.0
+                baseFrames = 6.0
             case "k", "t", "p", "g", "d", "b":
-                baseFrames = 3.5
+                baseFrames = 4.5
             default:
-                baseFrames = 4.0
+                baseFrames = 5.0
             }
         case .contracted:
             baseFrames = 5.0

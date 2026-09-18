@@ -14,9 +14,9 @@ public final class ProsodyModel: Sendable {
 
     public init(
         baseF0: Float = 220.0,
-        phraseAmp: Float = 0.18,
-        phraseDecay: Float = 2.0,
-        accentAmp: Float = 0.20,
+        phraseAmp: Float = 0.08,
+        phraseDecay: Float = 0.70,
+        accentAmp: Float = 0.12,
         accentAttack: Float = 15.0,
         accentDecay: Float = 16.0
     ) {
@@ -202,26 +202,35 @@ public final class ProsodyModel: Sendable {
     ) -> (f0Contour: [Float], voicedFlags: [Float], totalFrames: Int) {
         let effectiveBaseF0 = baseF0
 
-        var f0List: [Float] = []
+        var latentF0List: [Float] = []
         var voicedList: [Float] = []
 
         var pIdx = 0
         var phraseScale: Float = 1.0
         var globalFrame = 0
         var sentenceFrame = 0
+        var breathGroupFrame = 0
         var voicedStreak = 0
         var prevPhonemeSymbol = ""
+
+        // 輪状甲状筋の質量・弾性・粘性（マス・スプリング・ダンパー系）を模した2次臨界減衰系状態変数
+        // なぜ2次臨界減衰系を採用するか:
+        // 従来の1次指数遅れ（折れ線応答）による急峻な階段ピッチ段差や不自然な角を完全に排除し、
+        // 藤崎モデルに基づく滑らかなS字立ち上がりと自然な筋弛緩減衰（C1級連続性）を実現するため。
+        // また、頭高型アクセント（第1拍がHigh）では発話開始時点ですでに声帯筋が緊張しているため、
+        // 初期アクセント値を目標値に設定して第1拍の十分な高音立ち上がりを保証する。
+        var accentVal: Float = 0.0
+        var accentVel: Float = 0.0
+        if let firstPhrase = phrases.first, let firstMora = firstPhrase.moras.first, firstMora.tone == .high {
+            accentVal = accentAmp * phraseScale
+        }
+        let omegaAccent: Float = 22.0 // 自然角周波数 (約60msで目標アクセントへ滑らかに収束)
+        let dt: Float = 0.010        // 1フレーム = 10ms
 
         while pIdx < phrases.count {
             let phrase = phrases[pIdx]
             let moras = phrase.moras
             let effPhraseAmp = phraseAmp * phraseScale
-
-            var frameInPhrase = 0
-            var highStartFrame: Int? = nil
-            var fallStartFrame: Int? = nil
-            var lastAccentAtFall: Float = 0.0
-            var wasHigh = false
 
             var mIdx = 0
             while mIdx < moras.count {
@@ -238,121 +247,88 @@ public final class ProsodyModel: Sendable {
 
                     var f = 0
                     while f < duration {
-                        let t = Float(frameInPhrase) * 0.010 // 1フレーム = 10ms
+                        let tBreath = Float(breathGroupFrame) * 0.010
                         let tSentence = Float(sentenceFrame) * 0.010
 
-                        // 1. フレーズ成分: 句頭でインパルス応答的に立ち上がり、指数関数的減衰
-                        let phraseComp = effPhraseAmp * expf(-phraseDecay * t)
+                        // 1. 呼気段落（Breath Group）に基づくフレーズ成分
+                        // なぜ単語ごとではなく呼気段落（文頭・ポーズ境界）単位で減衰させるか:
+                        // ポーズのない同一文内の単語境界でフレーズ成分を0リセットすると、単語ごとにピッチが+20%跳ね上がる
+                        // ロボット特有の階段状イントネーションになるため、呼気圧全体を文全体で有機的に減衰させる。
+                        let phraseComp = effPhraseAmp * expf(-phraseDecay * tBreath)
 
-                        // 2. アクセント成分: High トーン区間に立ち上がりステップ応答、Low 遷移時に指数減衰平滑化
-                        var accentComp: Float = 0.0
+                        // 2. 生理学的2次臨界減衰系によるアクセント成分の追従
+                        // なぜ2次臨界減衰フィルタを用いるか:
+                        // 輪状甲状筋の生体慣性を再現し、目標ピッチへの加速と減速を連続的（S字カーブ）に行うため。
+                        var targetAccent: Float = 0.0
                         if isHigh {
-                            if wasHigh != true {
-                                highStartFrame = frameInPhrase
-                                wasHigh = true
-                            }
-                            let startFrame: Int
-                            switch highStartFrame {
-                            case .some(let sf):
-                                startFrame = sf
-                            case .none:
-                                startFrame = frameInPhrase
-                            }
-                            let tRel = Float(frameInPhrase - startFrame) * 0.010
-                            accentComp = accentAmp * (1.0 - expf(-accentAttack * tRel))
-                            lastAccentAtFall = accentComp
-                        } else {
-                            if wasHigh {
-                                fallStartFrame = frameInPhrase
-                                wasHigh = false
-                            }
-                            switch fallStartFrame {
-                            case .some(let fallFrame):
-                                let tFall = Float(frameInPhrase - fallFrame) * 0.010
-                                accentComp = lastAccentAtFall * expf(-accentDecay * tFall)
-                            case .none:
-                                accentComp = 0.0
-                            }
+                            targetAccent = accentAmp * phraseScale
                         }
-
-                        // 疑問文における文末上昇調（Interrogative Rising Tone）の付与
                         if phrase.isQuestion && isLastMoraInPhrase && isLastPhonemeInMora {
                             let relPos = Float(f) / Float(max(1, duration))
-                            accentComp += 0.20 * (relPos * relPos)
+                            targetAccent += 0.22 * (relPos * relPos)
                         }
 
-                        // 3. 生理学的呼気圧低下モデル (Declination / 文単位の自然降下線)
-                        // 人間の発話では文頭から文末に向けて呼気圧が徐々に減衰するため、緩やかな下降傾斜を付加する。
-                        // 文境界（句点・長ポーズ）で呼気圧がリセットされる生理学的機構を再現する。
-                        let declination = expf(-0.05 * min(4.0, tSentence))
+                        let accel = (omegaAccent * omegaAccent * (targetAccent - accentVal)) - (2.0 * omegaAccent * accentVel)
+                        accentVel += accel * dt
+                        accentVal += accentVel * dt
 
-                        // 4. 調音音声学に基づくマイクロプロソディ (Microprosody / 子音牽引ピッチ効果)
-                        // 先行する無声子音の気圧解放や有声子音の負荷により、母音立ち上がりの F0 が過渡的に変動する
+                        // 3. 生理学的呼気圧低下モデル (Declination)
+                        let declination = expf(-0.045 * min(4.0, tSentence))
+
+                        // 4. 調音音声学に基づくマイクロプロソディ (Microprosody)
+                        // なぜ直線減少ではなく時定数15msの滑らかな過渡応答にするか:
+                        // 先行子音解放時の気圧変化が母音開始部に連続的に合流する生理学的過渡現象を忠実に再現するため。
                         var microprosodyScale: Float = 1.0
                         if isVoicedPhoneme && f < 3 {
-                            let decay = Float(3 - f) / 3.0
+                            let decay = expf(-Float(f) * 0.6)
                             switch prevPhonemeSymbol {
                             case "k", "ky", "t", "ch", "ts", "p", "py", "s", "sh", "h", "hy":
-                                // 無声破裂・摩擦音後: 声門下圧の上昇によりピッチが一時的に跳ね上がる (+3.0%)
-                                microprosodyScale = 1.0 + (0.030 * decay)
+                                microprosodyScale = 1.0 + (0.025 * decay)
                             case "g", "gy", "d", "b", "by", "z", "j", "m", "my", "n", "ny", "r", "ry":
-                                // 有声子音・鼻音後: 声帯への音響負荷によりピッチが低域から立ち上がる (-2.0%)
-                                microprosodyScale = 1.0 - (0.020 * decay)
+                                microprosodyScale = 1.0 - (0.015 * decay)
                             default:
                                 break
                             }
                         }
 
                         // 5. 母音固有基本周波数 (Intrinsic Vowel Pitch / IF0)
-                        // 音響音声学における舌根挙上と喉頭牽引の相互作用により、狭母音 (i, u) は広母音よりわずかにピッチが高くなる
                         var intrinsicScale: Float = 1.0
                         switch phoneme.symbol {
                         case "i", "u":
-                            intrinsicScale = 1.035
+                            intrinsicScale = 1.030
                         default:
                             break
                         }
 
                         if isVoicedPhoneme {
                             voicedStreak += 1
-                            // 6. F0 周波数の合成と 1/f 生体ピッチゆらぎ (Jitter)
-                            // なぜ有声フレーム内のみで Jitter を算出するか:
-                            // 無声フレームで疑似乱数ジェネレータを進めると、無声子音の長さに応じて
-                            // 後続母音のピッチ位相が不自然にずれる現象を防止するため。
-                            let rawF0 = effectiveBaseF0 * expf(phraseComp + accentComp) * declination * intrinsicScale * microprosodyScale
-                            var f0 = rawF0
-                            if applyFluctuation {
-                                f0 = fluctuation.computePitchJitter(baseF0: rawF0)
-                            }
-
-                            // 有声化開始アタック (Onset Glottal Attack)
-                            // 無声から有声へ切り替わる先頭 2 フレームで声帯振動がわずかに低域から立ち上がる生理学的アタック
-                            if voicedStreak <= 2 {
-                                let onsetScale: Float = 0.94 + (0.03 * Float(voicedStreak))
-                                f0 = f0 * onsetScale
-                            }
-
-                            // 話者の絶対基音に応じた生理学的適正有声帯域内に確実にクランプ
-                            // なぜ固定 60〜480Hz ではなく話者基音連動にするか:
-                            // 重低音話者 (95Hz) の低音や子供話者 (300Hz) の高音域が不自然に飽和クリップされるのを防ぐため。
-                            let minF0 = max(45.0, effectiveBaseF0 * 0.45)
-                            let maxF0 = min(600.0, effectiveBaseF0 * 2.20)
-                            if f0 < minF0 {
-                                f0 = minF0
-                            }
-                            if maxF0 < f0 {
-                                f0 = maxF0
-                            }
-
-                            f0List.append(f0)
-                            voicedList.append(1.0)
                         } else {
                             voicedStreak = 0
-                            f0List.append(0.0)
+                        }
+
+                        let rawF0 = effectiveBaseF0 * expf(phraseComp + accentVal) * declination * intrinsicScale * microprosodyScale
+                        var f0 = rawF0
+                        if applyFluctuation {
+                            f0 = fluctuation.computePitchJitter(baseF0: rawF0)
+                        }
+
+                        let minF0 = max(45.0, effectiveBaseF0 * 0.45)
+                        let maxF0 = min(600.0, effectiveBaseF0 * 2.20)
+                        if f0 < minF0 {
+                            f0 = minF0
+                        }
+                        if maxF0 < f0 {
+                            f0 = maxF0
+                        }
+
+                        latentF0List.append(f0)
+                        if isVoicedPhoneme {
+                            voicedList.append(1.0)
+                        } else {
                             voicedList.append(0.0)
                         }
 
-                        frameInPhrase += 1
+                        breathGroupFrame += 1
                         globalFrame += 1
                         sentenceFrame += 1
                         f += 1
@@ -363,16 +339,26 @@ public final class ProsodyModel: Sendable {
                 mIdx += 1
             }
 
-            // 次のアクセント句へのダウンステップ（Catathesis）の適用および文境界での呼吸圧リセット
+            // 次のアクセント句へのダウンステップ（Catathesis）および文境界・読点での呼気圧リセット
             if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
                 phraseScale = 1.0
-                sentenceFrame = 0 // 文境界ポーズで呼気圧・微小ゆらぎ時間をリセット
+                sentenceFrame = 0
+                breathGroupFrame = 0 // ポーズ境界で呼気圧・フレーズ成分を新規立ち上げ
+                accentVal = 0.0
+                accentVel = 0.0
+                let nextPIdx = pIdx + 1
+                if nextPIdx < phrases.count {
+                    let nextPhrase = phrases[nextPIdx]
+                    if let nextMora = nextPhrase.moras.first, nextMora.tone == .high {
+                        accentVal = accentAmp * phraseScale
+                    }
+                }
             } else {
-                let nextScale = phraseScale * 0.85
-                if 0.68 <= nextScale {
+                let nextScale = phraseScale * 0.94
+                if 0.70 <= nextScale {
                     phraseScale = nextScale
                 } else {
-                    phraseScale = 0.68
+                    phraseScale = 0.70
                 }
             }
 
@@ -380,7 +366,7 @@ public final class ProsodyModel: Sendable {
             if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
                 var pf = 0
                 while pf < phrase.pauseDurationFrames {
-                    f0List.append(0.0)
+                    latentF0List.append(effectiveBaseF0)
                     voicedList.append(0.0)
                     pf += 1
                 }
@@ -389,7 +375,36 @@ public final class ProsodyModel: Sendable {
             pIdx += 1
         }
 
-        let total = f0List.count
-        return (f0List, voicedList, total)
+        // 6. 連続潜因ピッチ（Latent F0）に対する 5 点ガウシアン加重平滑化
+        // なぜ有声/無声の切断前に全体平滑化を行うか:
+        // 無声子音を挟む前後でピッチ目標が断絶するのを防ぎ、声帯制御筋の連続的緊張変化（C1級連続性）を保証するため。
+        let totalCount = latentF0List.count
+        var smoothedLatent = latentF0List
+        if 4 < totalCount {
+            var i = 2
+            let endIdx = totalCount - 2
+            while i < endIdx {
+                smoothedLatent[i] = (0.06 * latentF0List[i - 2]) +
+                                    (0.24 * latentF0List[i - 1]) +
+                                    (0.40 * latentF0List[i]) +
+                                    (0.24 * latentF0List[i + 1]) +
+                                    (0.06 * latentF0List[i + 2])
+                i += 1
+            }
+        }
+
+        // 7. 有声フラグに基づく F0 マスキング（無声区間は厳密に 0.0）
+        var f0List = [Float](repeating: 0.0, count: totalCount)
+        var i = 0
+        while i < totalCount {
+            if 0.5 <= voicedList[i] {
+                f0List[i] = smoothedLatent[i]
+            } else {
+                f0List[i] = 0.0
+            }
+            i += 1
+        }
+
+        return (f0List, voicedList, totalCount)
     }
 }

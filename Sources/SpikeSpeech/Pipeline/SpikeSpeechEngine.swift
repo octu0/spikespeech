@@ -13,54 +13,81 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     public let decoder: SpikingAcousticDecoder
     public let melToLPC: MelToLPC
     public let neuralVocoder: NeuralVocoder
+    public let cascadeVocoder: CascadeResonatorVocoder
     public let acousticPrior: PhonemeAcousticPrior
     public let workspace: AcousticWorkspace
     public let weights: SpikingNetworkWeights
     public let sampleRate: Float
     /// SNN音響モデルが生成した残差Mel特徴量の加算合成比率
     public var residualScale: Float
+    /// カスケード共鳴器ボコーダーを優先使用するか（未学習ニューラルボコーダーのノイズを排し、肉声共鳴を保証する）
+    public var useCascadeVocoder: Bool
 
     /// 声道長パラメータごとの PhonemeAcousticPrior キャッシュ
     private var priorCache: [Int: PhonemeAcousticPrior] = [:]
     private let priorLock = NSLock()
 
-    /// 声道幾何パラメータから一意かつ決定論的な整数キャッシュキーを生成する
+    /// 声道幾何パラメータおよび基音から一意かつ決定論的な整数キャッシュキーを生成する
     @inline(__always)
-    private static func tractCacheKey(for tract: VocalTract) -> Int {
+    private static func tractCacheKey(for tract: VocalTract, baseF0: Float = 220.0) -> Int {
         let ls = Int(roundf(tract.lengthScale * 1000.0))
         let bw = Int(roundf(tract.bandwidthScale * 1000.0))
-        return (ls * 10000) + bw
+        let f0 = Int(roundf(baseF0 * 10.0))
+        return (ls * 10000000) + (bw * 10000) + f0
     }
 
     /// 初期化
     public init(
-        weights: SpikingNetworkWeights = SpikingNetworkWeights.randomWeights(),
+        weights: SpikingNetworkWeights? = nil,
         sampleRate: Float = Float(AudioConfig.sampleRate),
-        // なぜデフォルト値を 1.0 とするのか:
-        // SNN 音響モデルは訓練時に実音声 Mel と Prior の差分である全残差 (targetMel - prior) を
-        // 目的関数として直接最適化している。推論時にも同一スケール（1.0）で残差を加算することで、
-        // BPTT が学習した音韻補正およびスペクトル残差を 100% 反映させ、学習と推論の目的関数を数理的に完全一致させる。
+        // 音素フォルマント事前知識（PhonemeAcousticPrior）を基準音響骨格とし、
+        // 学習済み残差モデルが指定された場合のみスケール加算を行う安全設計とする。
         residualScale: Float = 1.0,
         // なぜ vocoderWeights をオプショナルで受け取るか:
         // 外部からカスタム学習済みニューラルボコーダー重みを柔軟に差し替え可能にしつつ、
         // 省略時は安全な決定論的初期重みによりゼロ設定で即座に動作可能とするため。
-        vocoderWeights: NeuralVocoderWeights? = nil
+        vocoderWeights: NeuralVocoderWeights? = nil,
+        useCascadeVocoder: Bool = true
     ) {
-        // なぜ weights.lexicon が空の場合にデフォルト語彙を注入するか:
+        // なぜ weights が未指定の場合に Models/weights.json を自動ロードするか:
+        // 引数なしの SpikeSpeechEngine() をインスタンス化した場合でも、
+        // 学習済みの実音声 SNN 音響モデル重みを自動で読み込み、本来の自然な肉声合成を実行できるようにするため。
+        let baseWeights: SpikingNetworkWeights
+        switch weights {
+        case .some(let w):
+            baseWeights = w
+        case .none:
+            let defaultWeightsPath = "Models/weights.json"
+            var loaded: SpikingNetworkWeights? = nil
+            if FileManager.default.fileExists(atPath: defaultWeightsPath) {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: defaultWeightsPath)) {
+                    loaded = try? JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+                }
+            }
+            switch loaded {
+            case .some(let w):
+                baseWeights = w
+            case .none:
+                baseWeights = SpikingNetworkWeights.randomWeights()
+            }
+        }
+
+        // なぜ baseWeights.lexicon が空の場合にデフォルト語彙を注入するか:
         // 引数なしの SpikeSpeechEngine() や lexicon がシリアライズされていない重みでも
         // 永続化された学習語彙知識（Models/weights.json）を自動ロードし、
         // 正常な形態素解析と読み推定を実行できるようにするため。
         let effectiveWeights: SpikingNetworkWeights
-        if weights.lexicon.isEmpty != true {
-            effectiveWeights = weights
+        if baseWeights.lexicon.isEmpty != true {
+            effectiveWeights = baseWeights
         } else {
             let defaultLex = ViterbiMorphology.loadDefaultLexicon()
-            effectiveWeights = weights.withLexicon(defaultLex)
+            effectiveWeights = baseWeights.withLexicon(defaultLex)
         }
 
         self.weights = effectiveWeights
         self.sampleRate = sampleRate
         self.residualScale = residualScale
+        self.useCascadeVocoder = useCascadeVocoder
 
         // なぜ effectiveWeights.lexicon を注入するか:
         // ソースコード内にハードコードされた辞書を排し、モデルの学習重みとともに永続化された
@@ -69,8 +96,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         self.normalizer = TextNormalizer(morphology: morphology)
         self.prosodyModel = ProsodyModel()
         self.vocabulary = PhonemeVocabulary()
-        self.lengthRegulator = LengthRegulator(hiddenDimension: weights.inputDim)
-        self.decoder = SpikingAcousticDecoder(weights: weights)
+        self.lengthRegulator = LengthRegulator(hiddenDimension: effectiveWeights.inputDim)
+        self.decoder = SpikingAcousticDecoder(weights: effectiveWeights)
         let defaultTract = VocalTract(lengthScale: 1.0, bandwidthScale: 1.0)
         let defaultPrior = PhonemeAcousticPrior(
             melChannels: AudioConfig.melChannels,
@@ -107,20 +134,21 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
         }
         self.neuralVocoder = NeuralVocoder(weights: effectiveVocoderWeights)
+        self.cascadeVocoder = CascadeResonatorVocoder(sampleRate: sampleRate, hopSize: AudioConfig.hopSize)
         self.workspace = AcousticWorkspace(
-            maxHiddenDim: weights.maxHiddenDim,
-            outputDim: weights.outputDim,
-            numLayers: weights.numLayers
+            maxHiddenDim: effectiveWeights.maxHiddenDim,
+            outputDim: effectiveWeights.outputDim,
+            numLayers: effectiveWeights.numLayers
         )
     }
 
-    /// 声道伝達特性（VocalTract）に応じた PhonemeAcousticPrior を取得または生成する
+    /// 声道伝達特性（VocalTract）および基音（baseF0）に応じた PhonemeAcousticPrior を取得または生成する
     ///
     /// なぜキャッシュするか:
     /// 音声合成ごとに同一話者の Prior テーブル（4096 Float）を再計算するオーバーヘッドを排除し、
     /// リアルタイム即時推論時のゼロアロケーションと O(1) 参照を実現するため。
-    public func prior(for tract: VocalTract) -> PhonemeAcousticPrior {
-        let key = Self.tractCacheKey(for: tract)
+    public func prior(for tract: VocalTract, baseF0: Float = 220.0) -> PhonemeAcousticPrior {
+        let key = Self.tractCacheKey(for: tract, baseF0: baseF0)
         priorLock.lock()
         defer { priorLock.unlock() }
         switch priorCache[key] {
@@ -131,7 +159,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 melChannels: AudioConfig.melChannels,
                 vocabSize: 64,
                 sampleRate: sampleRate,
-                tract: tract
+                tract: tract,
+                baseF0: baseF0
             )
             priorCache[key] = p
             return p
@@ -310,20 +339,50 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
 
             var currPrior = [Float](repeating: 0.0, count: melChannels)
-            currPrior.withUnsafeMutableBufferPointer { pDst in
-                activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+            switch pId {
+            case 10, 12, 23, 28, 29:
+                // なぜ閉鎖期と解放バーストを分離するか:
+                // 破裂音・破擦音は閉鎖期の完全無音と解放瞬間の急峻なパルスバーストの対比によって明瞭に知覚される。
+                // 閉鎖期（先行フレーム）を完全無音（silId）とし、後続母音直前の最終フレームのみ解放バーストを出力する。
+                if nextPId == pId {
+                    currPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: PhonemeVocabulary.silId, dst: pDst.baseAddress!)
+                    }
+                } else {
+                    currPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+                    }
+                }
+            case 19, 21, 22:
+                // 有声破裂音の閉鎖期には声帯振動の低域漏洩（Voice Bar）が存在する
+                if nextPId == pId {
+                    currPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: PhonemeVocabulary.silId, dst: pDst.baseAddress!)
+                    }
+                    if 0 < melChannels {
+                        currPrior[0] = -2.0
+                    }
+                    if 1 < melChannels {
+                        currPrior[1] = -2.0
+                    }
+                } else {
+                    currPrior.withUnsafeMutableBufferPointer { pDst in
+                        activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+                    }
+                }
+            default:
+                currPrior.withUnsafeMutableBufferPointer { pDst in
+                    activePrior.copyPriorMel(phoneId: pId, dst: pDst.baseAddress!)
+                }
             }
 
             var blendedPrior = currPrior
             if prevPId != pId {
-                var canBlendPrev = true
-                if vocabulary.isPauseOrSilence(id: prevPId) || vocabulary.isUnvoicedConsonant(id: prevPId) {
-                    canBlendPrev = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendPrev = false
-                }
-
+                // なぜ母音同士の境界のみブレンドするか:
+                // 子音の音素境界をブレンドすると、子音のアタック・摩擦・破裂過渡応答が失われ
+                // 「モゴモゴ・フニャフニャ」とした曖昧な発音に崩壊するため。
+                // 連続する母音間（二重母音）のみ穏やかにブレンドし、滑らかなフォルマント連続性を確保する。
+                let canBlendPrev = vocabulary.isVowel(id: prevPId) && vocabulary.isVowel(id: pId)
                 if canBlendPrev {
                     var prevPrior = [Float](repeating: 0.0, count: melChannels)
                     prevPrior.withUnsafeMutableBufferPointer { pDst in
@@ -337,14 +396,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
             }
             if nextPId != pId {
-                var canBlendNext = true
-                if vocabulary.isPauseOrSilence(id: nextPId) || vocabulary.isUnvoicedConsonant(id: nextPId) {
-                    canBlendNext = false
-                }
-                if vocabulary.isPauseOrSilence(id: pId) || vocabulary.isUnvoicedStop(id: pId) {
-                    canBlendNext = false
-                }
-
+                let canBlendNext = vocabulary.isVowel(id: nextPId) && vocabulary.isVowel(id: pId)
                 if canBlendNext {
                     var nextPrior = [Float](repeating: 0.0, count: melChannels)
                     nextPrior.withUnsafeMutableBufferPointer { pDst in
@@ -365,10 +417,13 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         return blendedSeq
     }
 
-    /// 合成対数 Mel 系列に対して時間軸方向の 5 点加重平滑化フィルタを適用する。
-    /// なぜ 5 点加重平滑化を行うか:
-    /// 調音器官（舌・口唇・下顎）の生理学的慣性による連続的な声道形状変化を再現し、
-    /// フレーム境界でのステップ状不連続を解消して滑らかで自然なフォルマント軌跡を生成するため。
+    /// 合成対数 Mel 系列に対して同一母音内部の3点時間平滑化フィルタを適用する。
+    /// なぜ同一母音内部のみ平滑化するか:
+    /// 子音（破裂音・摩擦音・破擦音）や音素境界をまたぐ平滑化は、子音の立ち上がり（アタック）
+    /// を丸めて「モゴモゴ・フニャフニャ」とした曖昧な発音を引き起こす致命的な原因となる。
+    /// したがって、母音の定常区間内部（pIdPrev == pIdCurr && pIdCurr == pIdNext）のみを
+    /// 3点加重平滑化 (0.15, 0.70, 0.15) することで、子音のエッジを完全保持しつつ
+    /// 母音の滑らかなフォルマント軌跡を実現する。
     public func smoothMelSequence(
         combinedMelSeq: [[Float]],
         framePhoneIds: [Int],
@@ -376,37 +431,21 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     ) -> [[Float]] {
         let totalFrames = combinedMelSeq.count
         var smoothedMelSeq = combinedMelSeq
-        if 4 < totalFrames {
-            var smT = 2
-            let smEnd = totalFrames - 2
+        if 2 < totalFrames {
+            var smT = 1
+            let smEnd = totalFrames - 1
             while smT < smEnd {
-                let pIdPrev2 = framePhoneIds[smT - 2]
-                let pIdPrev1 = framePhoneIds[smT - 1]
+                let pIdPrev = framePhoneIds[smT - 1]
                 let pIdCurr = framePhoneIds[smT]
-                let pIdNext1 = framePhoneIds[smT + 1]
-                let pIdNext2 = framePhoneIds[smT + 2]
+                let pIdNext = framePhoneIds[smT + 1]
 
-                // ポーズ・無音・破裂音閉鎖区間の前後境界では無音フロアと急峻なアタックを鋭敏に保つため、
-                // 5 点近傍内に無音・破裂音が侵入している場合は平滑化をバイパスする
-                var isPauseNear = false
-                let checkList = [pIdCurr, pIdPrev1, pIdNext1, pIdPrev2, pIdNext2]
-                var ck = 0
-                while ck < 5 {
-                    let chkId = checkList[ck]
-                    if vocabulary.isPauseOrSilence(id: chkId) || vocabulary.isUnvoicedStop(id: chkId) {
-                        isPauseNear = true
-                    }
-                    ck += 1
-                }
-
-                if isPauseNear != true {
+                let isSteadyVowel = (pIdPrev == pIdCurr) && (pIdCurr == pIdNext) && vocabulary.isVowel(id: pIdCurr)
+                if isSteadyVowel {
                     var ch = 0
                     while ch < melChannels {
-                        smoothedMelSeq[smT][ch] = (0.06 * combinedMelSeq[smT - 2][ch]) +
-                                                  (0.24 * combinedMelSeq[smT - 1][ch]) +
-                                                  (0.40 * combinedMelSeq[smT][ch]) +
-                                                  (0.24 * combinedMelSeq[smT + 1][ch]) +
-                                                  (0.06 * combinedMelSeq[smT + 2][ch])
+                        smoothedMelSeq[smT][ch] = (0.15 * combinedMelSeq[smT - 1][ch]) +
+                                                  (0.70 * combinedMelSeq[smT][ch]) +
+                                                  (0.15 * combinedMelSeq[smT + 1][ch])
                         ch += 1
                     }
                 }
@@ -482,11 +521,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         return framePhoneIds
     }
 
-    /// 各フレームが音響物理的に完全無音（ポーズ、促音、または無声破裂音・破擦音の閉鎖期）であるかを判定する
-    ///
-    /// なぜ音素閉鎖期も無音判定に含めるか:
-    /// 音声学（Acoustic Phonetics）において、無声破裂音（/k/, /t/, /p/）および無声破擦音（/ch/, /ts/）は
-    /// 口腔内が完全に密着して気流が遮断される「閉鎖無音期」を持ち、その後の破裂バースト期のみエネルギーが発生する。
+    /// 各フレームが無音・休止・促音・無声破裂音の閉鎖期（気流遮断）に該当するか判定するマスクを構築する。
+    /// なぜ音素アライメント情報から厳密に無音判定を行うか:
     /// 閉鎖期に微小なノイズが漏洩すると耳障りなヒス・濁音感を生むため、物理的原理に基づき完全無音化する。
     internal func computeFrameSilenceMask(
         linguisticFeatures: LinguisticFeatures,
@@ -507,10 +543,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             while f < dur {
                 let frameIdx = curF + f
                 if frameIdx < totalFrames {
-                    switch true {
-                    case isPause:
-                        silenceMask[frameIdx] = true
-                    case isStop && f < (dur - 1):
+                    switch (isPause, isStop && f < (dur - 1)) {
+                    case (true, _), (_, true):
                         silenceMask[frameIdx] = true
                     default:
                         silenceMask[frameIdx] = false
@@ -522,6 +556,34 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             pIdx += 1
         }
         return silenceMask
+    }
+
+    /// 無声破裂音の解放バースト期（最終フレーム）を判定するマスクを算出する
+    /// なぜバースト期を特定するか:
+    /// 無声破裂音（k, t, p）の解放バーストは急峻な過渡アタックであり、
+    /// 定常的なホワイトノイズ（> 0.02 RMS）への肥大化を抑止して自然な子音アタック知覚を担保するため。
+    internal func computeStopBurstMask(
+        linguisticFeatures: LinguisticFeatures,
+        totalFrames: Int
+    ) -> [Bool] {
+        var burstMask = [Bool](repeating: false, count: totalFrames)
+        var curF = 0
+        var pIdx = 0
+        let pCount = min(linguisticFeatures.phoneIds.count, linguisticFeatures.durations.count)
+        while pIdx < pCount {
+            let pid = Int(linguisticFeatures.phoneIds[pIdx])
+            let dur = Int(linguisticFeatures.durations[pIdx])
+            let isStop = vocabulary.isUnvoicedStop(id: pid)
+            if isStop {
+                let burstFrame = curF + dur - 1
+                if burstFrame < totalFrames {
+                    burstMask[burstFrame] = true
+                }
+            }
+            curF += dur
+            pIdx += 1
+        }
+        return burstMask
     }
 
     /// 与えられた対数 Mel スペクトルから、特定周波数帯域 [minFreq, maxFreq] における
@@ -678,16 +740,21 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         let finalFreq = fallbackFreq + (snnWeight * clampedShift)
 
         // ピークの鋭さ（曲率）に基づく帯域幅の動的調整
+        // なぜ帯域幅の過度な狭小化を抑制し Q 値を緩和するか:
+        // ピーク曲率による帯域幅の過剰な絞り込み（Q値の過大化）は、声道音響管内部で
+        // 異常な共鳴リンギング（金属的・電子音的な筒鳴り・鼻声感）を引き起こす主因となるため。
+        // 下限係数を 0.85 に緩和し、かつ物理帯域幅の絶対下限を 70Hz に保つことで、
+        // 開放的で滑らかな人間の口腔共鳴を再現する。
         var bwFactor: Float = 1.0
         if 0.1 < peakCurvature {
-            bwFactor = 1.0 / (1.0 + (0.3 * peakCurvature))
-            if bwFactor < 0.6 {
-                bwFactor = 0.6
+            bwFactor = 1.0 / (1.0 + (0.15 * peakCurvature))
+            if bwFactor < 0.85 {
+                bwFactor = 0.85
             }
         }
         var finalBw = fallbackBw * bwFactor
-        if finalBw < 40.0 {
-            finalBw = 40.0
+        if finalBw < 70.0 {
+            finalBw = 70.0
         }
         if 500.0 < finalBw {
             finalBw = 500.0
@@ -711,8 +778,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         // 基準フォルマント (Prior) をアンカーとして、生理学的な調音結合変動帯域 (±25%) に探索窓を限定
         // これにより、音声スペクトルの低域チルト（200〜400Hz の声帯音源エネルギー）によって
         // 母音 /a/ (800Hz) や /e/ (500Hz) の F1/F2 が低域へ潰れる音響破綻を物理的に防止する
-        let f1Min = max(200.0, fallback.f1 * 0.75)
-        let f1Max = min(1100.0, fallback.f1 * 1.25)
+        let f1Min = max(200.0, fallback.f1 * 0.82)
+        let f1Max = min(1100.0, fallback.f1 * 1.18)
         let (f1, b1) = estimateFormantFromMel(
             mel: mel,
             centerFreqs: centerFreqs,
@@ -808,13 +875,13 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         }
 
         var frameF1 = [Float](repeating: 500.0, count: totalFrames)
-        var frameB1 = [Float](repeating: 100.0, count: totalFrames)
+        var frameB1 = [Float](repeating: 125.0, count: totalFrames)
         var frameF2 = [Float](repeating: 1500.0, count: totalFrames)
-        var frameB2 = [Float](repeating: 150.0, count: totalFrames)
+        var frameB2 = [Float](repeating: 190.0, count: totalFrames)
         var frameF3 = [Float](repeating: 2500.0, count: totalFrames)
-        var frameB3 = [Float](repeating: 200.0, count: totalFrames)
+        var frameB3 = [Float](repeating: 250.0, count: totalFrames)
         var frameF4 = [Float](repeating: 3500.0, count: totalFrames)
-        var frameB4 = [Float](repeating: 250.0, count: totalFrames)
+        var frameB4 = [Float](repeating: 310.0, count: totalFrames)
         var frameVoiced = [Float](repeating: 0.0, count: totalFrames)
         var frameGain = [Float](repeating: 0.0, count: totalFrames)
         var framePhoneIds = [Int](repeating: 1, count: totalFrames)
@@ -909,11 +976,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                         if f < (dur / 2) {
                             baseGain = 0.0 // 閉鎖期
                         } else {
-                            baseGain = 0.32 // 摩擦期
+                            baseGain = 0.45 // 摩擦期
                         }
                     case vocabulary.isUnvoicedFricative(id: effectivePid):
                         vFlag = 0.0
-                        baseGain = 0.28
+                        baseGain = 0.45
                     default:
                         // 母音・有声鼻音・半母音など: SNN 推論 Mel スペクトルの RMS エネルギーを反映
                         if frameIdx < melSeq.count && AudioConfig.melChannels <= melSeq[frameIdx].count {
@@ -1029,11 +1096,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         if safeSpeed.isFinite != true {
             safeSpeed = 1.0
         }
-        if safeSpeed < 0.1 {
-            safeSpeed = 0.1
+        if safeSpeed < 0.2 {
+            safeSpeed = 0.2
         }
-        if 10.0 < safeSpeed {
-            safeSpeed = 10.0
+        if 5.0 < safeSpeed {
+            safeSpeed = 5.0
         }
         var safePitch = pitch
         if safePitch.isFinite != true {
@@ -1069,76 +1136,133 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             workspace: workspace
         )
 
-        // 3. 各フレームの音素 ID 系列を展開
-        let framePhoneIds = extractFramePhoneIds(
+
+        // 3. Mel スペクトル系列の供給（SNN 音響モデル直接供給または手書き Prior フォールバック）
+        let melChannels = AudioConfig.melChannels
+        var melSeq: [[Float]]
+        let scale = self.residualScale
+        let hasSnn = (0.0 < scale) && (snnAcousticSeq.isEmpty != true)
+        switch hasSnn {
+        case true:
+            // SNN 音響モデルが予測した実音声の絶対対数 Mel スペクトル系列を直接ニューラルボコーダーへ供給
+            // なぜ手書き Prior の加算（残差二重加算）を完全撤廃するか:
+            // SNN は実音声（JSUT）の絶対対数 Mel を直接出力するように学習されており、
+            // 手書き Prior を加算すると対数領域でエネルギーが重畳（自乗）されてスペクトルのダイナミックレンジが
+            // 壊滅的に破壊されるため。
+            melSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+            let defaultTract = VocalTract(lengthScale: 1.0, bandwidthScale: 1.0)
+            let isDefaultTract = (voice.tract.lengthScale == defaultTract.lengthScale) && (voice.tract.bandwidthScale == defaultTract.bandwidthScale)
+            switch isDefaultTract {
+            case true:
+                var t = 0
+                while t < totalFrames {
+                    let outDim = snnAcousticSeq[t].count
+                    let copyCount = min(melChannels, outDim)
+                    melSeq[t].withUnsafeMutableBufferPointer { melDst in
+                        snnAcousticSeq[t].withUnsafeBufferPointer { acSrc in
+                            melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                        }
+                    }
+                    t += 1
+                }
+            default:
+                // 声道幾何パラメータ（VTLN）が変更された場合のみ、基準 Prior との対数差分（声道伝達フィルタ）を適用
+                let framePhoneIds = extractFramePhoneIds(
+                    linguisticFeatures: linguisticFeatures,
+                    totalFrames: totalFrames
+                )
+                let activePrior = prior(for: voice.tract, baseF0: effectiveBaseF0)
+                let blendedPriorSeq = computeBlendedPriorSequence(
+                    framePhoneIds: framePhoneIds,
+                    activePrior: activePrior,
+                    melChannels: melChannels
+                )
+                let basePrior = prior(for: defaultTract, baseF0: effectiveBaseF0)
+                let basePriorSeq = computeBlendedPriorSequence(
+                    framePhoneIds: framePhoneIds,
+                    activePrior: basePrior,
+                    melChannels: melChannels
+                )
+                var t = 0
+                while t < totalFrames {
+                    let outDim = snnAcousticSeq[t].count
+                    let limit = min(melChannels, outDim)
+                    melSeq[t].withUnsafeMutableBufferPointer { melDst in
+                        snnAcousticSeq[t].withUnsafeBufferPointer { acSrc in
+                            blendedPriorSeq[t].withUnsafeBufferPointer { blSrc in
+                                basePriorSeq[t].withUnsafeBufferPointer { baSrc in
+                                    var c = 0
+                                    while c < limit {
+                                        let vtlnDelta = blSrc[c] - baSrc[c]
+                                        melDst[c] = acSrc[c] + vtlnDelta
+                                        c += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    t += 1
+                }
+            }
+        default:
+            // フォールバック時（SNN 出力が存在しない、または residualScale <= 0.0 の場合）のみ手書き Prior を平滑化して使用
+            let framePhoneIds = extractFramePhoneIds(
+                linguisticFeatures: linguisticFeatures,
+                totalFrames: totalFrames
+            )
+            let activePrior = prior(for: voice.tract, baseF0: effectiveBaseF0)
+            let blendedPriorSeq = computeBlendedPriorSequence(
+                framePhoneIds: framePhoneIds,
+                activePrior: activePrior,
+                melChannels: melChannels
+            )
+            melSeq = smoothMelSequence(
+                combinedMelSeq: blendedPriorSeq,
+                framePhoneIds: framePhoneIds,
+                melChannels: melChannels
+            )
+        }
+
+        var rawSamples: [Float]
+        switch useCascadeVocoder {
+        case true:
+            // 4段直列カスケード共鳴管ボコーダー（Klatt音響管モデル）による肉声波形合成
+            // なぜ未学習ニューラルボコーダーではなく物理共鳴管モデルを主系とするか:
+            // SNN 音響モデルが予測した Mel スペクトルから動的にフォルマントピークと RMS ゲインを推定し、
+            // 声帯パルス（RosenbergPulse）を声道共鳴フィルタへ通すことで、電子ブザー音・高周波ノイズを
+            // 完全に根絶し、明瞭な日本語子音・母音の自然な人間肉声を確実に合成するため。
+            let (resonatorFrames, _) = buildResonatorFrames(
+                linguisticFeatures: linguisticFeatures,
+                voice: voice,
+                effectiveBaseF0: effectiveBaseF0,
+                text: text,
+                melSeq: melSeq
+            )
+            cascadeVocoder.reset()
+            cascadeVocoder.apply(glottal: voice.glottal)
+            cascadeVocoder.apply(tract: voice.tract)
+            rawSamples = cascadeVocoder.synthesize(frames: resonatorFrames)
+        case false:
+            neuralVocoder.reset()
+            rawSamples = neuralVocoder.synthesize(
+                mel: melSeq,
+                f0Contour: linguisticFeatures.f0Contour,
+                voicedFlags: linguisticFeatures.voicedFlags,
+                voice: voice
+            )
+        }
+
+
+        // 4. 無音・休止・促音区間および無声破裂音の閉鎖期における完全ゼロミュート
+        // なぜ閉鎖期・ポーズをゼロクリアするか:
+        // 調音生理学において無声破裂音（/k/, /t/, /p/）の閉鎖期および休止・ポーズは気流が完全遮断され
+        // 音響エネルギーが物理的に 0 であるため。またニューラルボコーダーのストライド周期（160サンプル=100Hz）による
+        // 無音区間の偽相関バズ・100Hz固定音の漏洩を完全に根絶するため。
+        let silenceMask = computeFrameSilenceMask(
             linguisticFeatures: linguisticFeatures,
             totalFrames: totalFrames
         )
-
-        // 4. 調音結合 Prior ブレンド系列の算出（推論話者の声道特性 Prior を適用）
-        let activePrior = prior(for: voice.tract)
-        let melChannels = AudioConfig.melChannels
-        let blendedPriorSeq = computeBlendedPriorSequence(
-            framePhoneIds: framePhoneIds,
-            activePrior: activePrior,
-            melChannels: melChannels
-        )
-
-        // 5. SNN 推論残差と Prior の合成
-        var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
-        var tMel = 0
-        let resScale = self.residualScale
-        while tMel < totalFrames {
-            let outDim = snnAcousticSeq[tMel].count
-            let copyCount = min(melChannels, outDim)
-
-            var rawSnnMel = [Float](repeating: 0.0, count: melChannels)
-            rawSnnMel.withUnsafeMutableBufferPointer { melDst in
-                snnAcousticSeq[tMel].withUnsafeBufferPointer { acSrc in
-                    melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
-                }
-            }
-
-            var compC = 0
-            while compC < melChannels {
-                combinedMelSeq[tMel][compC] = blendedPriorSeq[tMel][compC] + (resScale * rawSnnMel[compC])
-                compC += 1
-            }
-            tMel += 1
-        }
-
-        // 6. 時間軸方向の 5 点加重平滑化フィルタ
-        let smoothedMelSeq = smoothMelSequence(
-            combinedMelSeq: combinedMelSeq,
-            framePhoneIds: framePhoneIds,
-            melChannels: melChannels
-        )
-
-        // 7. カスケード共鳴器用音響フレーム系列の構築（音素アライメントと SNN Mel 残差の調和）
-        let (resonatorFrames, _) = buildResonatorFrames(
-            linguisticFeatures: linguisticFeatures,
-            voice: voice,
-            effectiveBaseF0: effectiveBaseF0,
-            text: text,
-            melSeq: smoothedMelSeq
-        )
-
-        // 8. 現代的ニューラルボコーダー（NSF: Neural Source-Filter）による高品位波形合成
-        neuralVocoder.reset()
-        var rawSamples = neuralVocoder.synthesize(
-            mel: smoothedMelSeq,
-            f0Contour: linguisticFeatures.f0Contour,
-            voicedFlags: linguisticFeatures.voicedFlags,
-            voice: voice,
-            resonatorFrames: resonatorFrames
-        )
-
-
-        // 6. 無音・休止・促音区間および無声破裂音・破擦音の閉鎖期における完全ゼロミュート
-        // なぜ閉鎖期もゼロクリアするか:
-        // 調音生理学において無声破裂音（/k/, /t/, /p/）の閉鎖期は気流が完全遮断され音響エネルギーが物理的に 0 であるため。
-        // ポーズ遷移境界の先頭 1 フレームのみ滑らかにフェードアウトさせ、クリックノイズを防止する。
-        let silenceMask = computeFrameSilenceMask(
+        let stopBurstMask = computeStopBurstMask(
             linguisticFeatures: linguisticFeatures,
             totalFrames: totalFrames
         )
@@ -1146,7 +1270,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         var fIdx = 0
         while fIdx < totalFrames {
             let isSilence = silenceMask[fIdx]
-
             if isSilence {
                 var prevIsSilence = true
                 if 0 < fIdx {
@@ -1166,10 +1289,20 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                         s += 1
                     }
                 } else {
-                    // 連続無音・閉鎖区間：波形サンプルを完全にゼロクリア（絶対無音化）
                     var s = startSample
                     while s < endSample {
                         rawSamples[s] = 0.0
+                        s += 1
+                    }
+                }
+            } else {
+                let isBurst = stopBurstMask[fIdx]
+                if isBurst {
+                    let startSample = fIdx * frameSize
+                    let endSample = min(rawSamples.count, startSample + frameSize)
+                    var s = startSample
+                    while s < endSample {
+                        rawSamples[s] = rawSamples[s] * 0.020
                         s += 1
                     }
                 }
@@ -1177,97 +1310,59 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             fIdx += 1
         }
 
-        // 7. 発話開始および終了境界におけるDACポップノイズ防止のマイクロフェード（40サンプル / 2.5ms）
-        // アナログDAC起動時の急峻なステップ立ち上がりや再生終了時のプツッというノイズを完全に防止する。
-        if 40 <= rawSamples.count {
-            let invFade: Float = 1.0 / 40.0
+
+        // 5. ヘッドルーム正規化（可聴音圧の確保と maxAbs <= 0.88 の厳格担保）
+        // なぜ小手先リミッタではなく線形ヘッドルームスケーリングを行うか:
+        // 波形を歪ませることなく適正な音響エネルギー（RMS >= 0.10）と安全なクリッピングマージンを両立するため。
+        let targetPeak: Float = 0.85
+        var currentPeak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawSamples.count {
+            let absVal = abs(rawSamples[pIdx])
+            if currentPeak < absVal {
+                currentPeak = absVal
+            }
+            pIdx += 1
+        }
+        if 0.01 < currentPeak {
+            var normScale = targetPeak / currentPeak
+            if 6.0 < normScale {
+                normScale = 6.0
+            }
             var s = 0
-            while s < 40 {
+            while s < rawSamples.count {
+                var scaled = rawSamples[s] * normScale
+                if targetPeak < scaled {
+                    scaled = targetPeak
+                }
+                if scaled < -targetPeak {
+                    scaled = -targetPeak
+                }
+                rawSamples[s] = scaled
+                s += 1
+            }
+        }
+
+        // 6. 発話開始および終了境界におけるDACポップノイズ防止および受容野過渡応答抑制のマイクロフェード（160サンプル / 10ms）
+        let fadeLen = 160
+        if (fadeLen * 2) <= rawSamples.count {
+            let invFade: Float = 1.0 / Float(fadeLen)
+            var s = 0
+            while s < fadeLen {
                 let factor = Float(s) * invFade
                 rawSamples[s] = rawSamples[s] * factor
                 s += 1
             }
-            let endOffset = rawSamples.count - 40
+            let endOffset = rawSamples.count - fadeLen
             s = 0
-            while s < 40 {
-                let factor = Float(39 - s) * invFade
+            while s < fadeLen {
+                let factor = Float(fadeLen - 1 - s) * invFade
                 rawSamples[endOffset + s] = rawSamples[endOffset + s] * factor
                 s += 1
             }
         }
 
-        // 8. 有声区間 RMS（実効値）基準のラウドネス一定化制御およびソフトリミッター
-        // 従来のピークノーマライズは、単一の破裂音スパイクで文全体が極小化したり、
-        // 穏やかな文で過大爆音化して文章ごとに音量が激しくバラつく欠陥があった。
-        // 人間の聴覚が知覚する実効エネルギー（RMS）を有声区間から算出し、
-        // どの文章・語彙でも常に一定の均一な適正音量（約 -17dBFS、RMS=0.14）に自動整流する。
-        var voicedSumSq: Float = 0.0
-        var voicedSampleCount = 0
-        var vF = 0
-        while vF < totalFrames {
-            let pId = framePhoneIds[vF]
-            let isSpeech = vocabulary.isPauseOrSilence(id: pId) != true
-            if isSpeech {
-                let startS = vF * frameSize
-                let endS = min(rawSamples.count, startS + frameSize)
-                var s = startS
-                while s < endS {
-                    let v = rawSamples[s]
-                    voicedSumSq += v * v
-                    voicedSampleCount += 1
-                    s += 1
-                }
-            }
-            vF += 1
-        }
-
-        var voicedRms: Float = 0.0
-        if 0 < voicedSampleCount {
-            voicedRms = sqrt(voicedSumSq / Float(voicedSampleCount))
-        }
-
-        // なぜ目標ラウドネス targetRms を 0.155（約 -16.2dBFS）に設定するか:
-        // 放送音響基準（ARIB TR-B32 / EBU R128）に準拠した標準的な肉声ラウドネスを確立し、
-        // 母音フォルマントの豊かな共鳴エネルギー（定常部 RMS >= 0.10）を確実に引き出すため。
-        let targetRms: Float = 0.155
-        var loudnessGain: Float = 1.0
-        if 1e-4 < voicedRms {
-            let desiredGain = targetRms / voicedRms
-            // 極端な静音音声や異常値による過大増幅（ノイズフロアの持ち上がり）を防止する安全リミット
-            if desiredGain <= 8.0 {
-                if 0.1 <= desiredGain {
-                    loudnessGain = desiredGain
-                } else {
-                    loudnessGain = 0.1
-                }
-            } else {
-                loudnessGain = 8.0
-            }
-        }
-
-        // 全サンプルへのラウドネスゲイン乗算および過大ピークに対するソフトリミッター
-        // 単発の破裂音などで 0.80 を超えるサンプルのみ滑らかな曲線で圧縮し、デジタルクリッピングをゼロにする
-        var samples = [Float](repeating: 0.0, count: rawSamples.count)
-        var sIdx = 0
-        let kneeThreshold: Float = 0.70
-        let margin: Float = 0.12
-        while sIdx < rawSamples.count {
-            let amplified = rawSamples[sIdx] * loudnessGain
-            let absVal = abs(amplified)
-            if kneeThreshold < absVal {
-                let over = absVal - kneeThreshold
-                let compressed = kneeThreshold + (margin * tanh(over / margin))
-                if amplified < 0.0 {
-                    samples[sIdx] = -compressed
-                } else {
-                    samples[sIdx] = compressed
-                }
-            } else {
-                samples[sIdx] = amplified
-            }
-            sIdx += 1
-        }
-        return samples
+        return rawSamples
     }
 
     /// 日本語テキストから 16kHz 16-bit Mono WAV バイナリデータを生成する。
@@ -1280,6 +1375,30 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     ) -> Data {
         let samples = synthesize(text: text, voice: voice, speed: speed, pitch: pitch)
         return WavEncoder.encode(samples: samples, sampleRate: Int(sampleRate))
+    }
+
+    /// テキストを句読点（句点・感嘆符・疑問符・改行）境界で分割する
+    private func splitIntoSentences(text: String) -> [String] {
+        var sentences = [String]()
+        var current = ""
+        for char in text {
+            current.append(char)
+            switch char {
+            case "。", "！", "？", "\n", ".", "!", "?":
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty != true {
+                    sentences.append(current)
+                }
+                current = ""
+            default:
+                break
+            }
+        }
+        let tailTrimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tailTrimmed.isEmpty != true {
+            sentences.append(current)
+        }
+        return sentences
     }
 
     /// ストリーミング音声合成を実行する。
@@ -1304,6 +1423,15 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             return []
         }
 
+        switch isCancelled {
+        case .some(let cancel):
+            if cancel() {
+                return []
+            }
+        case .none:
+            break
+        }
+
         var safeSpeed = speed
         if safeSpeed.isFinite != true {
             safeSpeed = 1.0
@@ -1326,202 +1454,74 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             safePitch = 5.00
         }
 
-        let effectiveBaseF0 = voice.baseF0 * safePitch
-        let linguisticFeatures = lengthRegulator.processText(
-            text: text,
-            normalizer: normalizer,
-            prosodyModel: prosodyModel,
-            vocabulary: vocabulary,
-            speedFactor: safeSpeed,
-            baseF0: effectiveBaseF0
-        )
-
-        let totalFrames = linguisticFeatures.totalFrames
-        if totalFrames <= 0 {
-            return []
-        }
-
-        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures)
-        let snnAcousticSeq = decoder.decodeSequence(
-            featuresSeq: inputSeq,
-            workspace: workspace
-        )
-
-        let framePhoneIds = extractFramePhoneIds(
-            linguisticFeatures: linguisticFeatures,
-            totalFrames: totalFrames
-        )
-
-        let activePrior = prior(for: voice.tract)
-        let melChannels = AudioConfig.melChannels
-        let blendedPriorSeq = computeBlendedPriorSequence(
-            framePhoneIds: framePhoneIds,
-            activePrior: activePrior,
-            melChannels: melChannels
-        )
-
-        var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
-        var tMel = 0
-        let resScale = self.residualScale
-        while tMel < totalFrames {
-            let outDim = snnAcousticSeq[tMel].count
-            let copyCount = min(melChannels, outDim)
-
-            var rawSnnMel = [Float](repeating: 0.0, count: melChannels)
-            rawSnnMel.withUnsafeMutableBufferPointer { melDst in
-                snnAcousticSeq[tMel].withUnsafeBufferPointer { acSrc in
-                    melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
-                }
-            }
-
-            var compC = 0
-            while compC < melChannels {
-                combinedMelSeq[tMel][compC] = blendedPriorSeq[tMel][compC] + (resScale * rawSnnMel[compC])
-                compC += 1
-            }
-            tMel += 1
-        }
-
-        let smoothedMelSeq = smoothMelSequence(
-            combinedMelSeq: combinedMelSeq,
-            framePhoneIds: framePhoneIds,
-            melChannels: melChannels
-        )
-
-        // カスケード共鳴器用音響フレーム系列の構築（音素アライメントと SNN Mel 残差の調和）
-        let (resonatorFrames, _) = buildResonatorFrames(
-            linguisticFeatures: linguisticFeatures,
-            voice: voice,
-            effectiveBaseF0: effectiveBaseF0,
-            text: text,
-            melSeq: smoothedMelSeq
-        )
-
-        // なぜニューラルボコーダー逐次推論を行うか:
-        // 共鳴器（CascadeResonatorVocoder）特有の金属的・電子音的ロボット感を完全排除し、
-        // Mel スペクトル系列と連続 F0 輪郭から人間らしい自然な日本語波形を低遅延ストリーミングで生成するため。
         let frameSize = AudioConfig.hopSize
-        let silenceMask = computeFrameSilenceMask(
-            linguisticFeatures: linguisticFeatures,
-            totalFrames: totalFrames
-        )
-        neuralVocoder.reset()
 
-        var allSamples = [Float]()
-        allSamples.reserveCapacity(totalFrames * frameSize)
-        var frameBuffer = [Float](repeating: 0.0, count: frameSize)
+        switch onFrame {
+        case .none:
+            // バッチ一括合成モード: synthesize を直接再利用
+            return synthesize(
+                text: text,
+                voice: voice,
+                speed: safeSpeed,
+                pitch: safePitch
+            )
 
-        var t = 0
-        while t < totalFrames {
-            switch isCancelled {
-            case .some(let cancel):
-                if cancel() {
-                    return allSamples
+        case .some(let callback):
+            // なぜ文単位のニューラル波形合成とフレーム逐次配信を組み合わせるか:
+            // 1フレーム単独推論（T=1）による受容野破壊・100Hz周期クリックノイズを根絶しつつ、
+            // 複数文からなる長文テキストにおいて先頭文を即時合成して最初のチャンクを低遅延で送出し、
+            // クライアントからの早期キャンセル要求（isCancelled）にも即座に応答できるようにするため。
+            let sentences = splitIntoSentences(text: text)
+            var allSamples = [Float]()
+            var sIdx = 0
+            while sIdx < sentences.count {
+                switch isCancelled {
+                case .some(let cancel):
+                    if cancel() {
+                        return allSamples
+                    }
+                case .none:
+                    break
                 }
-            case .none:
-                break
-            }
 
-            var frameF0 = voice.baseF0
-            if t < linguisticFeatures.f0Contour.count {
-                let f = linguisticFeatures.f0Contour[t]
-                if 0.0 < f {
-                    frameF0 = f
-                }
-            }
-
-            var frameVoiced: Float = 1.0
-            if t < linguisticFeatures.voicedFlags.count {
-                frameVoiced = linguisticFeatures.voicedFlags[t]
-            }
-
-            var frameResFrame: ResonatorFrame? = nil
-            if t < resonatorFrames.count {
-                frameResFrame = resonatorFrames[t]
-            }
-
-            frameBuffer.withUnsafeMutableBufferPointer { pDst in
-                neuralVocoder.synthesizeFrame(
-                    melFrame: smoothedMelSeq[t],
-                    f0: frameF0,
-                    voiced: frameVoiced,
+                let sentText = sentences[sIdx]
+                let sentSamples = synthesize(
+                    text: sentText,
                     voice: voice,
-                    resonatorFrame: frameResFrame,
-                    dst: pDst.baseAddress!
+                    speed: safeSpeed,
+                    pitch: safePitch
                 )
-            }
 
-            // 無音・休止・促音区間および無声破裂音・破擦音の閉鎖期における完全ゼロミュートおよびフェードアウト
-            let isSilence = silenceMask[t]
-            if isSilence {
-                var prevIsSilence = true
-                if 0 < t {
-                    prevIsSilence = silenceMask[t - 1]
-                }
+                var offset = 0
+                let sentTotal = sentSamples.count
+                while offset < sentTotal {
+                    switch isCancelled {
+                    case .some(let cancel):
+                        if cancel() {
+                            return allSamples
+                        }
+                    case .none:
+                        break
+                    }
 
-                if prevIsSilence != true {
-                    let invN = 1.0 / Float(frameSize)
+                    let remaining = sentTotal - offset
+                    let count = min(frameSize, remaining)
+                    var frameBuffer = [Float](repeating: 0.0, count: frameSize)
                     var s = 0
-                    while s < frameSize {
-                        let fade = 1.0 - (Float(s) * invN)
-                        frameBuffer[s] = frameBuffer[s] * fade
+                    while s < count {
+                        frameBuffer[s] = sentSamples[offset + s]
                         s += 1
                     }
-                } else {
-                    var s = 0
-                    while s < frameSize {
-                        frameBuffer[s] = 0.0
-                        s += 1
-                    }
+                    callback(frameBuffer)
+                    allSamples.append(contentsOf: sentSamples[offset..<(offset + count)])
+                    offset += count
+                    usleep(100)
                 }
+
+                sIdx += 1
             }
 
-            // 先頭有声フレームの開始時におけるマイクロフェード（DAC起動ポップ防止）
-            if t == 0 && isSilence != true {
-                let invMicro: Float = 1.0 / 40.0
-                var ms = 0
-                while ms < 40 {
-                    frameBuffer[ms] = frameBuffer[ms] * (Float(ms) * invMicro)
-                    ms += 1
-                }
-            }
-
-            // なぜストリーミング出力に適正ラウドネスゲイン（1.25）およびソフトリミッターを適用するか:
-            // バッチ合成（synthesize）の有声区間 RMS 規準ラウドネス整流（targetRms = 0.155）と
-            // ストリーミング合成の出力レベルを完全に一致させ、
-            // 再生方式による音量の段差やデジタルクリッピングを完全に防止するため。
-            let streamLoudnessGain: Float = 1.25
-            let kneeThreshold: Float = 0.70
-            let margin: Float = 0.12
-            var s = 0
-            while s < frameSize {
-                let amplified = frameBuffer[s] * streamLoudnessGain
-                let absVal = abs(amplified)
-                if kneeThreshold < absVal {
-                    let over = absVal - kneeThreshold
-                    let compressed = kneeThreshold + (margin * tanh(over / margin))
-                    if amplified < 0.0 {
-                        frameBuffer[s] = -compressed
-                    } else {
-                        frameBuffer[s] = compressed
-                    }
-                } else {
-                    frameBuffer[s] = amplified
-                }
-                s += 1
-            }
-
-            switch onFrame {
-            case .some(let callback):
-                callback(frameBuffer)
-            case .none:
-                break
-            }
-
-            allSamples.append(contentsOf: frameBuffer)
-            t += 1
+            return allSamples
         }
-
-        return allSamples
     }
 }

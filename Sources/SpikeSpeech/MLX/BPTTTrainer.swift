@@ -218,7 +218,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
 
             var step = 0
             while step < timeSteps {
-                var current = current0_t + matmul(s[0], self.wRec)
+                var current = current0_t + matmul(stopGradient(s[0]), self.wRec)
                 var l = 0
                 while l < numLayers {
                     let isLast = (l + 1) == numLayers
@@ -365,12 +365,63 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
         let maskArray = mask ?? MLXArray.ones([features.shape[0], features.shape[1]])
         let (lossVals, grads) = lg(network, [features, targets, maskArray])
         let lossVal = lossVals[0]
-        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+        var safeGrads = grads
+        if let recG = safeGrads[unwrapping: "wRec"] {
+            let recNorm = sqrt(sum(recG * recG))
+            let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (recNorm + 1e-6))
+            safeGrads[unwrapping: "wRec"] = recG * scale
+        }
+        if let inG = safeGrads[unwrapping: "wIn"] {
+            let inNorm = sqrt(sum(inG * inG))
+            let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (inNorm + 1e-6))
+            safeGrads[unwrapping: "wIn"] = inG * scale
+        }
+        let (clippedGrads, _) = clipGradNorm(gradients: safeGrads, maxNorm: 5.0)
 
         optimizer.update(model: network, gradients: clippedGrads)
         eval(network, optimizer, lossVal)
 
         return lossVal.item(Float.self)
+    }
+
+    /// 各パラメータの生の勾配ノルムおよびクリップ前後の診断
+    public func diagnoseGradNorms(
+        features: MLXArray,
+        targets: MLXArray,
+        mask: MLXArray? = nil
+    ) -> [String: Float] {
+        let lg = valueAndGrad(model: network) { (model: MLXSpikingAcousticNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let fArr = arrays[0]
+            let tArr = arrays[1]
+            let mArr = arrays[2]
+
+            let pred = model.forward(features: fArr, bpttWindow: self.bpttWindow)
+            let l1Loss = AcousticLossFunctions.spectralL1Loss(
+                predicted: pred,
+                target: tArr,
+                mask: mArr
+            )
+            let deltaLoss = AcousticLossFunctions.spectralDeltaLoss(
+                predicted: pred,
+                target: tArr,
+                mask: mArr
+            )
+            let totalLoss = l1Loss + (deltaLoss * 0.5)
+            return [totalLoss]
+        }
+
+        let maskArray = mask ?? MLXArray.ones([features.shape[0], features.shape[1]])
+        let (lossVals, grads) = lg(network, [features, targets, maskArray])
+        eval(lossVals[0])
+
+        var result: [String: Float] = [:]
+        for (k, g) in grads.flattened() {
+            eval(g)
+            let gSq = g * g
+            let sumVal = sum(gSq).item(Float.self)
+            result[k] = sqrt(sumVal)
+        }
+        return result
     }
 
     /// 単一発話の系列学習ヘルパー

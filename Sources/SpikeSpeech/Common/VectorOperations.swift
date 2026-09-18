@@ -1,10 +1,80 @@
 import Foundation
 
+/// 64要素固定長 Float ベクトル（8個の SIMD8 レジスタに事前展開保持）
+///
+/// なぜ SIMD64Float 構造体を設けるか:
+/// 1D 畳み込みおよび転置畳み込みにおいて、同一の入力行（64 float）を 64 個の出力チャンネルに対して
+/// 64 回重複ロードするメモリ帯域の浪費を根絶し、レジスタ上に保持した入力ベクトルに対して
+/// 重みベクトルとの内積を連続実行することでスループットを数倍に高めるため。
+public struct SIMD64Float: Sendable {
+    public var v0: SIMD8<Float>
+    public var v1: SIMD8<Float>
+    public var v2: SIMD8<Float>
+    public var v3: SIMD8<Float>
+    public var v4: SIMD8<Float>
+    public var v5: SIMD8<Float>
+    public var v6: SIMD8<Float>
+    public var v7: SIMD8<Float>
+
+    @inline(__always)
+    public init(from ptr: UnsafePointer<Float>) {
+        let raw = UnsafeRawPointer(ptr)
+        v0 = raw.loadUnaligned(fromByteOffset: 0, as: SIMD8<Float>.self)
+        v1 = raw.loadUnaligned(fromByteOffset: 32, as: SIMD8<Float>.self)
+        v2 = raw.loadUnaligned(fromByteOffset: 64, as: SIMD8<Float>.self)
+        v3 = raw.loadUnaligned(fromByteOffset: 96, as: SIMD8<Float>.self)
+        v4 = raw.loadUnaligned(fromByteOffset: 128, as: SIMD8<Float>.self)
+        v5 = raw.loadUnaligned(fromByteOffset: 160, as: SIMD8<Float>.self)
+        v6 = raw.loadUnaligned(fromByteOffset: 192, as: SIMD8<Float>.self)
+        v7 = raw.loadUnaligned(fromByteOffset: 224, as: SIMD8<Float>.self)
+    }
+
+    @inline(__always)
+    public func dot(with ptr: UnsafePointer<Float>) -> Float {
+        let raw = UnsafeRawPointer(ptr)
+        var acc0 = v0 * raw.loadUnaligned(fromByteOffset: 0, as: SIMD8<Float>.self)
+        var acc1 = v1 * raw.loadUnaligned(fromByteOffset: 32, as: SIMD8<Float>.self)
+        acc0 += v2 * raw.loadUnaligned(fromByteOffset: 64, as: SIMD8<Float>.self)
+        acc1 += v3 * raw.loadUnaligned(fromByteOffset: 96, as: SIMD8<Float>.self)
+        acc0 += v4 * raw.loadUnaligned(fromByteOffset: 128, as: SIMD8<Float>.self)
+        acc1 += v5 * raw.loadUnaligned(fromByteOffset: 160, as: SIMD8<Float>.self)
+        acc0 += v6 * raw.loadUnaligned(fromByteOffset: 192, as: SIMD8<Float>.self)
+        acc1 += v7 * raw.loadUnaligned(fromByteOffset: 224, as: SIMD8<Float>.self)
+        return (acc0 + acc1).sum()
+    }
+}
+
 /// SIMD8 および直接ポインタ操作による高速ベクトル演算
 ///
 /// インスタンス化のオーバーヘッドを完全に排除し、音声波形生成ループや
 /// フィルタバンク処理の最深部からインライン展開可能な高効率ユーティリティとして機能させる。
 public enum VectorOperations {
+
+    /// 64要素固定長内積（Hot Path ループ完全展開＆デュアルアキュムレータ）
+    ///
+    /// なぜ 64ch 完全ループ展開を行うか:
+    /// ニューラルボコーダーの隠れ層（64ch）における積和演算ループオーバーヘッドおよび
+    /// スカラーロード・挿入命令を完全排除し、SIMD8 ロードと 2 連アキュムレータによる
+    /// 命令レベル並列性（ILP）を極限まで引き出して RTF < 0.05 を達成するため。
+    @inline(__always)
+    public static func dotProduct64(
+        a: UnsafePointer<Float>,
+        b: UnsafePointer<Float>
+    ) -> Float {
+        let rawA = UnsafeRawPointer(a)
+        let rawB = UnsafeRawPointer(b)
+
+        var acc0 = rawA.loadUnaligned(fromByteOffset: 0, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 0, as: SIMD8<Float>.self)
+        var acc1 = rawA.loadUnaligned(fromByteOffset: 32, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 32, as: SIMD8<Float>.self)
+        acc0 += rawA.loadUnaligned(fromByteOffset: 64, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 64, as: SIMD8<Float>.self)
+        acc1 += rawA.loadUnaligned(fromByteOffset: 96, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 96, as: SIMD8<Float>.self)
+        acc0 += rawA.loadUnaligned(fromByteOffset: 128, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 128, as: SIMD8<Float>.self)
+        acc1 += rawA.loadUnaligned(fromByteOffset: 160, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 160, as: SIMD8<Float>.self)
+        acc0 += rawA.loadUnaligned(fromByteOffset: 192, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 192, as: SIMD8<Float>.self)
+        acc1 += rawA.loadUnaligned(fromByteOffset: 224, as: SIMD8<Float>.self) * rawB.loadUnaligned(fromByteOffset: 224, as: SIMD8<Float>.self)
+
+        return (acc0 + acc1).sum()
+    }
 
     /// 内積
     ///
@@ -16,25 +86,23 @@ public enum VectorOperations {
         b: UnsafePointer<Float>,
         count: Int
     ) -> Float {
+        if count == 64 {
+            return dotProduct64(a: a, b: b)
+        }
         let width = 8
         let limit = count - (count % width)
-        var sum: Float = 0.0
-        var vecSum = SIMD8<Float>(repeating: 0.0)
+        var acc0 = SIMD8<Float>(repeating: 0.0)
         var i = 0
+        let rawA = UnsafeRawPointer(a)
+        let rawB = UnsafeRawPointer(b)
 
         while i < limit {
-            let va = SIMD8<Float>(
-                a[i + 0], a[i + 1], a[i + 2], a[i + 3],
-                a[i + 4], a[i + 5], a[i + 6], a[i + 7]
-            )
-            let vb = SIMD8<Float>(
-                b[i + 0], b[i + 1], b[i + 2], b[i + 3],
-                b[i + 4], b[i + 5], b[i + 6], b[i + 7]
-            )
-            vecSum += va * vb
+            let va = rawA.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
+            let vb = rawB.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
+            acc0 += va * vb
             i += width
         }
-        sum += vecSum.sum()
+        var sum = acc0.sum()
 
         // 8の倍数以外の任意のフレーム長に対しても正確な内積値をビット欠損なく算出する端数処理。
         while i < count {

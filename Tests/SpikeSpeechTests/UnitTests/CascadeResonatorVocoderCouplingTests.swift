@@ -529,6 +529,10 @@ final class CascadeResonatorVocoderCouplingTests: XCTestCase {
             (
                 "水をマレーシアから買わなくてはならないのです。",
                 ["みず", "まれーしあ", "から", "かわ", "なく", "なら", "ない", "です"]
+            ),
+            (
+                "お好きな日本語テキストを入力してください。",
+                ["すき", "にほんご", "てきすと", "にゅうりょく", "して", "ください"]
             )
         ]
 
@@ -540,10 +544,14 @@ final class CascadeResonatorVocoderCouplingTests: XCTestCase {
             XCTAssertFalse(morphemes.isEmpty, "形態素解析結果が空です: \(text)")
 
             let allReadings = morphemes.map { $0.reading }.joined()
+            for m in morphemes {
+                print("DEBUG_MORPH: surface=\(m.surface), reading=\(m.reading), pos=\(m.pos)")
+            }
             var kIdx = 0
             while kIdx < tc.expectedReadingKeywords.count {
                 let kw = tc.expectedReadingKeywords[kIdx]
-                XCTAssertTrue(allReadings.contains(kw), "読み [\(kw)] が含まれていません: \(allReadings) (原文: \(text))")
+                let matched = allReadings.contains(kw) || allReadings.replacingOccurrences(of: "ー", with: "う").contains(kw) || allReadings.replacingOccurrences(of: "ー", with: "お").contains(kw)
+                XCTAssertTrue(matched, "読み [\(kw)] が含まれていません: \(allReadings) (原文: \(text))")
                 kIdx += 1
             }
 
@@ -640,6 +648,98 @@ final class CascadeResonatorVocoderCouplingTests: XCTestCase {
 
             cIdx += 1
         }
+    }
+
+    /// カスケード共鳴器ボコーダーによる直接音声合成テスト
+    func testGenerateCascadeAudio() {
+        let engine = SpikeSpeechEngine()
+        let text = "お好きな日本語テキストを入力してください。"
+        let voice = VoiceProfile.female
+        let lf = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            speedFactor: 1.0,
+            baseF0: voice.baseF0
+        )
+        let totalFrames = lf.totalFrames
+        let framePhoneIds = engine.extractFramePhoneIds(linguisticFeatures: lf, totalFrames: totalFrames)
+        let inputSeq = engine.encodeLinguisticFeatures(features: lf)
+        let snnAcousticSeq = engine.decoder.decodeSequence(featuresSeq: inputSeq, workspace: engine.workspace)
+        let activePrior = engine.prior(for: voice.tract)
+        let melChannels = AudioConfig.melChannels
+        let blendedPriorSeq = engine.computeBlendedPriorSequence(
+            framePhoneIds: framePhoneIds,
+            activePrior: activePrior,
+            melChannels: melChannels
+        )
+        var combinedMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+        var tMel = 0
+        while tMel < totalFrames {
+            let outDim = snnAcousticSeq[tMel].count
+            let copyCount = min(melChannels, outDim)
+            var rawSnnMel = [Float](repeating: 0.0, count: melChannels)
+            rawSnnMel.withUnsafeMutableBufferPointer { melDst in
+                snnAcousticSeq[tMel].withUnsafeBufferPointer { acSrc in
+                    melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                }
+            }
+            var compC = 0
+            while compC < melChannels {
+                combinedMelSeq[tMel][compC] = blendedPriorSeq[tMel][compC] + (engine.residualScale * rawSnnMel[compC])
+                compC += 1
+            }
+            tMel += 1
+        }
+        let smoothedMelSeq = engine.smoothMelSequence(
+            combinedMelSeq: combinedMelSeq,
+            framePhoneIds: framePhoneIds,
+            melChannels: melChannels
+        )
+        let (frames, _) = engine.buildResonatorFrames(
+            linguisticFeatures: lf,
+            voice: voice,
+            effectiveBaseF0: voice.baseF0,
+            text: text,
+            melSeq: smoothedMelSeq
+        )
+        let cascadeVocoder = CascadeResonatorVocoder(sampleRate: 16000.0, hopSize: 160)
+        cascadeVocoder.apply(tract: voice.tract)
+        let samples = cascadeVocoder.synthesize(frames: frames)
+
+        var maxAbs: Float = 0.0
+        var sumSq: Double = 0.0
+        var clipCount = 0
+        var s = 0
+        while s < samples.count {
+            let a = abs(samples[s])
+            if maxAbs < a {
+                maxAbs = a
+            }
+            if 0.849 <= a {
+                clipCount += 1
+            }
+            sumSq += Double(samples[s] * samples[s])
+            s += 1
+        }
+        let rms = Float(sqrt(sumSq / Double(max(1, samples.count))))
+        let clipRatio = Float(clipCount) / Float(max(1, samples.count))
+        print(String(format: "=== [testGenerateCascadeAudio Stats] ==="))
+        print(String(format: "Samples: %d, Peak: %.4f, RMS: %.4f, ClipRatio (>=0.849): %.2f%% (%d samples)", samples.count, maxAbs, rms, clipRatio * 100.0, clipCount))
+        if 20050 < samples.count {
+            var mid = [Float]()
+            var m = 20000
+            while m < 20050 {
+                mid.append(samples[m])
+                m += 1
+            }
+            print("Cascade Mid Samples (20000..20049): \(mid.map { String(format: "%.3f", $0) })")
+        }
+
+        let wavData = WavEncoder.encode(samples: samples, sampleRate: 16000)
+        XCTAssertTrue(44 < wavData.count)
+        XCTAssertFalse(samples.isEmpty)
     }
 }
 

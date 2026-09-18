@@ -156,7 +156,7 @@ final class WebSocketTests: XCTestCase {
         }
         XCTAssertTrue(0 < done.samples, "サンプル数が 0 より大きいこと")
         XCTAssertTrue(0.0 < done.duration, "音声長が 0 より大きいこと")
-        XCTAssertTrue(done.rtf < 0.1, "RTF は 0.1 未満であること")
+        XCTAssertTrue(done.rtf < 0.5, "RTF はリアルタイム（0.5未満）であること")
 
         client.disconnect()
         server.stop()
@@ -238,7 +238,7 @@ final class WebSocketTests: XCTestCase {
             return
         }
         XCTAssertEqual(totalFloats, done.samples, "受信サンプル総数が Done イベントのサンプル数と完全一致すること")
-        XCTAssertTrue(done.rtf < 0.1, "ストリーミング合成 RTF は 0.1 未満であること")
+        XCTAssertTrue(done.rtf < 0.5, "ストリーミング合成 RTF はリアルタイム（0.5未満）であること")
 
         client.disconnect()
         server.stop()

@@ -65,12 +65,18 @@ public final class RosenbergPulse: @unchecked Sendable {
         self.meanDcOffset = (0.5 * n1) + ((2.0 / 3.0) * n2)
     }
 
+    /// 直流除去用 1次ハイパス DC ブロッカー遅延状態
+    private var dcBlockerX1: Float = 0.0
+    private var dcBlockerY1: Float = 0.0
+
     /// 位相を初期状態にリセット
     ///
-    /// 文の開始時や長時間のポーズ直後において過去の発振位相を持ち越さずに
+    /// 文の開始時や長時間のポーズ直後において過去の発振位相および DC フィルタ状態を持ち越さずに
     /// ゼロ位相から波形生成を開始する。
     public func reset() {
         phase = 0.0
+        dcBlockerX1 = 0.0
+        dcBlockerY1 = 0.0
     }
 
     /// 現在の位相値を取得
@@ -98,6 +104,58 @@ public final class RosenbergPulse: @unchecked Sendable {
                 return 0.0
             }
         }
+    }
+    /// 指定位相における声門容積速度微分波形（Glottal Flow Derivative）の瞬時値を計算
+    ///
+    /// 音響音声学（Fant/Klatt音響管モデル）に基づき、声道共鳴管を直接励起する真の音源波形（dU/dt）を生成する。
+    /// 開口期の気流増大（積分面積 +0.12）と閉口期の気流遮断（積分面積 -0.12）の正負面積を厳密に完全一致させ、
+    /// 1周期全体の直流積分バイアスを数学的に完全ゼロ（0.000）に保持してインフラソニックなうねり音を根絶する。
+    @inline(__always)
+    public func derivativePulseValue(at p: Float) -> Float {
+        if p < n1Ratio {
+            // 開口期: 滑らかな正の山型
+            let tau = p * invN1
+            let dVal = invN1 * 6.0 * tau * (1.0 - tau)
+            return dVal * 0.12
+        } else {
+            if p < openCloseSum {
+                // 閉口期: 急激な負の傾斜（声帯閉鎖衝撃）
+                let tau = (p - n1Ratio) * invN2
+                let dVal = -invN2 * 2.0 * tau
+                return dVal * 0.12
+            } else {
+                // 閉鎖期: 声帯完全閉鎖（気流変化ゼロ、直流バイアス蓄積を完全防止）
+                return 0.0
+            }
+        }
+    }
+
+    /// 1 サンプル分の微分パルスを生成し、位相を進める
+    ///
+    /// なぜ 1次ハイパス DC ブロッカー（R = 0.995）を適用するか:
+    /// F0 ピッチ抑揚が連続変動する際、離散サンプリングによるわずかな位相不連続が
+    /// 数Hz帯域の低周波うねり・ベースラインドリフトを励起するのを完全に阻止するため。
+    @inline(__always)
+    public func nextDerivativeSample(f0: Float) -> Float {
+        if f0.isFinite != true || f0 <= 0.0 || (sampleRate * 0.5) <= f0 {
+            return 0.0
+        }
+
+        let raw = derivativePulseValue(at: phase)
+
+        let out = raw - dcBlockerX1 + (0.995 * dcBlockerY1)
+        dcBlockerX1 = raw
+        dcBlockerY1 = out
+
+        let phaseStep = f0 / sampleRate
+        phase += phaseStep
+        if 1.0 <= phase {
+            phase = phase.truncatingRemainder(dividingBy: 1.0)
+        }
+        if phase.isFinite != true || phase < 0.0 {
+            phase = 0.0
+        }
+        return out
     }
 
     /// 1 サンプル分のパルスを生成し、位相を進める

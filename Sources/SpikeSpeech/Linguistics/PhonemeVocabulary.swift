@@ -216,6 +216,16 @@ public struct PhonemeVocabulary: Sendable {
         }
     }
 
+    /// 音素 ID が母音（a, i, u, e, o, 長音）であるか判定する
+    public func isVowel(id: Int) -> Bool {
+        switch id {
+        case 5, 6, 7, 8, 9, 26: // a, i, u, e, o, _ (長音)
+            return true
+        default:
+            return false
+        }
+    }
+
     /// カタカナ文字をひらがなに正規化する。
     /// カタカナとひらがなは Unicode コードポイントが 0x60 オフセットで並行配置されており、
     /// 文字列置換ライブラリ呼び出しを排してスカラー演算のみで一括変換する。
