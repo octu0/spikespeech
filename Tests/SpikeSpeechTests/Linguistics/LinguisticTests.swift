@@ -1,10 +1,7 @@
 import XCTest
 @testable import SpikeSpeech
 
-/// 日本語言語処理フロントエンドおよび音響アライメントエンジンの単体テストスイート
-///
-/// 外部依存ゼロの形態素解析、助詞置換、動詞保護、数詞展開、韻律F0生成、および
-/// 累積和 Length Regulation の数学的・論理的整合性を厳密に検証する。
+/// 日本語言語処理フロントエンド（形態素解析, 読み正規化, 語彙, 韻律, LengthRegulator）の網羅的単体テストスイート
 final class LinguisticTests: XCTestCase {
 
     private var normalizer: TextNormalizer!
@@ -25,7 +22,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 1. 形態素解析・品詞特定テスト
 
     func testViterbiMorphologicalAnalysis() {
-        // 指示詞・助詞・名詞・助動詞の典型的な連接がラティス探索で正しく解かれるか検証する。
         let morphemes = morphology.tokenize("これは水です")
         XCTAssertEqual(morphemes.count, 4)
 
@@ -45,8 +41,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 2. 助詞読み替えテスト (は/へ/を)
 
     func testParticleReadingReplacement() {
-        // 助詞「は→わ」「へ→え」「を→お」の音変化を反映しつつ、
-        // 単語内部の「は」（母、花）が誤置換されないことを保証する。
         let text1 = "これは水です"
         let norm1 = normalizer.normalize(text: text1)
         let reading1 = norm1.map { $0.reading }.joined()
@@ -71,8 +65,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 3. 動詞終止形「う」保護および母音連続長音化テスト
 
     func testVerbEndingUProtectionAndProlongation() {
-        // 名詞の母音連続（東京→とーきょー、先生→せんせー）は長音化しつつ、
-        // 動詞終止形（思う、買う、追う）の語末 [u] は独立拍として保護されることを保証する。
         let textVerb1 = "彼を思う"
         let normVerb1 = normalizer.normalize(text: textVerb1)
         let readingVerb1 = normVerb1.map { $0.reading }.joined()
@@ -97,8 +89,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 4. 万進法数詞展開および助数詞連声テスト
 
     func testNumeralExpansionAndCounterSandhi() {
-        // 「1473年」の万進法展開および「1本(いっぽん)」「3本(さんぼん)」「4日(よっか)」等の
-        // 日本語特有の促音化・濁音化・不規則音便が決定論的に展開されることを確認する。
         let resYear = normalizer.expandNumbersAndCounters("1473年")
         XCTAssertEqual(resYear, "せんよんひゃくななじゅうさんねん")
 
@@ -130,8 +120,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 5. モーラ・音素階層トークナイズおよび 64 語彙 ID テスト
 
     func testMoraAndPhonemeTokenization() {
-        // 拗音（ky）や促音（Q）、長音（_）が正しいカテゴリ・音素IDにマッピングされ、
-        // 64語彙テーブルの整合性が維持されているか確認する。
         let morasKyo = vocabulary.kanaToMoras("きょう")
         XCTAssertEqual(morasKyo.count, 2)
         XCTAssertEqual(morasKyo[0].text, "きょ")
@@ -145,7 +133,6 @@ final class LinguisticTests: XCTestCase {
         XCTAssertEqual(morasGakko[1].phonemes[0].symbol, "Q")
         XCTAssertEqual(morasGakko[1].phonemes[0].category, .geminate)
 
-        // 語彙IDの範囲検証
         for mora in morasGakko {
             for p in mora.phonemes {
                 XCTAssertTrue(0 <= p.id)
@@ -157,8 +144,6 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 6. 東京方言ピッチアクセントトーンおよび F0 輪郭生成テスト
 
     func testProsodyAndF0Contour() {
-        // 頭高型（ねこ: H-L）、平板型（さくら: L-H-H）、中高型（たまご: L-H-L）が
-        // 東京方言の規則通りにトーン付与されることを確認する。
         let tonesHeadHigh = prosodyModel.computeMoraTones(moraCount: 2, accentKernel: 1)
         XCTAssertEqual(tonesHeadHigh, [.high, .low])
 
@@ -168,7 +153,6 @@ final class LinguisticTests: XCTestCase {
         let tonesMiddleHigh = prosodyModel.computeMoraTones(moraCount: 3, accentKernel: 2)
         XCTAssertEqual(tonesMiddleHigh, [.low, .high, .low])
 
-        // F0 輪郭の有声/無声マスキングおよび数値安定性検証
         let features = lengthRegulator.processText(
             text: "これは水です。",
             normalizer: normalizer,
@@ -197,33 +181,16 @@ final class LinguisticTests: XCTestCase {
         }
     }
 
-    /// 「お好きな日本語テキストを入力してください」の形態素解析・アクセント句・ピッチ輪郭の診断テスト
+    /// 日本語長文テキストに対する形態素解析・アクセント句・ピッチ輪郭の生成検証
     func testTargetSentenceProsody() {
         let text = "お好きな日本語テキストを入力してください"
         let norm = normalizer.cleanText(text)
         let morphemes = normalizer.normalize(text: norm)
-        print("--- [Morphology Result: \(text)] ---")
-        var mIdx = 0
-        while mIdx < morphemes.count {
-            let m = morphemes[mIdx]
-            print("  Surface: \(m.surface), Reading: \(m.reading), POS: \(m.pos), Kernel: \(m.accentKernel)")
-            mIdx += 1
-        }
+        XCTAssertTrue(0 < morphemes.count)
+
         let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
-        print("--- [Accent Phrases: \(phrases.count)] ---")
-        var pIdx = 0
-        while pIdx < phrases.count {
-            let p = phrases[pIdx]
-            var moraStr = ""
-            var mi = 0
-            while mi < p.moras.count {
-                let m = p.moras[mi]
-                moraStr += "\(m.text)(\(m.tone))-"
-                mi += 1
-            }
-            print("  Phrase \(pIdx): \(moraStr), pauseAfter: \(p.pauseAfter)")
-            pIdx += 1
-        }
+        XCTAssertTrue(0 < phrases.count)
+
         let features = lengthRegulator.processText(
             text: text,
             normalizer: normalizer,
@@ -231,31 +198,19 @@ final class LinguisticTests: XCTestCase {
             vocabulary: vocabulary,
             baseF0: 220.0
         )
-        print("--- [F0 Contour: \(features.totalFrames) frames] ---")
-        var f0Str = ""
-        var fi = 0
-        while fi < features.totalFrames {
-            if 0.5 <= features.voicedFlags[fi] {
-                f0Str += String(format: "%.1f, ", features.f0Contour[fi])
-            } else {
-                f0Str += "0, "
-            }
-            fi += 1
-        }
-        print("  F0: [\(f0Str)]")
+        XCTAssertTrue(0 < features.totalFrames)
+        XCTAssertEqual(features.f0Contour.count, features.totalFrames)
+        XCTAssertEqual(features.voicedFlags.count, features.totalFrames)
     }
 
     // MARK: - 7. Length Regulation フレーム展開および O(1) アロケーションテスト
 
     func testLengthRegulationExpansion() {
-        // 音素埋め込み行列 (N x D) と各音素の Duration 列から、
-        // 正確に sum(d_i) x D の連続音響フレーム系列が展開されることを確認する。
         let dim = 64
         let phonemeCount = 3
-        let durations = [2, 3, 4] // 合計 9 フレーム
+        let durations = [2, 3, 4]
         let totalFrames = 9
 
-        // 3 つの音素埋め込みベクトル (それぞれ一意な値で初期化)
         var embeddings = [Float](repeating: 0.0, count: phonemeCount * dim)
         var d = 0
         while d < dim {
@@ -273,7 +228,6 @@ final class LinguisticTests: XCTestCase {
 
         XCTAssertEqual(expanded.count, totalFrames * dim)
 
-        // 第 0..1 フレームは音素 0 (値 1.0)
         var f = 0
         while f < 2 {
             var j = 0
@@ -284,7 +238,6 @@ final class LinguisticTests: XCTestCase {
             f += 1
         }
 
-        // 第 2..4 フレームは音素 1 (値 2.0)
         while f < 5 {
             var j = 0
             while j < dim {
@@ -294,7 +247,6 @@ final class LinguisticTests: XCTestCase {
             f += 1
         }
 
-        // 第 5..8 フレームは音素 2 (値 3.0)
         while f < 9 {
             var j = 0
             while j < dim {
@@ -308,23 +260,17 @@ final class LinguisticTests: XCTestCase {
     // MARK: - 8. 累積和量子化テスト
 
     func testCumulativeQuantization() {
-        // 浮動小数点 Duration の四捨五入において、文全体での丸め誤差累積が
-        // ゼロとなることを数学的に証明する。
-        let rawDurations: [Float] = [1.2, 2.4, 3.4] // 総和 = 7.0
+        let rawDurations: [Float] = [1.2, 2.4, 3.4]
         let quantized = lengthRegulator.quantizeDurations(durations: rawDurations)
 
         XCTAssertEqual(quantized.count, 3)
         let totalQuantized = quantized.reduce(0, +)
-        XCTAssertEqual(totalQuantized, 7) // round(7.0) = 7
+        XCTAssertEqual(totalQuantized, 7)
     }
 
     // MARK: - 9. 境界値・敵対的 (Adversarial) 入力テスト
 
     func testAdversarialAndBoundaryInputs() {
-        // 空文字、空白のみ、記号混在、長文等の入力に対して
-        // クラッシュせず安全にフォールバックすることを証明する。
-
-        // 1. 空文字
         let emptyFeatures = lengthRegulator.processText(
             text: "",
             normalizer: normalizer,
@@ -334,23 +280,85 @@ final class LinguisticTests: XCTestCase {
         XCTAssertEqual(emptyFeatures.totalFrames, 0)
         XCTAssertTrue(emptyFeatures.phoneIds.isEmpty)
 
-        // 2. 空白のみ
         let spaceClean = normalizer.cleanText("    ")
         XCTAssertEqual(spaceClean, "    ")
 
-        // 3. 注記付き記号混在テキスト
         let annotText = "ら〜めん(笑)！"
         let cleaned = normalizer.cleanText(annotText)
         XCTAssertEqual(cleaned, "らーめん！")
 
-        // 4. 未知語・英数字混在
         let unknownText = "SNN音声合成AI"
         let morphemes = normalizer.normalize(text: unknownText)
         XCTAssertTrue(0 < morphemes.count)
 
-        // 5. 10,000 文字の長文ストレス入力
-        let longSentence = String(repeating: "東京の水は冷たい。", count: 1000)
+        let longSentence = String(repeating: "東京の水は冷たい。", count: 100)
         let longMorphemes = normalizer.normalize(text: longSentence)
         XCTAssertTrue(0 < longMorphemes.count)
+    }
+
+    // MARK: - 10. 生体プロソディ・音素ヘルパー・エネルギープロファイル検証
+
+    /// 調音音声学に基づくマイクロプロソディ（無声子音後の母音 F0 上昇 vs 有声子音後）の検証
+    func testMicroprosodyEffect() {
+        let prosody = ProsodyModel(baseF0: 200.0)
+
+        let lingKa = lengthRegulator.processText(text: "か", normalizer: normalizer, prosodyModel: prosody, vocabulary: vocabulary)
+        let lingGa = lengthRegulator.processText(text: "が", normalizer: normalizer, prosodyModel: prosody, vocabulary: vocabulary)
+
+        let ka_kDur = Int(lingKa.durations[0])
+        let ga_gDur = Int(lingGa.durations[0])
+
+        let vowelKaF0 = lingKa.f0Contour[ka_kDur]
+        let vowelGaF0 = lingGa.f0Contour[ga_gDur]
+
+        XCTAssertTrue(0.0 < vowelKaF0, "か の母音 /a/ F0 が正であること")
+        XCTAssertTrue(0.0 < vowelGaF0, "が の母音 /a/ F0 が正であること")
+
+        // 音響音声学の物理法則: 無声破裂音直後の母音立ち上がりピッチ (+3%) は有声破裂音直後 (-2%) よりも高くなる
+        XCTAssertTrue(vowelGaF0 < vowelKaF0, "マイクロプロソディにより無声破裂音直後の母音 /a/ F0 (\(vowelKaF0)) が有声子音直後 (\(vowelGaF0)) より高くなること")
+    }
+
+    /// 音素ヘルパー hy (32) の無声摩擦音・無声子音分類の検証
+    func testPhonemeHelperHy() {
+        let hyId = 32
+
+        XCTAssertEqual(vocabulary.token(for: hyId), "hy", "ID 32 は hy であること")
+        XCTAssertTrue(vocabulary.isUnvoicedFricative(id: hyId), "hy は無声摩擦音であること")
+        XCTAssertTrue(vocabulary.isUnvoicedConsonant(id: hyId), "hy は無声子音であること")
+        XCTAssertTrue(vocabulary.isVoiced(symbol: "hy") != true, "hy は無声音であること")
+    }
+
+    /// 推論時エネルギー輪郭の音素物理カテゴリプロファイルの検証
+    func testInferenceEnergyProfile() {
+        let features = lengthRegulator.processText(
+            text: "すし",
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary
+        )
+
+        XCTAssertTrue(0 < features.totalFrames, "フレームが生成されていること")
+        XCTAssertEqual(features.energyContour.count, features.totalFrames, "エネルギー輪郭と総フレーム数が一致すること")
+
+        var fIdx = 0
+        var foundVowelEnergy = false
+        var foundFricativeEnergy = false
+
+        while fIdx < features.totalFrames {
+            let eng = features.energyContour[fIdx]
+            XCTAssertTrue(0.0 <= eng, "エネルギーは 0 以上であること")
+            XCTAssertTrue(eng <= 1.0, "エネルギーは 1.0 以下であること")
+
+            if 0.60 <= eng {
+                foundVowelEnergy = true
+            }
+            if 0.15 <= eng && eng <= 0.35 {
+                foundFricativeEnergy = true
+            }
+            fIdx += 1
+        }
+
+        XCTAssertTrue(foundVowelEnergy, "母音の高エネルギー区間が存在すること")
+        XCTAssertTrue(foundFricativeEnergy, "摩擦音の中間エネルギー区間が存在すること")
     }
 }

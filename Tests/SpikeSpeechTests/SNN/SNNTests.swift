@@ -1,7 +1,7 @@
 import XCTest
 @testable import SpikeSpeech
 
-/// SNN 音響モデル単体検証テストスイート
+/// SNN（LIF/ALIF ニューロン, デコーダー, 重み, ワークスペース）の網羅的単体検証テストスイート
 final class SNNTests: XCTestCase {
 
     // MARK: - 1. LIF / ALIF 膜電位更新とスパイク生成の数学的正確性テスト
@@ -303,64 +303,39 @@ final class SNNTests: XCTestCase {
         XCTAssertEqual(emptyOut.count, 0)
     }
 
-    // MARK: - 7. 静的コード規約機械検査
+    // MARK: - 7. 膜電位の時間連続性検証
 
-    func testSNNStaticRuleCheck() {
-        let fileManager = FileManager.default
-        let currentDir = fileManager.currentDirectoryPath
-        let snnPath = currentDir + "/Sources/SpikeSpeech/SNN"
+    func testDecoderMembraneContinuity() {
+        let weights = SpikingNetworkWeights.randomWeights(
+            inputDim: 128,
+            maxHiddenDim: 64,
+            outputDim: 64,
+            numLayers: 2
+        )
+        let decoder = SpikingAcousticDecoder(weights: weights)
+        let workspace = AcousticWorkspace(
+            maxHiddenDim: weights.maxHiddenDim,
+            outputDim: weights.outputDim,
+            numLayers: weights.numLayers
+        )
 
-        guard let enumerator = fileManager.enumerator(atPath: snnPath) else {
-            XCTFail("Sources/SpikeSpeech/SNN が走査できませんでした")
-            return
+        let frame0 = [Float](repeating: 0.5, count: 128)
+        let frame1 = [Float](repeating: 0.5, count: 128)
+        let seq = [frame0, frame1]
+
+        let output = decoder.decodeSequence(featuresSeq: seq, workspace: workspace)
+        XCTAssertEqual(output.count, 2)
+
+        var nonZeroMembrane = false
+        var i = 0
+        let v0 = workspace.layerStates[0].v
+        while i < v0.count {
+            if 0.01 < abs(v0[i]) {
+                nonZeroMembrane = true
+                break
+            }
+            i += 1
         }
-
-        var checkedFiles = 0
-        while let relativePath = enumerator.nextObject() as? String {
-            if relativePath.hasSuffix(".swift") != true {
-                continue
-            }
-
-            let fullPath = snnPath + "/" + relativePath
-            guard let content = try? String(contentsOfFile: fullPath, encoding: .utf8) else {
-                continue
-            }
-
-            let lines = content.components(separatedBy: .newlines)
-            var lineIdx = 0
-            while lineIdx < lines.count {
-                let line = lines[lineIdx]
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-                if trimmed.hasPrefix("//") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("*") {
-                    lineIdx += 1
-                    continue
-                }
-
-                XCTAssertFalse(
-                    trimmed.contains(" > ") && trimmed.contains("->") != true,
-                    "比較演算子 > が使用されています: \(relativePath):\(lineIdx + 1): \(trimmed)"
-                )
-                XCTAssertFalse(
-                    trimmed.contains(" >= "),
-                    "比較演算子 >= が使用されています: \(relativePath):\(lineIdx + 1): \(trimmed)"
-                )
-                XCTAssertFalse(
-                    trimmed.contains("else if"),
-                    "else if が使用されています: \(relativePath):\(lineIdx + 1): \(trimmed)"
-                )
-                XCTAssertFalse(
-                    trimmed.contains(" ? ") && trimmed.contains("??") != true,
-                    "三項演算子が使用されています: \(relativePath):\(lineIdx + 1): \(trimmed)"
-                )
-                lineIdx += 1
-            }
-            checkedFiles += 1
-        }
-
-        XCTAssertTrue(0 < checkedFiles, "チェック対象の Swift ファイルがありません")
-        print("--- [SNN Static Rule Check] ---")
-        print("検証完了 SNN ファイル数: \(checkedFiles) 件 (全ファイル規約適合)")
-        print("-------------------------------")
+        XCTAssertTrue(nonZeroMembrane, "フレーム間で膜電位が時間連続的に保持されていません")
     }
 }

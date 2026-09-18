@@ -53,7 +53,7 @@ func main() {
                 i += 1
             }
         case "-h", "--help":
-            print("Usage: benchmark [-n <iterations>] [-t <text>] [-m all|linguistics|snn|vocoder|e2e]")
+            print("Usage: benchmark [-n <iterations>] [-t <text>] [-m all|linguistics|snn|vocoder|e2e|stress|longtext]")
             return
         default:
             break
@@ -205,6 +205,40 @@ func main() {
         print("   E2E Real-Time Factor: \(String(format: "%.4f", e2eRTF))")
         print("   E2E スループット比:   リアルタイムの \(String(format: "%.1f", 1.0 / e2eRTF)) 倍速")
         print("   終了時常駐メモリ (RSS): \(String(format: "%.2f", rssMB)) MB")
+        print("----------------------------------------------------------")
+    }
+
+    // 5. 1,000文字超 巨大テキスト合成ストレステスト & メモリスケーリング
+    if mode == "all" || mode == "stress" || mode == "longtext" {
+        print("5. 1,000文字超 巨大テキスト合成ストレステスト & メモリスケーリング")
+        let baseParagraph = "スパイキングニューラルネットワークによる超低遅延音声合成は、脳型情報処理の利点を最大限に活かした革新的アーキテクチャです。疎な発火活動と膜電位積分により、従来の深層学習モデルを凌駕する電力効率と実時間性を達成します。"
+        var longText = ""
+        while longText.count < 1200 {
+            longText += baseParagraph
+        }
+
+        print("   テストテキスト長: \(longText.count) 文字 (1,000文字超)")
+        let engine = SpikeSpeechEngine()
+        let rssBefore = getResidentMemoryBytes()
+
+        let tStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let wavData = engine.synthesizeWav(text: longText)
+        let tEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+
+        let elapsed = Double(tEnd - tStart) / 1_000_000_000.0
+        let audioSamples = max(0, (wavData.count - 44) / 2)
+        let audioDuration = Double(audioSamples) / Double(AudioConfig.sampleRate)
+        let rtf = elapsed / max(1e-6, audioDuration)
+        let rssAfter = getResidentMemoryBytes()
+
+        let rssDeltaMB = Double(Int64(rssAfter) - Int64(rssBefore)) / (1024.0 * 1024.0)
+        let charsPerSec = Double(longText.count) / elapsed
+
+        print("   合成処理時間:     \(String(format: "%.4f", elapsed)) 秒")
+        print("   生成音声実時間:   \(String(format: "%.4f", audioDuration)) 秒")
+        print("   Real-Time Factor: \(String(format: "%.4f", rtf))")
+        print("   文字スループット: \(String(format: "%.1f", charsPerSec)) 文字/秒")
+        print("   常駐メモリ増分:   \(String(format: "%.2f", rssDeltaMB)) MB")
         print("----------------------------------------------------------")
     }
 

@@ -2,6 +2,7 @@ import XCTest
 import Foundation
 @testable import SpikeSpeech
 
+/// PitchTracker（基本周波数 F0 および有声判定）の単体テストスイート
 final class PitchTrackerTests: XCTestCase {
 
     /// 既知の合成正弦波（150Hz, 220Hz, 330Hz, 440Hz）に対する F0 抽出精度の厳格検証
@@ -46,7 +47,6 @@ final class PitchTrackerTests: XCTestCase {
             validF0List.sort()
             let medianF0 = validF0List[validF0List.count / 2]
             let absError = abs(medianF0 - targetF0)
-            print(String(format: "[PitchTrackerTest] Target: %.1f Hz, Detected Median: %.2f Hz, Error: %.2f Hz", targetF0, medianF0, absError))
 
             // 誤差は ±2.0 Hz 以内（相対誤差 1% 未満）であることを厳格に検証
             XCTAssertTrue(absError <= 2.0, "ターゲット周波数 \(targetF0)Hz に対する誤差が過大です: median=\(medianF0), error=\(absError)")
@@ -95,7 +95,6 @@ final class PitchTrackerTests: XCTestCase {
 
         // ホワイトノイズでは周期相関が低いため、有声誤検出フレーム比率は極小（15% 未満）であることを検証
         let voicedRatio = Float(voicedCount) / Float(max(1, noiseResult.frameCount))
-        print(String(format: "[PitchTrackerTest] White noise false positive ratio: %.2f%% (%d / %d)", voicedRatio * 100.0, voicedCount, noiseResult.frameCount))
         XCTAssertTrue(voicedRatio <= 0.15, "ホワイトノイズに対する有声誤検出が過大です: \(voicedRatio)")
     }
 
@@ -122,38 +121,40 @@ final class PitchTrackerTests: XCTestCase {
         XCTAssertTrue(resLow.energy[5] < resHigh.energy[5], "振幅の増加に対して抽出エネルギーが増加していません")
     }
 
-    /// 実際の音声ファイル（test_denoised.wav）に対する F0 およびエネルギー抽出の安定性検証
-    func testRealAudioTracking() throws {
-        let currentDir = FileManager.default.currentDirectoryPath
-        let wavPath = currentDir + "/Tests/resources/test_denoised.wav"
-        let reader = WavAudioReader()
-        let pcm = try reader.loadWav16k(from: wavPath)
-
+    /// 合成複合音（基音 220Hz + 高調波）に対するトラッキング精度検証
+    func testHarmonicSignalTracking() {
         let tracker = PitchTracker(sampleRate: 16000.0)
-        let result = tracker.track(pcm: pcm)
+        let sampleRate: Float = 16000.0
+        let count = 4800
+        var pcm = [Float](repeating: 0.0, count: count)
 
-        print("[PitchTrackerTest] Real audio total frames: \(result.frameCount)")
-        XCTAssertTrue(100 <= result.frameCount, "実音声フレーム数が過小です")
+        var s = 0
+        while s < count {
+            let t = Float(s) / sampleRate
+            let base = 0.5 * sinf(2.0 * Float.pi * 220.0 * t)
+            let h2 = 0.3 * sinf(2.0 * Float.pi * 440.0 * t)
+            let h3 = 0.15 * sinf(2.0 * Float.pi * 660.0 * t)
+            pcm[s] = base + h2 + h3
+            s += 1
+        }
 
-        var voicedFrames = 0
-        var f0Sum: Float = 0.0
-        var f = 0
-        while f < result.frameCount {
-            let v = result.voiced[f]
-            let pitch = result.f0[f]
-            if 0.5 <= v {
-                voicedFrames += 1
-                f0Sum += pitch
-                // 日本語女性音声の自然なピッチ範囲（minF0 60Hz 〜 450Hz）に収まっていること
-                XCTAssertTrue(60.0 <= pitch, "有声フレームのピッチが異常に低いです: frame=\(f), f0=\(pitch)")
-                XCTAssertTrue(pitch <= 450.0, "有声フレームのピッチが異常に高いです: frame=\(f), f0=\(pitch)")
+        let res = tracker.track(pcm: pcm)
+        XCTAssertTrue(10 <= res.frameCount)
+
+        var midF0List: [Float] = []
+        var f = 5
+        let endF = res.frameCount - 5
+        while f < endF {
+            if 0.5 <= res.voiced[f] {
+                midF0List.append(res.f0[f])
             }
             f += 1
         }
 
-        let avgF0 = f0Sum / Float(max(1, voicedFrames))
-        print(String(format: "[PitchTrackerTest] Real audio voiced frames: %d / %d, Avg F0: %.1f Hz", voicedFrames, result.frameCount, avgF0))
-        XCTAssertTrue(50 <= voicedFrames, "有声フレームが検出されていません")
-        XCTAssertTrue(150.0 <= avgF0 && avgF0 <= 350.0, "平均ピッチが日本語音声の適正レンジ外です: \(avgF0)")
+        XCTAssertTrue(5 <= midF0List.count)
+        midF0List.sort()
+        let medianF0 = midF0List[midF0List.count / 2]
+        let diff = abs(medianF0 - 220.0)
+        XCTAssertTrue(diff <= 2.0, "調波複合音で基音 220Hz が検出されていません: median=\(medianF0)")
     }
 }

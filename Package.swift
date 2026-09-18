@@ -27,6 +27,10 @@ let package = Package(
             name: "benchmark",
             targets: ["benchmark"]
         ),
+        .executable(
+            name: "e2etest",
+            targets: ["e2etest"]
+        ),
     ],
     dependencies: [],
     targets: [
@@ -65,6 +69,14 @@ let package = Package(
             ],
             path: "script/benchmark"
         ),
+        .executableTarget(
+            name: "e2etest",
+            dependencies: [
+                "SpikeSpeech",
+                "SpikeSpeechWeb"
+            ],
+            path: "script/e2etest"
+        ),
     ]
 )
 #else
@@ -84,6 +96,10 @@ var products: [Product] = [
     .executable(
         name: "benchmark",
         targets: ["benchmark"]
+    ),
+    .executable(
+        name: "e2etest",
+        targets: ["e2etest"]
     ),
     .library(
         name: "SpikeSpeechWeb",
@@ -135,6 +151,15 @@ var targets: [Target] = [
             "SpikeSpeech"
         ],
         path: "script/benchmark"
+    ),
+    .executableTarget(
+        name: "e2etest",
+        dependencies: [
+            "SpikeSpeech",
+            "SpikeSpeechWeb",
+            .product(name: "MLX", package: "mlx-swift")
+        ],
+        path: "script/e2etest"
     ),
     .executableTarget(
         name: "spikespeech-web",
