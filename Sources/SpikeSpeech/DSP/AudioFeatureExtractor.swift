@@ -177,7 +177,7 @@ public final class WavAudioReader: @unchecked Sendable {
             return pcm
         }
 
-        // JSUT basic5000 の標準サンプリングレート 48kHz では、
+        // 48kHz 音声データでは、
         // 3 サンプル移動平均によるローパスフィルタを適用してエイリアシング歪みを防止する
         if sourceSampleRate == 48000 {
             let outCount = pcm.count / 3
@@ -232,7 +232,7 @@ public enum WavAudioError: Error, Equatable {
 /// 64 チャンネル対数 Mel スペクトログラム抽出器
 ///
 /// STFT 短時間フーリエ変換および Mel フィルタバンクにより、
-/// MelToLPC の逆写像行列と厳密に同一の周波数ビン配置を持つ音響特徴量を抽出する。
+/// NeuralVocoder と厳密に同一の周波数ビン配置を持つ音響特徴量を抽出する。
 public final class MelSpectrogramExtractor: @unchecked Sendable {
 
     public let fftSize: Int
@@ -330,7 +330,7 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
         self.window = win
 
         // 3. Mel フィルタバンク重み行列の事前計算
-        // MelToLPC の周波数ビン配置と完全に一致させ、相互変換の整合性を保証する
+        // NeuralVocoder の周波数ビン配置と完全に一致させ、相互変換の整合性を保証する
         let minMel: Float = 0.0
         let maxFreq = sampleRate * 0.5
         let maxMel = 2595.0 * log10(1.0 + (maxFreq / 700.0))
@@ -495,8 +495,8 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
                 }
 
                 // なぜ下限値を 3.8e-4 (logf ≈ -7.88) に設定するか:
-                // PhonemeAcousticPrior の無音・ノイズフロア（3.8e-4）と厳密に一致させることで、
-                // 実録音の無音区間やフォールバック無音において Prior と Mel 抽出の床を揃え、
+                // 音響モデルの無音・ノイズフロア（3.8e-4）と厳密に一致させることで、
+                // 実録音の無音区間やフォールバック無音において音響抽出の床を揃え、
                 // 無音フレームでの過大な負の残差による勾配汚染を完全に根絶するため。
                 var clamped = melEnergy
                 if clamped.isFinite != true || clamped < 3.8e-4 {

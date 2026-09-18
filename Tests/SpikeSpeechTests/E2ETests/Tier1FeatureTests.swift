@@ -6,8 +6,9 @@ import MLX
 /// Tier 1: 機能網羅テストスイート
 ///
 /// SpikeSpeech の全構成要素（形態素解析、読み正規化、トークナイズ、Duration展開、アクセント/F0、
-/// ボコーダー、MelToLPC、WAV、DSP安全機構、SNNデコーダー、BPTT学習、推論HotPath、多層SNN重み構造、
-/// 基準音声生成、CLIスイート、E2E合成パイプライン）の代表的正常系挙動を決定論的に検証する。
+/// NeuralVocoder、WAV、DSP安全機構、SNNデコーダー、BPTT学習、推論HotPath、多層SNN重み構造、
+/// キャッシュ局所性、低遅延ストリーミング、音声データ、CLIツールなど
+/// 単機能およびアルゴリズムの独立した振る舞いを厳密に検証する。
 final class Tier1FeatureTests: XCTestCase {
 
     private var engine: SpikeSpeechEngine!
@@ -16,9 +17,7 @@ final class Tier1FeatureTests: XCTestCase {
     private var vocabulary: PhonemeVocabulary!
     private var prosodyModel: ProsodyModel!
     private var lengthRegulator: LengthRegulator!
-    private var vocoder: LPCVocoder!
-    private var melToLPC: MelToLPC!
-    private var generator: SyntheticAudioGenerator!
+    private var vocoder: NeuralVocoder!
 
     override func setUp() {
         super.setUp()
@@ -28,9 +27,7 @@ final class Tier1FeatureTests: XCTestCase {
         self.vocabulary = PhonemeVocabulary()
         self.prosodyModel = ProsodyModel()
         self.lengthRegulator = LengthRegulator(hiddenDimension: 128)
-        self.vocoder = LPCVocoder()
-        self.melToLPC = MelToLPC()
-        self.generator = SyntheticAudioGenerator()
+        self.vocoder = NeuralVocoder()
         self.engine = SpikeSpeechEngine()
     }
 
@@ -313,18 +310,13 @@ final class Tier1FeatureTests: XCTestCase {
         }
     }
 
-    // MARK: - F6: Source-Filter LPC ボコーダー (5ケース以上)
+    // MARK: - F6: NeuralVocoder 直接波形合成 (5ケース以上)
 
-    func testF6_Vocoder_VoicedSynthesis() {
-        // Rosenberg パルス励起と AR 声道フィルタの畳み込みにより安定した周期波形が生成されることを検証する。
+    func testF6_Vocoder_BasicSynthesis() {
+        // 対数 Mel フレーム系列から 16kHz PCM が正確なサンプル数（フレーム数 × 160）で生成されることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.05, count: 16),
-            gain: 0.1,
-            pitchF0: 150.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame, frame])
+        let melFrame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [melFrame, melFrame])
         XCTAssertEqual(samples.count, 320)
         var energy: Float = 0.0
         var i = 0
@@ -335,57 +327,35 @@ final class Tier1FeatureTests: XCTestCase {
         XCTAssertTrue(0.0 < energy)
     }
 
-    func testF6_Vocoder_UnvoicedSynthesis() {
-        // Xorshift64 ノイズ励起によって非周期・広帯域な信号が生成されることを検証する。
+    func testF6_Vocoder_ZeroMelSynthesis() {
+        // ゼロ値の対数 Mel フレーム入力に対しても有限な波形が出力され、発散しないことを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.02, count: 16),
-            gain: 0.1,
-            pitchF0: 0.0,
-            voiced: 0.0
-        )
-        let samples = vocoder.synthesize(frames: [frame, frame])
+        let zeroFrame = [Float](repeating: 0.0, count: 64)
+        let samples = vocoder.synthesize(mel: [zeroFrame, zeroFrame])
         XCTAssertEqual(samples.count, 320)
-        var energy: Float = 0.0
         var i = 0
         while i < samples.count {
-            energy += samples[i] * samples[i]
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
-        XCTAssertTrue(0.0 < energy)
     }
 
     func testF6_Vocoder_LinearInterpolation() {
-        // ゲインや係数が急変する2フレーム間でサンプル値が不連続なステップ破綻を起こさないことを検証する。
+        // スペクトルが急変する2フレーム間でも不連続な発散を起こさず有限な波形が連続生成されることを検証する。
         vocoder.reset()
-        let frame1 = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.01, count: 16),
-            gain: 0.05,
-            pitchF0: 120.0,
-            voiced: 1.0
-        )
-        let frame2 = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.05, count: 16),
-            gain: 0.2,
-            pitchF0: 180.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame1, frame2])
+        let frame1 = [Float](repeating: -5.0, count: 64)
+        let frame2 = [Float](repeating: 1.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame1, frame2])
         XCTAssertEqual(samples.count, 320)
         XCTAssertTrue(samples[159].isFinite)
         XCTAssertTrue(samples[160].isFinite)
     }
 
     func testF6_Vocoder_SignalEnergyAndLimits() {
-        // Soft Limiter の適用により出力サンプルが [-1.0, 1.0] に収まることを検証する。
+        // tanh 等のリミッター適用により出力サンプル値が [-1.0, 1.0] に安全に収まることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.05, count: 16),
-            gain: 0.5,
-            pitchF0: 140.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let loudFrame = [Float](repeating: 10.0, count: 64)
+        let samples = vocoder.synthesize(mel: [loudFrame])
         var i = 0
         while i < samples.count {
             XCTAssertTrue(-1.0 <= samples[i])
@@ -395,75 +365,82 @@ final class Tier1FeatureTests: XCTestCase {
     }
 
     func testF6_Vocoder_ResetState() {
-        // reset() 呼び出しによって残響と内部レジスタが完全に初期化されることを検証する。
+        // reset() 呼び出しによって内部バッファが初期化され、過去フレームの残響汚染が残らないことを検証する。
         vocoder.reset()
-        let frameSilent = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.0, count: 16),
-            gain: 0.0,
-            pitchF0: 0.0,
-            voiced: 0.0
-        )
-        let samples = vocoder.synthesize(frames: [frameSilent])
+        let loudFrame = [Float](repeating: 5.0, count: 64)
+        _ = vocoder.synthesize(mel: [loudFrame])
+        vocoder.reset()
+        let silentFrame = [Float](repeating: -10.0, count: 64)
+        let samples = vocoder.synthesize(mel: [silentFrame])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
         while i < samples.count {
-            XCTAssertEqual(samples[i], 0.0)
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    // MARK: - F7: Mel/スペクトル反転アルゴリズム (5ケース以上)
+    // MARK: - F7: NeuralVocoder 構造・話者適応検証 (5ケース以上)
 
-    func testF7_MelToLPC_LogMelConversion() {
-        // 64ch の対数 Mel スペクトルから Levinson-Durbin により安定した 16次 LPC 係数が導出されることを検証する。
-        let logMel = [Float](repeating: -2.0, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: logMel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(0.0 < gain)
+    func testF7_Vocoder_HiddenChannels256() {
+        // Wave 1 仕様に従い NeuralVocoderConfig の hiddenChannels が 256 であることを検証する。
+        let config = NeuralVocoderConfig()
+        XCTAssertEqual(config.hiddenChannels, 256)
+    }
+
+    func testF7_Vocoder_SpeakerConditioning() {
+        // SpeakerConditioning を指定した合成で有限な PCM サンプルが正しく得られることを検証する。
+        vocoder.reset()
+        let cond = SpeakerConditioning(embedding: [Float](repeating: 0.1, count: 128))
+        let melFrame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [melFrame], speaker: cond)
+        XCTAssertEqual(samples.count, 160)
         var i = 0
-        while i < coeffs.count {
-            XCTAssertTrue(coeffs[i].isFinite)
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF7_MelToLPC_LinearMelConversion() {
-        // 線形エネルギー表現の Mel 特徴量からも破綻なくゲインと LPC 係数が計算できることを検証する。
-        let linMel = [Float](repeating: 0.1, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: linMel, isLogMel: false, outCoeffs: &coeffs)
-        XCTAssertTrue(0.0 < gain)
+    func testF7_Vocoder_MultiFrameSynthesis() {
+        // 長いフレーム系列（10フレーム）に対して厳密に 1600 サンプルの連続 PCM が生成されることを検証する。
+        vocoder.reset()
+        let frames = [[Float]](repeating: [Float](repeating: -1.0, count: 64), count: 10)
+        let samples = vocoder.synthesize(mel: frames)
+        XCTAssertEqual(samples.count, 1600)
     }
 
-    func testF7_MelToLPC_AutoCorrelationProperties() {
-        // パワースペクトルの IDCT から得られる自己相関 r0 が正の実数であり全帯域エネルギーを反映することを検証する。
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let mel = [Float](repeating: -1.0, count: 64)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(1e-5 < gain)
-    }
-
-    func testF7_MelToLPC_StabilityReflectionCoeffs() {
-        // Levinson-Durbin の内部反射係数 ki が [-0.999, 0.999] に抑えられ発散しないことを検証する。
-        var sharpMel = [Float](repeating: -10.0, count: 64)
-        sharpMel[10] = 5.0 // 極端な鋭いピーク
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: sharpMel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(gain.isFinite)
+    func testF7_Vocoder_DeterministicSynthesis() {
+        // 同一の Mel 入力系列に対して、リセット後の合成結果がビット完全で決定論的に一致することを検証する。
+        vocoder.reset()
+        let frames = [[Float]](repeating: [Float](repeating: -2.0, count: 64), count: 3)
+        let run1 = vocoder.synthesize(mel: frames)
+        vocoder.reset()
+        let run2 = vocoder.synthesize(mel: frames)
+        XCTAssertEqual(run1.count, run2.count)
         var i = 0
-        while i < coeffs.count {
-            XCTAssertTrue(coeffs[i].isFinite)
-            XCTAssertTrue(abs(coeffs[i]) < 10.0)
+        while i < run1.count {
+            XCTAssertEqual(run1[i], run2[i])
             i += 1
         }
     }
 
-    func testF7_MelToLPC_BandwidthExpansion() {
-        // 出力 LPC 係数に帯域幅拡大係数ガンマのべき乗が適用され高次係数が適切に減衰していることを検証する。
-        let mel = [Float](repeating: -3.0, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(gain.isFinite)
-        XCTAssertTrue(coeffs[15].isFinite)
+    func testF7_Vocoder_EnergyScaling() {
+        // 異なるエネルギースケールを与えた場合に振幅が追従して制御されることを検証する。
+        let profileLow = VoiceProfile(name: "low", baseF0: 220.0, energyScale: 0.2)
+        let profileHigh = VoiceProfile(name: "high", baseF0: 220.0, energyScale: 1.5)
+        let lowSamples = engine.synthesize(text: "あ", voice: profileLow)
+        let highSamples = engine.synthesize(text: "あ", voice: profileHigh)
+        var lowEnergy: Float = 0.0
+        var highEnergy: Float = 0.0
+        var i = 0
+        let count = min(lowSamples.count, highSamples.count)
+        while i < count {
+            lowEnergy += lowSamples[i] * lowSamples[i]
+            highEnergy += highSamples[i] * highSamples[i]
+            i += 1
+        }
+        XCTAssertTrue(lowEnergy <= highEnergy)
     }
 
     // MARK: - F8: Pure Swift WAV エンコーダー (5ケース以上)
@@ -570,19 +547,17 @@ final class Tier1FeatureTests: XCTestCase {
     }
 
     func testF9_Safety_NaNInfGuards() {
-        // ボコーダーに非有限値（NaN, ±Inf）が渡された際、異常終了せずにゼロクリアで安全復旧することを検証する。
+        // ボコーダーに非有限値（NaN, ±Inf）が渡された際、異常終了せずに有限値で安全復旧することを検証する。
         vocoder.reset()
-        let nanFrame = AcousticFrame(
-            lpcCoefficients: [Float.nan, 0.0],
-            gain: Float.infinity,
-            pitchF0: 100.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [nanFrame])
+        var nanMel = [Float](repeating: 0.0, count: 64)
+        nanMel[0] = Float.nan
+        nanMel[1] = Float.infinity
+        nanMel[2] = -Float.infinity
+        let samples = vocoder.synthesize(mel: [nanMel])
         XCTAssertEqual(samples.count, 160)
         var i = 0
         while i < samples.count {
-            XCTAssertEqual(samples[i], 0.0)
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
@@ -931,63 +906,70 @@ final class Tier1FeatureTests: XCTestCase {
         }
     }
 
-    // MARK: - F14: 基準音声データ自動生成器 (5ケース以上)
+    // MARK: - F14: NeuralVocoder 音響合成特性 (5ケース以上)
 
-    func testF14_Synthetic_FiveVowelsSynthesis() {
-        // a, i, u, e, o の各母音がホルマント周波数設定に従って合成され、有限エネルギーを持つことを検証する。
-        let vowels: [SyntheticAudioGenerator.Vowel] = [.a, .i, .u, .e, .o]
-        var v = 0
-        while v < vowels.count {
-            let samples = generator.generateVowel(vowel: vowels[v], durationSeconds: 0.1, f0: 140.0)
-            XCTAssertTrue(0 < samples.count)
-            XCTAssertTrue(samples[0].isFinite)
-            v += 1
+    func testF14_NeuralVocoder_FrequencyModulation() {
+        // 周波数変調された Mel フレーム系列から有限エネルギーの音声サンプルが生成されることを検証する。
+        vocoder.reset()
+        var frames: [[Float]] = []
+        var t = 0
+        while t < 5 {
+            var frame = [Float](repeating: -3.0, count: 64)
+            frame[t * 10] = 2.0
+            frames.append(frame)
+            t += 1
         }
-    }
-
-    func testF14_Synthetic_ChirpWaveGeneration() {
-        // 20Hz から 8000Hz への周波数スイープ波形が所定のサンプル数で生成されることを検証する。
-        let chirp = generator.generateChirp(startFreq: 20.0, endFreq: 4000.0, durationSeconds: 0.1)
-        XCTAssertEqual(chirp.count, 1600)
+        let samples = vocoder.synthesize(mel: frames)
+        XCTAssertEqual(samples.count, 800)
         var i = 0
-        while i < chirp.count {
-            XCTAssertTrue(-1.0 <= chirp[i])
-            XCTAssertTrue(chirp[i] <= 1.0)
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF14_Synthetic_ImpulseTrainGeneration() {
-        // ピッチ周期ごとに厳密にデルタパルスが配置されることを検証する。
-        let impulses = generator.generateImpulseTrain(f0: 100.0, durationSeconds: 0.05)
-        XCTAssertEqual(impulses.count, 800)
-        XCTAssertEqual(impulses[0], 1.0)
-        XCTAssertEqual(impulses[160], 1.0)
-        XCTAssertEqual(impulses[1], 0.0)
-    }
-
-    func testF14_Synthetic_WhiteNoiseGeneration() {
-        // 指定振幅範囲内に均一に分散するノイズ波形が生成されることを検証する。
-        let noise = generator.generateWhiteNoise(durationSeconds: 0.05, amplitude: 0.4)
-        XCTAssertEqual(noise.count, 800)
+    func testF14_NeuralVocoder_SingleFrame() {
+        // 1フレーム（160サンプル）の合成が正確な長さで実行されることを検証する。
+        vocoder.reset()
+        let frame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
-        while i < noise.count {
-            XCTAssertTrue(-0.4 <= noise[i])
-            XCTAssertTrue(noise[i] <= 0.4)
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF14_Synthetic_StandardCorpusGeneration() {
-        // 5 つの代表フレーズに対する擬似正解音声データセットが外部依存なしにオンデマンド生成されることを検証する。
-        let corpus = generator.generateStandardCorpus()
-        XCTAssertEqual(corpus.count, 5)
-        var c = 0
-        while c < corpus.count {
-            XCTAssertTrue(0 < corpus[c].text.count)
-            XCTAssertTrue(0 < corpus[c].samples.count)
-            c += 1
+    func testF14_NeuralVocoder_EmptyFrames() {
+        // 空の Mel フレーム配列を渡した際、クラッシュせずに空配列が返ることを検証する。
+        vocoder.reset()
+        let samples = vocoder.synthesize(mel: [])
+        XCTAssertEqual(samples.count, 0)
+    }
+
+    func testF14_NeuralVocoder_ExtremeMelClamping() {
+        // 極端に大きな Mel 入力に対しても出力振幅が安全にクリッピングされることを検証する。
+        vocoder.reset()
+        let loudFrame = [Float](repeating: 50.0, count: 64)
+        let samples = vocoder.synthesize(mel: [loudFrame])
+        XCTAssertEqual(samples.count, 160)
+        var i = 0
+        while i < samples.count {
+            XCTAssertTrue(-1.0 <= samples[i])
+            XCTAssertTrue(samples[i] <= 1.0)
+            i += 1
         }
+    }
+
+    func testF14_NeuralVocoder_ConsecutiveInference() {
+        // 連続して推論を行っても内部バッファの再利用によりクラッシュや数値異常が発生しないことを検証する。
+        vocoder.reset()
+        let frame = [Float](repeating: -1.0, count: 64)
+        let samples1 = vocoder.synthesize(mel: [frame, frame])
+        let samples2 = vocoder.synthesize(mel: [frame, frame])
+        XCTAssertEqual(samples1.count, 320)
+        XCTAssertEqual(samples2.count, 320)
     }
 
     // MARK: - F15: CLI ツールスイート (5ケース以上)
@@ -998,10 +980,10 @@ final class Tier1FeatureTests: XCTestCase {
     }
 
     func testF15_CLI_TrainCLIFlow() {
-        let pair = generator.generateStandardCorpus()[0]
+        let text = "こんにちは"
         let feat = engine.encodeLinguisticFeatures(
             features: engine.lengthRegulator.processText(
-                text: pair.text,
+                text: text,
                 normalizer: engine.normalizer,
                 prosodyModel: engine.prosodyModel,
                 vocabulary: engine.vocabulary

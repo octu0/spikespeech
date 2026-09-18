@@ -360,6 +360,13 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
 
     /// 保存済み重みをネットワークへインポートする
     public func importWeights(from weights: NeuralVocoderWeights) {
+        // なぜ hiddenChannels の不一致を検査してインポートを破棄するか:
+        // 旧 64ch など異次元構造の重みインポートによるテンソル形状破壊・クラッシュを未然に防止するため。
+        if weights.config.hiddenChannels != self.config.hiddenChannels {
+            print("[MLXNeuralVocoder] 警告: 指定された重みの hiddenChannels (\(weights.config.hiddenChannels)) がモデル (\(self.config.hiddenChannels)) と一致しません。インポートを拒否します。")
+            return
+        }
+
         let hCh = weights.config.hiddenChannels
 
         func updateLayer(_ mod: Module, weight: [Float], weightShape: [Int], bias: [Float], biasShape: [Int]) {

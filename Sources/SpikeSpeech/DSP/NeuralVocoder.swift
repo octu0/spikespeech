@@ -3,7 +3,7 @@ import Foundation
 /// 現代的ニューラルボコーダー（Neural Vocoder）の設定パラメータ
 ///
 /// サンプリングレート、フレーム幅（Hop Size）、Mel チャンネル数、および
-/// 隠れ層チャンネル数（64ch）と多重受容野（MRF）畳み込み構造を一元管理し、
+/// 隠れ層チャンネル数（256ch）と多重受容野（MRF）畳み込み構造を一元管理し、
 /// 音響モデルおよび MLX 学習基盤との整合性を保証する。
 public struct NeuralVocoderConfig: Sendable, Codable, Equatable {
     /// 音声サンプリングレート [Hz] (16,000 Hz)
@@ -12,18 +12,17 @@ public struct NeuralVocoderConfig: Sendable, Codable, Equatable {
     public let hopSize: Int
     /// 入力 Mel スペクトログラムの周波数チャンネル数 (64ch)
     public let melChannels: Int
-    /// 隠れ層特徴量チャンネル数 (64ch)
-    /// なぜ 64ch に設定するか:
-    /// 16ch の玩具規模では 64ch Mel の音響情報・フォルマント包絡を保持できず、
-    /// 64ch かつ SIMD8（8 レーン）ベクトル演算との整合性を最大化し、
-    /// 高速な Pure Swift 推論と豊かな肉声表現力を両立するため。
+    /// 隠れ層特徴量チャンネル数 (256ch)
+    /// なぜ 256ch に設定するか:
+    /// 音響情報および Mel スペクトル包絡・微細時間構造を十分に保持し、
+    /// 高速な Pure Swift SIMD8 タイル推論と自然で豊かな肉声表現力を両立するため。
     public let hiddenChannels: Int
 
     public init(
         sampleRate: Int = AudioConfig.sampleRate,
         hopSize: Int = AudioConfig.hopSize,
         melChannels: Int = AudioConfig.melChannels,
-        hiddenChannels: Int = 64
+        hiddenChannels: Int = 256
     ) {
         self.sampleRate = sampleRate
         self.hopSize = hopSize
@@ -96,10 +95,6 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
     public let convPostWeight: [Float]
     public let convPostBias: [Float]
 
-    /// 後方互換性用（推論では未使用）
-    public let harmonicWeight: [Float]
-    public let harmonicBias: Float
-
     public init(
         config: NeuralVocoderConfig = NeuralVocoderConfig(),
         convPreWeight: [Float],
@@ -135,9 +130,7 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
         res6Conv2Weight: [Float],
         res6Conv2Bias: [Float],
         convPostWeight: [Float],
-        convPostBias: [Float],
-        harmonicWeight: [Float] = [],
-        harmonicBias: Float = 0.0
+        convPostBias: [Float]
     ) {
         self.config = config
         self.convPreWeight = convPreWeight
@@ -174,8 +167,6 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
         self.res6Conv2Bias = res6Conv2Bias
         self.convPostWeight = convPostWeight
         self.convPostBias = convPostBias
-        self.harmonicWeight = harmonicWeight
-        self.harmonicBias = harmonicBias
     }
 
     /// 決定論的疑似乱数による初期重みの生成
@@ -371,7 +362,6 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
 
 /// 現代的ニューラルボコーダー（Neural Vocoder）Pure Swift 推論エンジン
 ///
-/// 従来の音響物理共鳴器（カスケード IIR フィルタ）や Rosenberg 声門パルス潜在加算を完全撤廃し、
 /// 64チャンネル絶対 log-Mel スペクトログラムおよび連続 F0 / 有声フラグから、
 /// 多重受容野（MRF: kernel 3, 7 × dilation 1, 3）残差ブロックと階層的転置畳み込みアップサンプリング
 /// （10x, 4x, 4x = 160倍）によって直接時間領域 16kHz PCM 波形を高速生成する。
@@ -394,16 +384,19 @@ public final class NeuralVocoder: @unchecked Sendable {
     private var bufR5: [Float] = []
     private var bufR6: [Float] = []
 
-    // NSF (Neural Source-Filter) 位相蓄積器、乱流気流ノイズ乱数シード、および平滑化包絡線
-    private var phase: Float = 0.0
-    private var noiseRng: UInt32 = 20260917
-    private var smoothEnv: Float = 0.0
-
     public init(weights: NeuralVocoderWeights? = nil) {
         let w: NeuralVocoderWeights
         switch weights {
         case .some(let explicit):
-            w = explicit
+            if explicit.config.hiddenChannels != 256 {
+                // なぜ旧 64ch 重みを破棄して 256ch 初期重みへフォールバックするか:
+                // 256ch 構造との不整合によるテンソル次元破壊および推論時クラッシュを防ぎ、
+                // 安全にフォールバック動作を成立させるため。
+                print("[NeuralVocoder] 警告: 指定されたボコーダー重みの hiddenChannels (\(explicit.config.hiddenChannels)) が 256 と一致しないため、破棄し 256ch の初期重みを使用します。")
+                w = NeuralVocoderWeights.randomWeights(config: NeuralVocoderConfig(hiddenChannels: 256))
+            } else {
+                w = explicit
+            }
         case .none:
             let defaultVocoderPath = "Models/vocoder_weights.json"
             var loaded: NeuralVocoderWeights? = nil
@@ -414,9 +407,14 @@ public final class NeuralVocoder: @unchecked Sendable {
             }
             switch loaded {
             case .some(let vw):
-                w = vw
+                if vw.config.hiddenChannels != 256 {
+                    print("[NeuralVocoder] 警告: \(defaultVocoderPath) の hiddenChannels (\(vw.config.hiddenChannels)) が 256 と一致しないため、ロードを破棄し 256ch の初期重みを使用します。再学習が必要です。")
+                    w = NeuralVocoderWeights.randomWeights(config: NeuralVocoderConfig(hiddenChannels: 256))
+                } else {
+                    w = vw
+                }
             case .none:
-                w = NeuralVocoderWeights.randomWeights()
+                w = NeuralVocoderWeights.randomWeights(config: NeuralVocoderConfig(hiddenChannels: 256))
             }
         }
         self.weights = w
@@ -425,9 +423,6 @@ public final class NeuralVocoder: @unchecked Sendable {
 
     /// 内部推論バッファのリセット
     public func reset() {
-        phase = 0.0
-        noiseRng = 20260917
-        smoothEnv = 0.0
     }
 
     @inline(__always)
@@ -442,14 +437,9 @@ public final class NeuralVocoder: @unchecked Sendable {
 
     /// 1D 畳み込み演算（ゼロパディングおよび膨張係数 Dilation 対応）
     ///
-    /// なぜ Dilation（膨張畳み込み）を導入するか:
-    /// パラメータ数および積和演算量を増加させることなく受容野を指数関数的に拡大し、
-    /// 16kHz PCM におけるピッチ周期（40〜160サンプル）と音韻遷移の微細時間構造を完全にカバーするため。
-    /// 1D 畳み込み演算（ゼロパディングおよび膨張係数 Dilation 対応）
-    ///
-    /// なぜ境界領域と内部領域を分離（Hoist）し 64ch 展開を行うか:
-    /// ループ深部から if 条件分岐を完全排除し、Hot Path 指針（ボイラープレートを恐れず内部・境界分離）に
-    /// 従い、dotProduct64 の SIMD8 デュアルアキュムレータと組み合わせて演算スループットを最大化するため。
+    /// なぜ境界領域と内部領域を分離（Hoist）するか:
+    /// ループ深部から if 条件分岐を完全排除し、Hot Path 指針に従い
+    /// VectorOperations.dotProduct の SIMD8 タイルと組み合わせて演算スループットを最大化するため。
     private static func conv1d(
         input: UnsafePointer<Float>,
         output: UnsafeMutablePointer<Float>,
@@ -498,123 +488,32 @@ public final class NeuralVocoder: @unchecked Sendable {
             t += 1
         }
 
-        // 2. 内部領域（innerStart <= t < innerEnd）: 条件分岐完全排除
-        if inC == 64 {
-            switch (kernel, outC) {
-            case (3, 64):
-                let d0 = 0 - padding
-                let d1 = dilation - padding
-                let d2 = (2 * dilation) - padding
-                while t < innerEnd {
-                    let inK0 = SIMD64Float(from: input.advanced(by: (t + d0) * 64))
-                    let inK1 = SIMD64Float(from: input.advanced(by: (t + d1) * 64))
-                    let inK2 = SIMD64Float(from: input.advanced(by: (t + d2) * 64))
-                    let outRow = t * 64
-                    var c = 0
-                    while c < 64 {
-                        let wRow = c * 192
-                        var sum = bias[c]
-                        sum += inK0.dot(with: weights.advanced(by: wRow))
-                        sum += inK1.dot(with: weights.advanced(by: wRow + 64))
-                        sum += inK2.dot(with: weights.advanced(by: wRow + 128))
-                        if applyActivation {
-                            sum = leakyRelu(sum)
-                        }
-                        output[outRow + c] = sum
-                        c += 1
-                    }
-                    t += 1
+        // 2. 内部領域（innerStart <= t < innerEnd）: 境界検査ゼロ
+        while t < innerEnd {
+            let outRow = t * outC
+            var c = 0
+            while c < outC {
+                var sum = bias[c]
+                let wRow = c * kernel * inC
+                var k = 0
+                while k < kernel {
+                    let inT = t + (k * dilation) - padding
+                    let inRow = inT * inC
+                    let wOffset = wRow + (k * inC)
+                    sum += VectorOperations.dotProduct(
+                        a: input.advanced(by: inRow),
+                        b: weights.advanced(by: wOffset),
+                        count: inC
+                    )
+                    k += 1
                 }
-            case (7, 64):
-                let d0 = 0 - padding
-                let d1 = dilation - padding
-                let d2 = (2 * dilation) - padding
-                let d3 = (3 * dilation) - padding
-                let d4 = (4 * dilation) - padding
-                let d5 = (5 * dilation) - padding
-                let d6 = (6 * dilation) - padding
-                while t < innerEnd {
-                    let inK0 = SIMD64Float(from: input.advanced(by: (t + d0) * 64))
-                    let inK1 = SIMD64Float(from: input.advanced(by: (t + d1) * 64))
-                    let inK2 = SIMD64Float(from: input.advanced(by: (t + d2) * 64))
-                    let inK3 = SIMD64Float(from: input.advanced(by: (t + d3) * 64))
-                    let inK4 = SIMD64Float(from: input.advanced(by: (t + d4) * 64))
-                    let inK5 = SIMD64Float(from: input.advanced(by: (t + d5) * 64))
-                    let inK6 = SIMD64Float(from: input.advanced(by: (t + d6) * 64))
-                    let outRow = t * 64
-                    var c = 0
-                    while c < 64 {
-                        let wRow = c * 448
-                        var sum = bias[c]
-                        sum += inK0.dot(with: weights.advanced(by: wRow))
-                        sum += inK1.dot(with: weights.advanced(by: wRow + 64))
-                        sum += inK2.dot(with: weights.advanced(by: wRow + 128))
-                        sum += inK3.dot(with: weights.advanced(by: wRow + 192))
-                        sum += inK4.dot(with: weights.advanced(by: wRow + 256))
-                        sum += inK5.dot(with: weights.advanced(by: wRow + 320))
-                        sum += inK6.dot(with: weights.advanced(by: wRow + 384))
-                        if applyActivation {
-                            sum = leakyRelu(sum)
-                        }
-                        output[outRow + c] = sum
-                        c += 1
-                    }
-                    t += 1
+                if applyActivation {
+                    sum = leakyRelu(sum)
                 }
-            default:
-                while t < innerEnd {
-                    let outRow = t * outC
-                    var c = 0
-                    while c < outC {
-                        var sum = bias[c]
-                        let wRow = c * kernel * inC
-                        var k = 0
-                        while k < kernel {
-                            let inT = t + (k * dilation) - padding
-                            let inRow = inT * inC
-                            let wOffset = wRow + (k * inC)
-                            sum += VectorOperations.dotProduct64(
-                                a: input.advanced(by: inRow),
-                                b: weights.advanced(by: wOffset)
-                            )
-                            k += 1
-                        }
-                        if applyActivation {
-                            sum = leakyRelu(sum)
-                        }
-                        output[outRow + c] = sum
-                        c += 1
-                    }
-                    t += 1
-                }
+                output[outRow + c] = sum
+                c += 1
             }
-        } else {
-            while t < innerEnd {
-                let outRow = t * outC
-                var c = 0
-                while c < outC {
-                    var sum = bias[c]
-                    let wRow = c * kernel * inC
-                    var k = 0
-                    while k < kernel {
-                        let inT = t + (k * dilation) - padding
-                        let inRow = inT * inC
-                        let wOffset = wRow + (k * inC)
-                        sum += VectorOperations.dotProduct(
-                            a: input.advanced(by: inRow),
-                            b: weights.advanced(by: wOffset),
-                            count: inC
-                        )
-                        k += 1
-                    }
-                    if applyActivation {
-                        sum = leakyRelu(sum)
-                    }
-                    output[outRow + c] = sum
-                    c += 1
-                }
-                t += 1
-            }
+            t += 1
         }
 
         // 3. 右境界（innerEnd <= t < T）: 境界検査付き
@@ -651,8 +550,8 @@ public final class NeuralVocoder: @unchecked Sendable {
     /// 1D 転置畳み込み演算（階層的アップサンプリング）
     ///
     /// なぜ偶数カーネルかつ 2 * stride の線形補間型転置畳み込みを採用するか:
-    /// 奇数カーネルや不整合なストライドで発生するチェッカーボード歪み（エイリアシングノイズ）を物理的に抑制し、
-    /// 境界分離および dotProduct64 によりリアルタイム係数を大幅に削減するため。
+    /// 奇数カーネルや不整合なストライドで発生するチェッカーボード歪みを抑制し、
+    /// 境界分離および SIMD8 タイルによりリアルタイム係数を大幅に削減するため。
     private static func convTransposed1d(
         input: UnsafePointer<Float>,
         output: UnsafeMutablePointer<Float>,
@@ -699,75 +598,27 @@ public final class NeuralVocoder: @unchecked Sendable {
         }
 
         // 2. 内部領域（境界検査不要）
-        switch (inC, outC) {
-        case (64, 64):
-            let kStride = K * 64
-            while tau < innerEnd {
-                let q = (tau + padding) / stride
-                let r = (tau + padding) % stride
-                let in0 = SIMD64Float(from: input.advanced(by: q * 64))
-                let in1 = SIMD64Float(from: input.advanced(by: (q - 1) * 64))
-                let k0Offset = r * 64
-                let k1Offset = (r + stride) * 64
-                let outRow = tau * 64
-                var c = 0
-                while c < 64 {
-                    let wBase = c * kStride
-                    var sum = bias[c]
-                    sum += in0.dot(with: weights.advanced(by: wBase + k0Offset))
-                    sum += in1.dot(with: weights.advanced(by: wBase + k1Offset))
-                    if applyActivation { sum = leakyRelu(sum) }
-                    output[outRow + c] = sum
-                    c += 1
-                }
-                tau += 1
+        while tau < innerEnd {
+            let q = (tau + padding) / stride
+            let r = (tau + padding) % stride
+            let t0 = q
+            let k0 = r
+            let t1 = q - 1
+            let k1 = r + stride
+            let inRow0 = t0 * inC
+            let inRow1 = t1 * inC
+            let outRow = tau * outC
+            var c = 0
+            while c < outC {
+                let wBase = c * K * inC
+                var sum = bias[c]
+                sum += VectorOperations.dotProduct(a: input.advanced(by: inRow0), b: weights.advanced(by: wBase + (k0 * inC)), count: inC)
+                sum += VectorOperations.dotProduct(a: input.advanced(by: inRow1), b: weights.advanced(by: wBase + (k1 * inC)), count: inC)
+                if applyActivation { sum = leakyRelu(sum) }
+                output[outRow + c] = sum
+                c += 1
             }
-        case (64, _):
-            while tau < innerEnd {
-                let q = (tau + padding) / stride
-                let r = (tau + padding) % stride
-                let t0 = q
-                let k0 = r
-                let t1 = q - 1
-                let k1 = r + stride
-                let inRow0 = t0 * inC
-                let inRow1 = t1 * inC
-                let outRow = tau * outC
-                var c = 0
-                while c < outC {
-                    let wBase = c * K * inC
-                    var sum = bias[c]
-                    sum += VectorOperations.dotProduct64(a: input.advanced(by: inRow0), b: weights.advanced(by: wBase + (k0 * inC)))
-                    sum += VectorOperations.dotProduct64(a: input.advanced(by: inRow1), b: weights.advanced(by: wBase + (k1 * inC)))
-                    if applyActivation { sum = leakyRelu(sum) }
-                    output[outRow + c] = sum
-                    c += 1
-                }
-                tau += 1
-            }
-        default:
-            while tau < innerEnd {
-                let q = (tau + padding) / stride
-                let r = (tau + padding) % stride
-                let t0 = q
-                let k0 = r
-                let t1 = q - 1
-                let k1 = r + stride
-                let inRow0 = t0 * inC
-                let inRow1 = t1 * inC
-                let outRow = tau * outC
-                var c = 0
-                while c < outC {
-                    let wBase = c * K * inC
-                    var sum = bias[c]
-                    sum += VectorOperations.dotProduct(a: input.advanced(by: inRow0), b: weights.advanced(by: wBase + (k0 * inC)), count: inC)
-                    sum += VectorOperations.dotProduct(a: input.advanced(by: inRow1), b: weights.advanced(by: wBase + (k1 * inC)), count: inC)
-                    if applyActivation { sum = leakyRelu(sum) }
-                    output[outRow + c] = sum
-                    c += 1
-                }
-                tau += 1
-            }
+            tau += 1
         }
 
         // 3. 右境界
@@ -798,11 +649,12 @@ public final class NeuralVocoder: @unchecked Sendable {
     }
 
     /// Mel スペクトログラム系列および F0 輪郭から時間領域 16kHz PCM 波形を直接合成する
+    @discardableResult
     public func synthesize(
         mel: [[Float]],
         f0Contour: [Float] = [],
         voicedFlags: [Float] = [],
-        voice: VoiceProfile = .female
+        speaker: SpeakerConditioning = .zero
     ) -> [Float] {
         let totalFrames = mel.count
         if totalFrames <= 0 {
@@ -810,7 +662,7 @@ public final class NeuralVocoder: @unchecked Sendable {
         }
 
         // なぜ 250 フレーム単位でチャンク分割推論を行うか:
-        // 超長文合成時（数万フレーム）に内部テンソルバッファの過大確保を抑制し、
+        // 超長文合成時に内部テンソルバッファの過大確保を抑制し、
         // メモリ制約を確実に遵守しながら受容野境界を滑らかに接続するため。
         let maxChunkFrames = 250
         if totalFrames <= maxChunkFrames {
@@ -818,7 +670,7 @@ public final class NeuralVocoder: @unchecked Sendable {
                 mel: mel,
                 f0Contour: f0Contour,
                 voicedFlags: voicedFlags,
-                voice: voice
+                speaker: speaker
             )
         }
 
@@ -845,7 +697,7 @@ public final class NeuralVocoder: @unchecked Sendable {
             var f = padLeft
             while f < padRight {
                 chunkMel.append(mel[f])
-                var f0Val = voice.baseF0
+                var f0Val: Float = 220.0
                 if f < f0Contour.count {
                     let fVal = f0Contour[f]
                     if 0.0 < fVal { f0Val = fVal }
@@ -864,7 +716,7 @@ public final class NeuralVocoder: @unchecked Sendable {
                 mel: chunkMel,
                 f0Contour: chunkF0,
                 voicedFlags: chunkVoiced,
-                voice: voice
+                speaker: speaker
             )
 
             let trimStartSamples = (validStart - padLeft) * hopSize
@@ -892,7 +744,7 @@ public final class NeuralVocoder: @unchecked Sendable {
         mel: [[Float]],
         f0Contour: [Float] = [],
         voicedFlags: [Float] = [],
-        voice: VoiceProfile = .female
+        speaker: SpeakerConditioning = .zero
     ) -> [Float] {
         let totalFrames = mel.count
         if totalFrames <= 0 {
@@ -913,7 +765,11 @@ public final class NeuralVocoder: @unchecked Sendable {
             var c = 0
             let copyLimit = min(melCh, frameMel.count)
             while c < copyLimit {
-                inputFeats[rowStart + c] = frameMel[c]
+                var mVal = frameMel[c]
+                if mVal.isFinite != true {
+                    mVal = 0.0
+                }
+                inputFeats[rowStart + c] = mVal
                 c += 1
             }
 
@@ -926,7 +782,7 @@ public final class NeuralVocoder: @unchecked Sendable {
 
             var normF0: Float = 0.0
             if 0.5 <= vVal {
-                var f0Val: Float = voice.baseF0
+                var f0Val: Float = 220.0
                 if t < f0Contour.count {
                     let f = f0Contour[t]
                     if 0.0 < f {
@@ -1006,6 +862,26 @@ public final class NeuralVocoder: @unchecked Sendable {
                                                                                 bias: pBPre.baseAddress!,
                                                                                 applyActivation: true
                                                                             )
+                                                                        }
+                                                                    }
+                                                                    // なぜ convPre 出力特徴量に話者埋め込みベクトルを加算変調するか:
+                                                                    // 入力 Mel/F0 から抽出された隠れ音響表現（hCh=256）に対して
+                                                                    // 話者同一性（SpeakerConditioning）を直交バイアスとして注入し、
+                                                                    // 後続のアップサンプリングおよび多重受容野 MRF フィルタを通して
+                                                                    // 出力波形に一意な話者声色差分を確実に反映させるため。
+                                                                    if speaker.embedding.isEmpty != true {
+                                                                        let spkEmb = speaker.embedding
+                                                                        let spkDim = spkEmb.count
+                                                                        var fIdx = 0
+                                                                        while fIdx < totalFrames {
+                                                                            let frameOffset = fIdx * hCh
+                                                                            var c = 0
+                                                                            while c < hCh {
+                                                                                let spkVal = spkEmb[c % spkDim]
+                                                                                pPre[frameOffset + c] = pPre[frameOffset + c] + (spkVal * 0.1)
+                                                                                c += 1
+                                                                            }
+                                                                            fIdx += 1
                                                                         }
                                                                     }
 
@@ -1320,7 +1196,11 @@ public final class NeuralVocoder: @unchecked Sendable {
                                                                                     }
                                                                                     k += 1
                                                                                 }
-                                                                                pOut[s] = tanhf(sum)
+                                                                                var sampleVal = tanhf(sum)
+                                                                                if sampleVal.isFinite != true {
+                                                                                    sampleVal = 0.0
+                                                                                }
+                                                                                pOut[s] = sampleVal
                                                                                 s += 1
                                                                             }
                                                                         }
@@ -1349,14 +1229,14 @@ public final class NeuralVocoder: @unchecked Sendable {
         melFrame: [Float],
         f0: Float = 220.0,
         voiced: Float = 1.0,
-        voice: VoiceProfile = .female,
+        speaker: SpeakerConditioning = .zero,
         dst: UnsafeMutablePointer<Float>
     ) {
         let pcm = synthesize(
             mel: [melFrame],
             f0Contour: [f0],
             voicedFlags: [voiced],
-            voice: voice
+            speaker: speaker
         )
         let copyCount = min(config.hopSize, pcm.count)
         var i = 0

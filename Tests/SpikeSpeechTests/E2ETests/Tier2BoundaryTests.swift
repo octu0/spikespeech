@@ -16,9 +16,7 @@ final class Tier2BoundaryTests: XCTestCase {
     private var vocabulary: PhonemeVocabulary!
     private var prosodyModel: ProsodyModel!
     private var lengthRegulator: LengthRegulator!
-    private var vocoder: LPCVocoder!
-    private var melToLPC: MelToLPC!
-    private var generator: SyntheticAudioGenerator!
+    private var vocoder: NeuralVocoder!
 
     override func setUp() {
         super.setUp()
@@ -28,9 +26,7 @@ final class Tier2BoundaryTests: XCTestCase {
         self.vocabulary = PhonemeVocabulary()
         self.prosodyModel = ProsodyModel()
         self.lengthRegulator = LengthRegulator(hiddenDimension: 128)
-        self.vocoder = LPCVocoder()
-        self.melToLPC = MelToLPC()
-        self.generator = SyntheticAudioGenerator()
+        self.vocoder = NeuralVocoder()
         self.engine = SpikeSpeechEngine()
     }
 
@@ -254,35 +250,26 @@ final class Tier2BoundaryTests: XCTestCase {
         XCTAssertTrue(voiced.isEmpty)
     }
 
-    // MARK: - F6: ボコーダー境界 (5ケース以上)
+    // MARK: - F6: NeuralVocoder 境界 (5ケース以上)
 
-    func testF6_Boundary_ZeroGain() {
-        // gain = 0.0 のフレームでボコーダーがエネルギーを出力せず 0.0 を維持することを検証する。
+    func testF6_Boundary_ZeroMel() {
+        // 対数 Mel = 0.0 のフレームに対して NeuralVocoder が有限な波形を出力することを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.05, count: 16),
-            gain: 0.0,
-            pitchF0: 150.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let frame = [Float](repeating: 0.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
         while i < samples.count {
-            XCTAssertEqual(samples[i], 0.0)
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF6_Boundary_ExcessiveGain() {
-        // gain = 100.0 の入力に対しても Soft Limiter が働き、振幅が [-1.0, 1.0] に安全に圧縮されることを検証する。
+    func testF6_Boundary_HugeMelValues() {
+        // 対数 Mel = +100.0 の極大入力に対してもリミッターにより振幅が [-1.0, 1.0] に安全に圧縮されることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.01, count: 16),
-            gain: 100.0,
-            pitchF0: 150.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let frame = [Float](repeating: 100.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame])
         var i = 0
         while i < samples.count {
             XCTAssertTrue(-1.0 <= samples[i])
@@ -291,32 +278,67 @@ final class Tier2BoundaryTests: XCTestCase {
         }
     }
 
-    func testF6_Boundary_AllUnvoicedFrame() {
-        // voiced = 0.0 かつ F0 = 0.0 で声帯パルスが停止し、ノイズのみが駆動されることを検証する。
+    func testF6_Boundary_SmallMelValues() {
+        // 対数 Mel = -100.0 の極小値でもアンダーフローによる非有限値が発生しないことを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.0, count: 16),
-            gain: 0.1,
-            pitchF0: 0.0,
-            voiced: 0.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let frame = [Float](repeating: -100.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame])
         XCTAssertEqual(samples.count, 160)
-        XCTAssertTrue(samples[0].isFinite)
+        var i = 0
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
+            i += 1
+        }
     }
 
-    func testF6_Boundary_NaNInLpcCoeffs() {
-        // LPC 係数配列に NaN が混入した際、内部メモリをリセットして全サンプル 0.0 を出力することを検証する。
+    func testF6_Boundary_NaNMelValues() {
+        // 対数 Mel 入力に NaN が混入した際、安全復旧により有限値のみが出力されることを検証する。
         vocoder.reset()
-        var nanCoeffs = [Float](repeating: 0.01, count: 16)
-        nanCoeffs[5] = Float.nan
-        let frame = AcousticFrame(
-            lpcCoefficients: nanCoeffs,
-            gain: 0.1,
-            pitchF0: 120.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        var nanMel = [Float](repeating: -2.0, count: 64)
+        nanMel[5] = Float.nan
+        let samples = vocoder.synthesize(mel: [nanMel])
+        XCTAssertEqual(samples.count, 160)
+        var i = 0
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
+            i += 1
+        }
+    }
+
+    func testF6_Boundary_InfMelValues() {
+        // 対数 Mel 入力に +Inf が混入した際、安全復旧により全サンプル有限値が出力されることを検証する。
+        vocoder.reset()
+        var infMel = [Float](repeating: -2.0, count: 64)
+        infMel[10] = Float.infinity
+        let samples = vocoder.synthesize(mel: [infMel])
+        XCTAssertEqual(samples.count, 160)
+        var i = 0
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
+            i += 1
+        }
+    }
+
+    // MARK: - F7: NeuralVocoder 話者・条件付け境界 (5ケース以上)
+
+    func testF7_Boundary_ZeroConditioning() {
+        // SpeakerConditioning.zero で通常通り合成できることを検証する。
+        vocoder.reset()
+        let frame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame], speaker: .zero)
+        XCTAssertEqual(samples.count, 160)
+        var i = 0
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
+            i += 1
+        }
+    }
+
+    func testF7_Boundary_ZeroEnergyScale() {
+        // energyScale = 0.0 のとき振幅がゼロになることを検証する。
+        let profile = VoiceProfile(name: "zero", baseF0: 220.0, energyScale: 0.0)
+        let samples = engine.synthesize(text: "あ", voice: profile)
+        XCTAssertFalse(samples.isEmpty)
         var i = 0
         while i < samples.count {
             XCTAssertEqual(samples[i], 0.0)
@@ -324,74 +346,42 @@ final class Tier2BoundaryTests: XCTestCase {
         }
     }
 
-    func testF6_Boundary_InfInGain() {
-        // ゲインに +Inf が混入した際、安全ガードにより全サンプル 0.0 が出力されることを検証する。
+    func testF7_Boundary_ExtremePitchShift() {
+        // 極端な F0 コンター（1000.0Hz）でも有限な波形が出力されることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.01, count: 16),
-            gain: Float.infinity,
-            pitchF0: 120.0,
-            voiced: 1.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let frame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame], f0Contour: [1000.0])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
         while i < samples.count {
-            XCTAssertEqual(samples[i], 0.0)
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    // MARK: - F7: MelToLPC 境界 (5ケース以上)
-
-    func testF7_Boundary_AllZeroMel() {
-        // 対数 Mel = 0.0（線形エネルギー 1.0）の入力で Levinson-Durbin が破綻しないことを検証する。
-        let mel = [Float](repeating: 0.0, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(0.0 < gain)
-        XCTAssertTrue(gain.isFinite)
-    }
-
-    func testF7_Boundary_HugeMelValues() {
-        // 対数 Mel = +50.0 が入力された際、exp クランプ [-20.0, 20.0] によりオーバーフローが防止されることを検証する。
-        let mel = [Float](repeating: 50.0, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(gain.isFinite)
-    }
-
-    func testF7_Boundary_SmallMelValues() {
-        // 対数 Mel = -50.0 の極小値でも exp クランプによりアンダーフローゼロ除算が防止されることを検証する。
-        let mel = [Float](repeating: -50.0, count: 64)
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(0.0 <= gain)
-    }
-
-    func testF7_Boundary_NaNMelValues() {
-        // Mel 特徴量に NaN が含まれていた場合、全係数 0.0 とゲイン 0.0 を返し安全復旧することを検証する。
-        var mel = [Float](repeating: -1.0, count: 64)
-        mel[3] = Float.nan
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertEqual(gain, 0.0)
+    func testF7_Boundary_LargeFrameBatch() {
+        // 50フレームの連続 Mel 入力に対してバッファ破綻なく 8000 サンプルが出力されることを検証する。
+        vocoder.reset()
+        let frames = [[Float]](repeating: [Float](repeating: -3.0, count: 64), count: 50)
+        let samples = vocoder.synthesize(mel: frames)
+        XCTAssertEqual(samples.count, 8000)
         var i = 0
-        while i < coeffs.count {
-            XCTAssertEqual(coeffs[i], 0.0)
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF7_Boundary_SingularImpulseMel() {
-        // 1 チャンネルのみが極大で自己相関が縮退する場合でも、ホワイトノイズフロア付加により ki が計算できることを検証する。
-        var mel = [Float](repeating: -15.0, count: 64)
-        mel[20] = 5.0
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &coeffs)
-        XCTAssertTrue(gain.isFinite)
+    func testF7_Boundary_ShortEmbedding() {
+        // 埋め込みベクトルの長さが標準長未満の場合でもクラッシュせず安全に波形合成されることを検証する。
+        vocoder.reset()
+        let cond = SpeakerConditioning(embedding: [1.0, 2.0])
+        let frame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [frame], speaker: cond)
+        XCTAssertEqual(samples.count, 160)
         var i = 0
-        while i < coeffs.count {
-            XCTAssertTrue(coeffs[i].isFinite)
+        while i < samples.count {
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
@@ -478,14 +468,10 @@ final class Tier2BoundaryTests: XCTestCase {
     func testF9_Boundary_DenormalValues() {
         // 1e-25 などのデノーマル数が CPU トラップを引き起こさず 0.0 に安全に扱われることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.0, count: 16),
-            gain: 1e-25,
-            pitchF0: 0.0,
-            voiced: 0.0
-        )
-        let samples = vocoder.synthesize(frames: [frame])
+        let frame = [Float](repeating: 1e-25, count: 64)
+        let samples = vocoder.synthesize(mel: [frame])
         XCTAssertEqual(samples.count, 160)
+        XCTAssertTrue(samples[0].isFinite)
     }
 
     func testF9_Boundary_ZeroElementVector() {
@@ -750,40 +736,41 @@ final class Tier2BoundaryTests: XCTestCase {
         XCTAssertEqual(restored.wOut, original.wOut)
     }
 
-    // MARK: - F14: 基準音声データ境界 (5ケース以上)
+    // MARK: - F14: 音声合成エンジン境界 (5ケース以上)
 
-    func testF14_Boundary_ZeroDurationVowel() {
-        // 継続時間 0 秒の母音合成が安全に空配列を返すことを検証する。
-        let samples = generator.generateVowel(vowel: .a, durationSeconds: 0.0)
+    func testF14_Boundary_EmptyStringSynthesis() {
+        // 空文字入力時にエンジンが安全に空の波形を返しクラッシュしないことを検証する。
+        let samples = engine.synthesize(text: "")
         XCTAssertTrue(samples.isEmpty)
     }
 
-    func testF14_Boundary_NegativeDurationChirp() {
-        // 負の継続時間で無限ループやメモリ割り当てエラーを起こさず空配列を返すことを検証する。
-        let samples = generator.generateChirp(durationSeconds: -0.5)
+    func testF14_Boundary_WhitespaceOnlySynthesis() {
+        // 空白・改行のみの入力時にエンジンが安全に空の波形を返すことを検証する。
+        let samples = engine.synthesize(text: "  \t\n  ")
         XCTAssertTrue(samples.isEmpty)
     }
 
-    func testF14_Boundary_ZeroF0Impulse() {
-        // ゼロ除算を未然に回避して空配列を返すことを検証する。
-        let samples = generator.generateImpulseTrain(f0: 0.0, durationSeconds: 0.1)
-        XCTAssertTrue(samples.isEmpty)
+    func testF14_Boundary_NegativeSpeedClamp() {
+        // 負の speed や下限未満の speed が渡された際に安全にクランプされて合成されることを検証する。
+        let samples = engine.synthesize(text: "あ", speed: -1.0)
+        XCTAssertFalse(samples.isEmpty)
     }
 
-    func testF14_Boundary_ZeroAmplitudeNoise() {
-        // amplitude = 0.0 で全サンプルが厳密に 0.0 の無音波形を返すことを検証する。
-        let samples = generator.generateWhiteNoise(durationSeconds: 0.01, amplitude: 0.0)
-        XCTAssertEqual(samples.count, 160)
+    func testF14_Boundary_NaNPitchClamp() {
+        // 非有限な pitch (NaN) が渡された際に 1.0 へフォールバックされ有限波形が得られることを検証する。
+        let samples = engine.synthesize(text: "あ", pitch: Float.nan)
+        XCTAssertFalse(samples.isEmpty)
         var i = 0
         while i < samples.count {
-            XCTAssertEqual(samples[i], 0.0)
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
 
-    func testF14_Boundary_EmptyPhraseToySpeech() {
-        // phrase = "" の場合に数式合成が空配列を返しクラッシュしないことを検証する。
-        let samples = generator.generatePhrase(phrase: "")
+    func testF14_Boundary_ZeroFramesVocoder() {
+        // NeuralVocoder に空のフレーム列を渡した際に安全に空配列が返されることを検証する。
+        vocoder.reset()
+        let samples = vocoder.synthesize(mel: [])
         XCTAssertTrue(samples.isEmpty)
     }
 

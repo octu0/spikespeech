@@ -21,9 +21,7 @@ final class ForensicAuditorM3Tests: XCTestCase {
             let candidates = [
                 currentDir + "/default.metallib",
                 currentDir + "/.build/arm64-apple-macosx/debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
-                currentDir + "/.build/arm64-apple-macosx/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
-                currentDir + "/../spiketrans/.build/arm64-apple-macosx/debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
-                currentDir + "/../spiketrans/.build/arm64-apple-macosx/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
+                currentDir + "/.build/arm64-apple-macosx/release/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
             ]
             var cIdx = 0
             while cIdx < candidates.count {

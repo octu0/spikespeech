@@ -28,6 +28,10 @@ func main() {
     var vocoderEpochs: Int = 5
     var vocoderLearningRate: Float = 0.0003
 
+    func printUsage() {
+        print("Usage: train -d <corpus_dir> [-s <samples>] [-e <epochs>] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
+    }
+
     var i = 1
     while i < args.count {
         let arg = args[i]
@@ -177,12 +181,25 @@ func main() {
         case "--init-bout":
             forceInitBOut = true
         case "-h", "--help":
-            print("Usage: train [-d <jsut_dir>] [-s <samples>] [-e <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
+            printUsage()
             return
         default:
             break
         }
         i += 1
+    }
+
+    guard let explicit = datasetPath, explicit.isEmpty != true else {
+        printUsage()
+        exit(1)
+    }
+    var cleanDatasetPath = explicit
+    if cleanDatasetPath.hasPrefix("@") {
+        cleanDatasetPath = String(cleanDatasetPath.dropFirst())
+    }
+    if FileManager.default.fileExists(atPath: cleanDatasetPath + "/transcript_utf8.txt") != true {
+        printUsage()
+        exit(1)
     }
 
     // 他のマシンや CI 環境でも動作するよう、ハードコードされた絶対パスを廃止し相対パスと探索候補から解決する
@@ -236,7 +253,7 @@ func main() {
     print("シャッフルシード: \(shuffleSeed)")
     print("隠れ層次元:       \(hiddenDim)")
     print("層数:             \(numLayers)")
-    print("教師音声基準:     JSUT (女性単一話者 VoiceProfile.female.tract Prior)")
+    print("教師音声基準:     JSUT (女性単一話者 VoiceProfile.female 自然な Mel 目標系列)")
     print("出力パス:         \(outputPath)")
     print("--------------------------------------------------")
 
@@ -304,35 +321,8 @@ func main() {
     )
     let wavReader = WavAudioReader()
 
-    // コーパス探索候補
-    var corpusDir: String? = nil
-    var candidates: [String] = []
-    if let explicit = datasetPath, explicit.isEmpty != true {
-        var cleanPath = explicit
-        if cleanPath.hasPrefix("@") {
-            cleanPath = String(cleanPath.dropFirst())
-        }
-        candidates.append(cleanPath)
-    }
-    if let envPath = ProcessInfo.processInfo.environment["JSUT_CORPUS_DIR"], envPath.isEmpty != true {
-        candidates.append(envPath)
-    }
-    candidates.append(currentDir + "/../spiketrans/.tmp/jsut_ver1.1/basic5000")
-    candidates.append(currentDir + "/.tmp/jsut_ver1.1/basic5000")
-    candidates.append(currentDir + "/basic5000")
-    let homeDir = fileManager.homeDirectoryForCurrentUser.path
-    candidates.append(homeDir + "/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000")
-
-    var cIdx = 0
-    while cIdx < candidates.count {
-        let cand = candidates[cIdx]
-        if fileManager.fileExists(atPath: cand + "/transcript_utf8.txt") {
-            corpusDir = cand
-            break
-        }
-        cIdx += 1
-    }
-
+    // コーパス読み込み
+    let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]])] = []
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
 
@@ -341,116 +331,75 @@ func main() {
     // アライメント・Blended Prior 目標残差生成器を唯一の正本として共有するため。
     let pitchTracker = PitchTracker()
 
-    switch corpusDir {
-    case .some(let cDir):
-        print("JSUT basic5000 コーパスパス: \(cDir)")
-        let transcriptPath = cDir + "/transcript_utf8.txt"
-        let wavDir = cDir + "/wav"
-        if let content = try? String(contentsOfFile: transcriptPath, encoding: .utf8) {
-            let lines = content.components(separatedBy: .newlines)
-            var lineIdx = 0
-            while lineIdx < lines.count {
-                if maxSamples <= trainingData.count {
-                    break
-                }
-                let line = lines[lineIdx].trimmingCharacters(in: .whitespacesAndNewlines)
-                if line.isEmpty {
-                    lineIdx += 1
-                    continue
-                }
-                var parts = line.split(separator: ":", maxSplits: 1).map { String($0) }
-                if parts.count != 2 {
-                    parts = line.split(separator: "\t", maxSplits: 1).map { String($0) }
-                }
-                if parts.count == 2 {
-                    let id = parts[0].trimmingCharacters(in: .whitespaces)
-                    let text = parts[1].trimmingCharacters(in: .whitespaces)
-                    var wavFile = wavDir + "/" + id + ".wav"
-                    if fileManager.fileExists(atPath: wavFile) != true {
-                        let uppercaseWav = wavDir + "/" + id + ".WAV"
-                        if fileManager.fileExists(atPath: uppercaseWav) {
-                            wavFile = uppercaseWav
-                        }
-                    }
-
-                    if fileManager.fileExists(atPath: wavFile) {
-                        if let rawPCM = try? wavReader.loadWav16k(from: wavFile) {
-                            // なぜ教師音声を標準肉声レベル（Peak 0.85）にピーク正規化するか:
-                            // 各録音トラックごとのマイクゲインのばらつきや過小音量を排し、
-                            // 人間の標準的な肉声聴取音量（RMS 0.15〜0.20、Peak 0.80〜0.85）を
-                            // SNN およびニューラルボコーダーの正準ターゲットとして統一するため。
-                            var peak: Float = 0.0
-                            var pIdx = 0
-                            while pIdx < rawPCM.count {
-                                let a = abs(rawPCM[pIdx])
-                                if peak < a {
-                                    peak = a
-                                }
-                                pIdx += 1
-                            }
-                            var pcm16k = rawPCM
-                            if 0.01 < peak {
-                                let normFactor = 0.85 / peak
-                                var s = 0
-                                while s < pcm16k.count {
-                                    pcm16k[s] = pcm16k[s] * normFactor
-                                    s += 1
-                                }
-                            }
-                            if let pair = engine.prepareTrainingPair(
-                                text: text,
-                                pcm16k: pcm16k,
-                                melExtractor: melExtractor,
-                                pitchTracker: pitchTracker
-                            ) {
-                                trainingData.append(pair)
-                                let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
-                                let pitchResult = pitchTracker.track(pcm: pcm16k)
-                                vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
-                            }
-                        }
-                    }
-                }
+    print("コーパスパス: \(corpusDir)")
+    let transcriptPath = corpusDir + "/transcript_utf8.txt"
+    let wavDir = corpusDir + "/wav"
+    if let content = try? String(contentsOfFile: transcriptPath, encoding: .utf8) {
+        let lines = content.components(separatedBy: .newlines)
+        var lineIdx = 0
+        while lineIdx < lines.count {
+            if maxSamples <= trainingData.count {
+                break
+            }
+            let line = lines[lineIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
                 lineIdx += 1
+                continue
             }
-        }
-    case .none:
-        print("JSUT コーパス未検出のため、SyntheticAudioGenerator による基準音声で学習データを自動生成します。")
-        let synthGen = SyntheticAudioGenerator(sampleRate: Float(AudioConfig.sampleRate))
-        let standardCorpus = synthGen.generateStandardCorpus()
-        var sIdx = 0
-        while sIdx < standardCorpus.count {
-            let item = standardCorpus[sIdx]
-            var peak: Float = 0.0
-            var pIdx = 0
-            while pIdx < item.samples.count {
-                let a = abs(item.samples[pIdx])
-                if peak < a {
-                    peak = a
+            var parts = line.split(separator: ":", maxSplits: 1).map { String($0) }
+            if parts.count != 2 {
+                parts = line.split(separator: "\t", maxSplits: 1).map { String($0) }
+            }
+            if parts.count == 2 {
+                let id = parts[0].trimmingCharacters(in: .whitespaces)
+                let text = parts[1].trimmingCharacters(in: .whitespaces)
+                var wavFile = wavDir + "/" + id + ".wav"
+                if fileManager.fileExists(atPath: wavFile) != true {
+                    let uppercaseWav = wavDir + "/" + id + ".WAV"
+                    if fileManager.fileExists(atPath: uppercaseWav) {
+                        wavFile = uppercaseWav
+                    }
                 }
-                pIdx += 1
-            }
-            var pcm16k = item.samples
-            if 0.01 < peak {
-                let normFactor = 0.85 / peak
-                var s = 0
-                while s < pcm16k.count {
-                    pcm16k[s] = pcm16k[s] * normFactor
-                    s += 1
+
+                if fileManager.fileExists(atPath: wavFile) {
+                    if let rawPCM = try? wavReader.loadWav16k(from: wavFile) {
+                        // なぜ教師音声を標準肉声レベル（Peak 0.85）にピーク正規化するか:
+                        // 各録音トラックごとのマイクゲインのばらつきや過小音量を排し、
+                        // 人間の標準的な肉声聴取音量（RMS 0.15〜0.20、Peak 0.80〜0.85）を
+                        // SNN およびニューラルボコーダーの正準ターゲットとして統一するため。
+                        var peak: Float = 0.0
+                        var pIdx = 0
+                        while pIdx < rawPCM.count {
+                            let a = abs(rawPCM[pIdx])
+                            if peak < a {
+                                peak = a
+                            }
+                            pIdx += 1
+                        }
+                        var pcm16k = rawPCM
+                        if 0.01 < peak {
+                            let normFactor = 0.85 / peak
+                            var s = 0
+                            while s < pcm16k.count {
+                                pcm16k[s] = pcm16k[s] * normFactor
+                                s += 1
+                            }
+                        }
+                        if let pair = engine.prepareTrainingPair(
+                            text: text,
+                            pcm16k: pcm16k,
+                            melExtractor: melExtractor,
+                            pitchTracker: pitchTracker
+                        ) {
+                            trainingData.append(pair)
+                            let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
+                            let pitchResult = pitchTracker.track(pcm: pcm16k)
+                            vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                        }
+                    }
                 }
             }
-            if let pair = engine.prepareTrainingPair(
-                text: item.text,
-                pcm16k: pcm16k,
-                melExtractor: melExtractor,
-                pitchTracker: pitchTracker
-            ) {
-                trainingData.append(pair)
-                let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
-                let pitchResult = pitchTracker.track(pcm: pcm16k)
-                vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
-            }
-            sIdx += 1
+            lineIdx += 1
         }
     }
 
@@ -674,8 +623,15 @@ func main() {
             if let existingData = try? Data(contentsOf: vocoderURL) {
                 switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
                 case .some(let savedWeights):
-                    vocoder.importWeights(from: savedWeights)
-                    print("既存のニューラルボコーダー重みを読み込みました: \(vocoderURL.path)")
+                    if savedWeights.config.hiddenChannels != 256 {
+                        // なぜ 64ch 重みを破棄して 256ch モデルの新規初期重みを使用するか:
+                        // 64ch 重みを 256ch モデルに import するとテンソル形状不整合でクラッシュするため、
+                        // 推論時（NeuralVocoder.swift）と同様に不一致時は破棄し、256ch の初期状態から学習するため。
+                        print("[NeuralVocoder] 警告: \(vocoderURL.path) の hiddenChannels (\(savedWeights.config.hiddenChannels)) が 256 と一致しないため、破棄し 256ch の初期重みを使用します。")
+                    } else {
+                        vocoder.importWeights(from: savedWeights)
+                        print("既存のニューラルボコーダー重みを読み込みました: \(vocoderURL.path)")
+                    }
                 case .none:
                     break
                 }
@@ -845,8 +801,12 @@ func main() {
         if needVocoderWrite != true && fileManager.fileExists(atPath: vocoderURL.path) {
             if let existingData = try? Data(contentsOf: vocoderURL) {
                 switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
-                case .some:
-                    needVocoderWrite = false
+                case .some(let savedWeights):
+                    if savedWeights.config.hiddenChannels != 256 {
+                        needVocoderWrite = true
+                    } else {
+                        needVocoderWrite = false
+                    }
                 case .none:
                     needVocoderWrite = true
                 }

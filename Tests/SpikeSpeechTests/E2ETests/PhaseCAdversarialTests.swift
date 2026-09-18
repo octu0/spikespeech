@@ -106,7 +106,7 @@ final class PhaseCAdversarialTests: XCTestCase {
         // 通常のテスト実行を阻害しないよう、環境変数 SPIKESPEECH_STRESS_TEST が明示された場合のみ実行する。
         let shouldRun = ProcessInfo.processInfo.environment["SPIKESPEECH_STRESS_TEST"] != nil
         if shouldRun != true {
-            throw XCTSkip("長文ストレステストは実行時間が大きいためスキップします (実行時は SPIKESPEECH_STRESS_TEST=1 を指定してください)")
+            throw XCTSkip("10,000文字超の超長文ストレステストは実行時間が大きすぎるため通常テストから除外します (実行時は SPIKESPEECH_STRESS_TEST=1 を指定してください)")
         }
 
         let engine = SpikeSpeechEngine()
@@ -132,7 +132,7 @@ final class PhaseCAdversarialTests: XCTestCase {
 
         XCTAssertTrue(0 < samples1.count, "1,000文字超の合成サンプル数が0であってはならない")
         // なぜ RTF を 1.0 未満とするか:
-        // 旧 LPC フィルタ前提の 0.1 ではなく、現代的ニューラルボコーダー（64ch MRF 畳み込み）の
+        // 現代的ニューラルボコーダー（64ch MRF 畳み込み）の
         // Pure Swift 実時間合成要件（RTF < 1.0、実測 0.38 で実時間の 2.6 倍高速）に適合させるため。
         XCTAssertTrue(rtf1 < 1.0, "1,000文字超の合成でもRTFはリアルタイム (1.0未満) であること (実測: \(rtf1))")
 

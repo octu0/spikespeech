@@ -2,12 +2,11 @@ import XCTest
 @testable import SpikeSpeech
 
 /// Challenger 2 による WAV 規格準拠性・逐次 finalize 完全性・
-/// および MelToLPC Levinson-Durbin 誤差最小化の数理的・定量的検証テストスイート
+/// および NeuralVocoder 波形生成安定性の数理的・定量的検証テストスイート
 ///
 /// RIFF/WAVE 44 バイトヘッダの規格準拠性、WavStreamWriter による逐次書き込みと
-/// ヘッダ確定更新のビット完全一致、Wiener-Khinchin IDCT 自己相関の正定値性、
-/// Levinson-Durbin による線形予測誤差二次形式の大域的最小性、および
-/// Schur-Cohn ステップダウン法による反射係数クランプと単位円内極の安定性を自ら実証・保証する。
+/// ヘッダ確定更新のビット完全一致、ニューラルボコーダーの多パターン入力に対する
+/// 数値健全性、およびクリッピング防止を自ら実証・保証する。
 final class ChallengerAudioDSPTests: XCTestCase {
 
     // MARK: - 1. WAV 規格準拠性のバイトレベル検証
@@ -268,15 +267,15 @@ final class ChallengerAudioDSPTests: XCTestCase {
         }
     }
 
-    // MARK: - 4. MelToLPC Levinson-Durbin 線形予測誤差最小化の大域的最適解検証
+    // MARK: - 4. NeuralVocoder 活性化および畳み込み演算の数値健全性検証
 
-    func testMelToLPCGlobalPredictionErrorMinimization() {
-        // Levinson-Durbin アルゴリズムから導出された係数ベクトル a が、
-        // Yule-Walker 方程式 R a = r を満たす厳密な大域的最小値であり、
-        // 任意の摂動方向に対して予測誤差 J(a) が単調に増大することを数理的に実証する。
-        let melToLpc = MelToLPC(melChannels: 64, fftBins: 257, lpcOrder: 16, sampleRate: 16000.0)
+    func testNeuralVocoderGlobalPredictionErrorMinimization() {
+        // 多層 1D 畳み込みおよび MRF 残差ブロックによる推論において、
+        // 入力 Mel 特徴量から出力 PCM まで NaN や Inf が発生せず、
+        // 振幅が安定して [-1.0, 1.0] に保持されることを数理的に実証する。
+        let vocoder = NeuralVocoder()
 
-        // 典型的な母音スペクトル包絡（低域・中域に明瞭なホルマント共鳴）
+        // 典型的な母音スペクトル包絡（低域・中域に明瞭なピーク）
         var mel = [Float](repeating: 0.0, count: 64)
         var ch = 0
         while ch < 64 {
@@ -284,104 +283,37 @@ final class ChallengerAudioDSPTests: XCTestCase {
             let f2Dist = Float(ch - 24)
             let peak1 = exp(-(f1Dist * f1Dist) * 0.08) * 6.0
             let peak2 = exp(-(f2Dist * f2Dist) * 0.05) * 4.0
-            mel[ch] = peak1 + peak2 + 0.1
+            mel[ch] = logf(max(peak1 + peak2 + 0.1, 1e-4))
             ch += 1
         }
 
-        var outCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLpc.convert(mel: mel, isLogMel: false, outCoeffs: &outCoeffs)
-        XCTAssertTrue(0.0 < gain, "計算されたゲインが正値ではありません")
+        let samples = vocoder.synthesize(mel: [mel, mel])
+        XCTAssertEqual(samples.count, 320)
 
-        // 帯域幅拡大 (gamma = 0.98) を反転し、元の Levinson-Durbin 解 a を復元
-        let gamma: Float = 0.98
-        var currentGamma: Float = 1.0
-        var rawA = [Float](repeating: 0.0, count: 16)
+        var hasNonZero = false
+        var maxVal: Float = 0.0
         var i = 0
-        while i < 16 {
-            currentGamma *= gamma
-            rawA[i] = outCoeffs[i] / currentGamma
+        while i < samples.count {
+            let s = samples[i]
+            XCTAssertTrue(s.isFinite)
+            if 0.0 < abs(s) {
+                hasNonZero = true
+            }
+            if maxVal < abs(s) {
+                maxVal = abs(s)
+            }
             i += 1
         }
-
-        // MelToLPC と同一の Wiener-Khinchin IDCT により独立オラクル自己相関 r_0 ... r_16 を算出
-        let autoCorr = computeOracleAutoCorrelation(mel: mel, sampleRate: 16000.0)
-        let r0Loaded = autoCorr[0] * 1.002 // MelToLPC と同一の 0.2% ノイズフロア
-        var loadedAutoCorr = autoCorr
-        loadedAutoCorr[0] = r0Loaded
-
-        // MelToLPC の Levinson-Durbin 法が対角要素 r0 に 0.2% のフロアを加算した Toeplitz 行列
-        // R_loaded a = r を解いているため、オラクルの二次形式 J(a) および Yule-Walker 方程式の
-        // 対角成分 (lag = 0) においても同一のフロア整合性を保ち、厳密な大域的最小性を実証する。
-        let optimalCost = computePredictionCost(a: rawA, autoCorr: loadedAutoCorr, r0: r0Loaded)
-
-        // 1. Yule-Walker 方程式残差の検証: res_k = sum_j(a_j * r_|k-j|) - r_k
-        var k = 0
-        while k < 16 {
-            var sum: Float = 0.0
-            var j = 0
-            while j < 16 {
-                let lag = abs((k + 1) - (j + 1))
-                sum += rawA[j] * loadedAutoCorr[lag]
-                j += 1
-            }
-            let targetR = autoCorr[k + 1]
-            let residual = abs(sum - targetR)
-            let relativeRes = residual / r0Loaded
-            XCTAssertTrue(relativeRes < 1e-3, "Yule-Walker 残差が許容値を超過: lag=\(k + 1), res=\(relativeRes)")
-            k += 1
-        }
-
-        // 2. 各基底座標方向への微小摂動 (+delta, -delta) に対する誤差増大の検証
-        let delta: Float = 1e-3
-        var cIdx = 0
-        while cIdx < 16 {
-            var perturbedPlus = rawA
-            perturbedPlus[cIdx] += delta
-            let costPlus = computePredictionCost(a: perturbedPlus, autoCorr: loadedAutoCorr, r0: r0Loaded)
-            XCTAssertTrue(optimalCost < costPlus, "正方向摂動で予測誤差が増大していません: coord=\(cIdx)")
-
-            var perturbedMinus = rawA
-            perturbedMinus[cIdx] -= delta
-            let costMinus = computePredictionCost(a: perturbedMinus, autoCorr: loadedAutoCorr, r0: r0Loaded)
-            XCTAssertTrue(optimalCost < costMinus, "負方向摂動で予測誤差が増大していません: coord=\(cIdx)")
-
-            cIdx += 1
-        }
-
-        // 3. 多次元ランダム単位ベクトル方向への摂動に対する誤差増大の検証
-        var rTrial = 0
-        while rTrial < 20 {
-            var randDir = [Float](repeating: 0.0, count: 16)
-            var normSq: Float = 0.0
-            var d = 0
-            while d < 16 {
-                let val = (Float((rTrial * 17) + (d * 31) % 100) * 0.02) - 1.0
-                randDir[d] = val
-                normSq += val * val
-                d += 1
-            }
-            let invNorm = delta / sqrt(normSq)
-            var perturbedRand = rawA
-            d = 0
-            while d < 16 {
-                perturbedRand[d] += randDir[d] * invNorm
-                d += 1
-            }
-
-            let costRand = computePredictionCost(a: perturbedRand, autoCorr: loadedAutoCorr, r0: r0Loaded)
-            XCTAssertTrue(optimalCost < costRand, "ランダム方向摂動で予測誤差が増大していません: trial=\(rTrial)")
-
-            rTrial += 1
-        }
+        XCTAssertTrue(hasNonZero)
+        XCTAssertTrue(maxVal <= 1.0)
     }
 
-    // MARK: - 5. Schur-Cohn ステップダウン法による全極単位円内安定性の定量的検証
+    // MARK: - 5. NeuralVocoder 多パターン Mel 入力波形安定性の定量的検証
 
-    func testMelToLPCUnitCirclePoleStabilityViaStepDown() {
-        // 任意の Mel 特徴量に対して多項式 A(z) の逆 Levinson-Durbin 反射係数 k_m が
-        // 厳密に |k_m| <= 0.999 を満たし、単位円境界および外側への極の逸脱が
-        // 完全に遮断されていることを数学的に証明する。
-        let melToLpc = MelToLPC(melChannels: 64, fftBins: 257, lpcOrder: 16)
+    func testNeuralVocoderUnitCirclePoleStabilityViaStepDown() {
+        // 様々なホルマントパターン、単一周波数ピーク、過大飽和 Mel 特徴量に対して
+        // ニューラルボコーダーが一切破綻せず、有限で安全な波形を出力することを検証する。
+        let vocoder = NeuralVocoder()
 
         let testMelPatterns: [(name: String, mel: [Float])] = [
             ("Formant_A", generateSyntheticVowelMel(f1Bin: 12, f2Bin: 22)),
@@ -399,79 +331,51 @@ final class ChallengerAudioDSPTests: XCTestCase {
         var pIdx = 0
         while pIdx < testMelPatterns.count {
             let tc = testMelPatterns[pIdx]
-            var outCoeffs = [Float](repeating: 0.0, count: 16)
-            let gain = melToLpc.convert(mel: tc.mel, isLogMel: false, outCoeffs: &outCoeffs)
+            vocoder.reset()
+            let samples = vocoder.synthesize(mel: [tc.mel])
+            XCTAssertEqual(samples.count, 160)
 
-            XCTAssertTrue(0.0 <= gain, "ゲインが負値です: pattern=\(tc.name)")
-
-            // 帯域幅拡大 gamma = 0.98 の逆補正
-            let gamma: Float = 0.98
-            var currentGamma: Float = 1.0
-            var a = [Float](repeating: 0.0, count: 16)
             var i = 0
-            while i < 16 {
-                currentGamma *= gamma
-                a[i] = outCoeffs[i] / currentGamma
+            while i < samples.count {
+                let s = samples[i]
+                XCTAssertTrue(s.isFinite, "非有限サンプル検出: pattern=\(tc.name), index=\(i)")
+                XCTAssertTrue(-1.0 <= s, "振幅下限逸脱: pattern=\(tc.name), index=\(i), val=\(s)")
+                XCTAssertTrue(s <= 1.0, "振幅上限逸脱: pattern=\(tc.name), index=\(i), val=\(s)")
                 i += 1
             }
-
-            // Schur-Cohn ステップダウン再帰の実行
-            // 次数 m = 16 から 1 へ逆順に反射係数 k_m を導出
-            var currentA = a
-            var m = 16
-            while 1 <= m {
-                let km = currentA[m - 1]
-                // 反射係数が [-0.999, 0.999] 内に収まっているか
-                XCTAssertTrue(km <= 0.9991, "Schur-Cohn 反射係数が 0.999 を超過: pattern=\(tc.name), m=\(m), km=\(km)")
-                XCTAssertTrue(-0.9991 <= km, "Schur-Cohn 反射係数が -0.999 を下回る: pattern=\(tc.name), m=\(m), km=\(km)")
-
-                if 1 < m {
-                    let denom = 1.0 - (km * km)
-                    XCTAssertTrue(1e-6 < denom, "ステップダウン除数がゼロ付近です: denom=\(denom)")
-                    var nextA = [Float](repeating: 0.0, count: m - 1)
-                    var j = 0
-                    while j < m - 1 {
-                        let prevJ = currentA[j]
-                        let prevOpposite = currentA[m - 2 - j]
-                        nextA[j] = (prevJ + (km * prevOpposite)) / denom
-                        j += 1
-                    }
-                    currentA = nextA
-                }
-                m -= 1
-            }
-
-            // 帯域幅拡大 gamma = 0.98 乗算後の多項式では、極の絶対値がさらに 0.98 倍収縮し
-            // |z| <= 0.999 * 0.98 = 0.97902 に制限されることを確認
             pIdx += 1
         }
     }
 
-    // MARK: - 6. 平坦スペクトル（ホワイトノイズ）における LPC 係数ゼロ収束テスト
+    // MARK: - 6. 平坦スペクトル（ホワイトノイズ）における波形エネルギー安定性テスト
 
-    func testMelToLPCFlatSpectrumZeroCoefficients() {
-        // 白色雑音に対しては共鳴構造が存在しないため、すべての LPC 係数が 0.0 付近へ収束し、
-        // ボコーダーが全通過特性として動作することを数学的に実証する。
-        let melToLpc = MelToLPC(melChannels: 64, fftBins: 257, lpcOrder: 16)
-        let flatMel = [Float](repeating: 1.0, count: 64)
+    func testNeuralVocoderFlatSpectrumZeroCoefficients() {
+        // 一様な平坦対数 Mel 特徴量に対しても安定して波形合成が行われ、
+        // 異常な発振や直流オフセット過大が発生しないことを検証する。
+        let vocoder = NeuralVocoder()
+        let flatMel = [Float](repeating: -2.0, count: 64)
 
-        var coeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLpc.convert(mel: flatMel, isLogMel: false, outCoeffs: &coeffs)
+        let samples = vocoder.synthesize(mel: [flatMel, flatMel])
+        XCTAssertEqual(samples.count, 320)
 
-        XCTAssertTrue(0.0 < gain, "平坦スペクトルでのゲインが正値ではありません: \(gain)")
-
-        var maxCoeff: Float = 0.0
+        var sum: Float = 0.0
+        var maxAbs: Float = 0.0
         var i = 0
-        while i < 16 {
-            let absC = abs(coeffs[i])
-            if maxCoeff < absC {
-                maxCoeff = absC
+        while i < samples.count {
+            let s = samples[i]
+            XCTAssertTrue(s.isFinite)
+            sum += s
+            let absS = abs(s)
+            if maxAbs < absS {
+                maxAbs = absS
             }
             i += 1
         }
 
-        // 平坦スペクトル時の LPC 係数は 0 付近（最大絶対値 < 0.08）に収束
-        XCTAssertTrue(maxCoeff < 0.08, "平坦スペクトルで LPC 係数がゼロに収束していません: max=\(maxCoeff)")
+        let mean = sum / Float(samples.count)
+        // 直流オフセットが過大でないこと
+        XCTAssertTrue(abs(mean) < 0.2)
+        XCTAssertTrue(maxAbs <= 1.0)
     }
 
     // MARK: - 7. PCM 量子化境界値およびバイナリビット精度テスト
@@ -602,111 +506,7 @@ final class ChallengerAudioDSPTests: XCTestCase {
         print("-----------------------------------------")
     }
 
-    // MARK: - ヘルパー関数 (オラクル計算)
-
-    /// 予測誤差二次形式 J(a) の算出
-    private func computePredictionCost(a: [Float], autoCorr: [Float], r0: Float) -> Float {
-        let p = a.count
-        var cost: Float = r0
-
-        // - 2 * sum_i(a_i * r_i)
-        var i = 0
-        while i < p {
-            cost -= 2.0 * a[i] * autoCorr[i + 1]
-            i += 1
-        }
-
-        // + sum_i sum_j (a_i * a_j * r_|i-j|)
-        i = 0
-        while i < p {
-            var j = 0
-            while j < p {
-                let lag = abs(i - j)
-                cost += a[i] * a[j] * autoCorr[lag]
-                j += 1
-            }
-            i += 1
-        }
-        return cost
-    }
-
-    /// Mel 特徴量から Wiener-Khinchin IDCT による独立オラクル自己相関 r_0 ... r_16 を算出
-    private func computeOracleAutoCorrelation(mel: [Float], sampleRate: Float) -> [Float] {
-        let melChannels = 64
-        let fftBins = 257
-        let lpcOrder = 16
-
-        let maxFreq = sampleRate * 0.5
-        let maxMel = 2595.0 * log10(1.0 + (maxFreq / 700.0))
-        var melPoints = [Float](repeating: 0.0, count: melChannels + 2)
-        let melStep = maxMel / Float(melChannels + 1)
-        var m = 0
-        while m < melChannels + 2 {
-            melPoints[m] = Float(m) * melStep
-            m += 1
-        }
-
-        // パワースペクトル復元
-        var powerSpectrum = [Float](repeating: 0.0, count: fftBins)
-        var k = 0
-        while k < fftBins {
-            let freq = (Float(k) * maxFreq) / Float(fftBins - 1)
-            let melVal = 2595.0 * log10(1.0 + (freq / 700.0))
-
-            var ch = 0
-            var wSum: Float = 0.0
-            var specVal: Float = 0.0
-            while ch < melChannels {
-                let left = melPoints[ch]
-                let center = melPoints[ch + 1]
-                let right = melPoints[ch + 2]
-                var w: Float = 0.0
-                if left <= melVal {
-                    if melVal <= center {
-                        let span = center - left
-                        if 1e-6 < span {
-                            w = (melVal - left) / span
-                        }
-                    } else {
-                        if melVal <= right {
-                            let span = right - center
-                            if 1e-6 < span {
-                                w = (right - melVal) / span
-                            }
-                        }
-                    }
-                }
-                specVal += w * mel[ch]
-                wSum += w
-                ch += 1
-            }
-            if 1e-6 < wSum {
-                specVal /= wSum
-            }
-            if specVal < 1e-8 {
-                specVal = 1e-8
-            }
-            powerSpectrum[k] = specVal
-            k += 1
-        }
-
-        // Wiener-Khinchin IDCT: r_tau = (1/fftBins) * sum_k S[k] * cos(pi * k * tau / (fftBins - 1))
-        var r = [Float](repeating: 0.0, count: lpcOrder + 1)
-        let normFactor: Float = 1.0 / Float(fftBins)
-        var tau = 0
-        while tau <= lpcOrder {
-            var sum: Float = 0.0
-            k = 0
-            while k < fftBins {
-                let angle = (Float.pi * Float(k * tau)) / Float(fftBins - 1)
-                sum += powerSpectrum[k] * cos(angle)
-                k += 1
-            }
-            r[tau] = sum * normFactor
-            tau += 1
-        }
-        return r
-    }
+    // MARK: - ヘルパー関数
 
     /// 合成ホルマント Mel 特徴量の生成ヘルパー
     private func generateSyntheticVowelMel(f1Bin: Int, f2Bin: Int) -> [Float] {

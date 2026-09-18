@@ -1,11 +1,10 @@
 import XCTest
 @testable import SpikeSpeech
 
-/// Audio DSP, Rosenberg パルス, MelToLPC, LPCVocoder, WAV エンコーダーの網羅的単体テストスイート
+/// Audio DSP, NeuralVocoder, MelSpectrogramExtractor, WAV エンコーダーの網羅的単体テストスイート
 ///
-/// SIMD8 ベクトル演算のビット精度、Rosenberg 声門音源モデルの数理的周期性、
-/// Levinson-Durbin 法における反射係数クランプと単位円内極保証、
-/// 過大入力や NaN 注入に対するボコーダーの無発振安定性、
+/// SIMD8 ベクトル演算のビット精度、対数 Mel スペクトログラム抽出の数理的妥当性、
+/// ニューラルボコーダーの連続推論安定性、過大入力や NaN 注入に対する無発振安全性、
 /// および 44 バイト WAV バイナリ整合性を数理オラクルによって実証・保証する。
 final class DSPTests: XCTestCase {
 
@@ -127,136 +126,76 @@ final class DSPTests: XCTestCase {
         XCTAssertEqual(quantDst[5], 0)
     }
 
-    // MARK: - 2. Rosenberg パルス周期性・波形形状テスト
+    // MARK: - 2. NeuralVocoder 時間領域波形生成特性テスト
 
-    func testRosenbergPulsePropertiesAndPeriodicity() {
-        // 声門パルス発生器が位相アキュムレータに従って周波数通りの厳密な周期で
-        // ピークを出力しているかを数学的に検証する。
-        let sampleRate: Float = 16000.0
-        let targetF0: Float = 200.0 // 16000 / 200 = 80 サンプル周期
-        let expectedPeriod = 80
-        let totalSamples = 800 // 10 周期分
+    func testNeuralVocoderFrequencyResponseAndWaveform() {
+        // 対数 Mel フレーム系列から 16kHz PCM が破綻なく生成され、
+        // 振幅が許容範囲内に収まることを数学的に検証する。
+        let vocoder = NeuralVocoder()
+        let melFrame = [Float](repeating: -2.0, count: 64)
+        let samples = vocoder.synthesize(mel: [melFrame, melFrame])
+        XCTAssertEqual(samples.count, 320)
 
-        let pulseGen = RosenbergPulse(sampleRate: sampleRate, n1Ratio: 0.40, n2Ratio: 0.16)
-        var wave = [Float](repeating: 0.0, count: totalSamples)
-        wave.withUnsafeMutableBufferPointer { pWave in
-            pulseGen.generateFrame(f0: targetF0, count: totalSamples, dst: pWave.baseAddress!, removeDC: false)
-        }
-
-        // ピーク位置（極大値）の探索
-        var peakIndices: [Int] = []
-        var i = 1
-        while i < totalSamples - 1 {
-            let prev = wave[i - 1]
-            let curr = wave[i]
-            let next = wave[i + 1]
-            if prev < curr {
-                if next <= curr {
-                    if 0.5 < curr {
-                        peakIndices.append(i)
-                    }
-                }
+        var hasNonZero = false
+        var maxVal: Float = 0.0
+        var i = 0
+        while i < samples.count {
+            let s = samples[i]
+            XCTAssertTrue(s.isFinite)
+            if 0.0 < abs(s) {
+                hasNonZero = true
+            }
+            if maxVal < abs(s) {
+                maxVal = abs(s)
             }
             i += 1
         }
+        XCTAssertTrue(hasNonZero)
+        XCTAssertTrue(maxVal <= 1.0)
+    }
 
-        XCTAssertTrue(5 <= peakIndices.count, "検出されたパルスピーク数が不足しています: \(peakIndices.count)")
-        var pIdx = 1
-        while pIdx < peakIndices.count {
-            let interval = peakIndices[pIdx] - peakIndices[pIdx - 1]
-            let diff = abs(interval - expectedPeriod)
-            // 離散サンプリングによる ±1 サンプルの量子化誤差を許容
-            XCTAssertTrue(diff <= 1, "パルス周期が目標周期から乖離: interval=\(interval), expected=\(expectedPeriod)")
-            pIdx += 1
+    // MARK: - 3. AudioFeatureExtractor 特徴量抽出妥当性テスト
+
+    func testMelSpectrogramExtractorProperties() {
+        // 短時間フーリエ変換と Mel フィルタバンクによる対数 Mel スペクトログラム抽出が
+        // 有限な数値を安定して出力することを保証する。
+        let extractor = MelSpectrogramExtractor(sampleRate: 16000, melChannels: 64, hopSize: 160, fftSize: 512)
+        var sine = [Float](repeating: 0.0, count: 640)
+        var s = 0
+        while s < 640 {
+            sine[s] = sinf(2.0 * Float.pi * 440.0 * Float(s) / 16000.0) * 0.5
+            s += 1
         }
+        let melFrames = extractor.extractLogMel(pcm: sine)
+        XCTAssertTrue(0 < melFrames.count)
 
-        // パルス値の数理的特性の検証 (開口期・閉口期・閉鎖期)
-        let v0 = pulseGen.pulseValue(at: 0.0)
-        XCTAssertEqual(v0, 0.0, accuracy: 1e-6)
-        let vPeak = pulseGen.pulseValue(at: 0.40) // N1 = 0.40 でピーク 1.0
-        XCTAssertEqual(vPeak, 1.0, accuracy: 1e-5)
-        let vClose = pulseGen.pulseValue(at: 0.56) // N1 + N2 = 0.56 で閉口 0.0
-        XCTAssertEqual(vClose, 0.0, accuracy: 1e-5)
-        let vSilent = pulseGen.pulseValue(at: 0.80) // 閉鎖期
-        XCTAssertEqual(vSilent, 0.0, accuracy: 1e-6)
-
-        // 無声区間 (F0 = 0.0) での出力検証
-        var unvoicedWave = [Float](repeating: 1.0, count: 160)
-        unvoicedWave.withUnsafeMutableBufferPointer { pWave in
-            pulseGen.generateFrame(f0: 0.0, count: 160, dst: pWave.baseAddress!, removeDC: true)
-        }
-        var uIdx = 0
-        while uIdx < 160 {
-            XCTAssertEqual(unvoicedWave[uIdx], 0.0)
-            uIdx += 1
+        var f = 0
+        while f < melFrames.count {
+            XCTAssertEqual(melFrames[f].count, 64)
+            var ch = 0
+            while ch < 64 {
+                XCTAssertTrue(melFrames[f][ch].isFinite)
+                ch += 1
+            }
+            f += 1
         }
     }
 
-    // MARK: - 3. MelToLPC 変換と Levinson-Durbin の数学的妥当性テスト
+    // MARK: - 4. NeuralVocoder の安定性・エネルギー保持テスト
 
-    func testMelToLPCConversionAndLevinsonDurbin() {
-        // 逆写像行列、Wiener-Khinchin IDCT 自己相関、および Levinson-Durbin の
-        // 各パイプラインが NaN を発生させずに安定した係数を出力することを保証する。
-        let melToLpc = MelToLPC(melChannels: 64, fftBins: 257, lpcOrder: 16, sampleRate: 16000.0)
-
-        // 1. 低域（母音の第1ホルマント付近）にピークを持つ Mel 特徴量の生成
-        var mel = [Float](repeating: 0.0, count: 64)
-        var ch = 0
-        while ch < 64 {
-            let dist = Float(ch - 8)
-            mel[ch] = exp(-(dist * dist) * 0.05) * 5.0
-            ch += 1
-        }
-
-        var lpcCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLpc.convert(mel: mel, isLogMel: false, outCoeffs: &lpcCoeffs)
-
-        XCTAssertTrue(0.0 < gain, "ゲインが正値になっていません: \(gain)")
-        var k = 0
-        while k < 16 {
-            let coeff = lpcCoeffs[k]
-            // NaN / Inf チェック
-            XCTAssertEqual(coeff, coeff, "LPC 係数に NaN が含まれています: index=\(k)")
-            XCTAssertTrue(abs(coeff) < 100.0, "LPC 係数が異常に肥大化しています: \(coeff)")
-            k += 1
-        }
-
-        // 2. 無音入力に対するフェイルセーフ検証
-        let zeroMel = [Float](repeating: -20.0, count: 64) // 極小 log-mel
-        var zeroCoeffs = [Float](repeating: 1.0, count: 16)
-        let zeroGain = melToLpc.convert(mel: zeroMel, isLogMel: true, outCoeffs: &zeroCoeffs)
-        XCTAssertTrue(zeroGain <= 1e-3, "無音入力時のゲインが抑制されていません: \(zeroGain)")
-    }
-
-    // MARK: - 4. LPC 合成ボコーダーの安定性・無発振テスト
-
-    func testLPCVocoderStabilityAndResonance() {
-        // IIR フィルタの過去状態が帰還ループで無限大に発散せず、
-        // 安定したエネルギー包らかを持つ音声波形が継続して出力されることを実証する。
-        let vocoder = LPCVocoder(sampleRate: 16000.0, frameSize: 160, lpcOrder: 16, deEmphasisCoeff: 0.97)
-
-        // 代表的な日本語母音 /a/ の LPC 係数モデル (F1=800Hz, F2=1300Hz 付近に共鳴極)
-        // 安定な単位円内極を持つ多項式係数列
-        let vowelCoeffs: [Float] = [
-            1.25, -0.85, 0.45, -0.25, 0.15, -0.08, 0.04, -0.02,
-            0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        ]
+    func testNeuralVocoderStabilityAndResonance() {
+        // 連続する Mel フレームに対して内部状態が発散せず、
+        // 安定したエネルギーを持つ音声波形が継続して出力されることを実証する。
+        let vocoder = NeuralVocoder()
         let frameCount = 10
-        var frames: [AcousticFrame] = []
+        var frames: [[Float]] = []
         var f = 0
         while f < frameCount {
-            frames.append(
-                AcousticFrame(
-                    lpcCoefficients: vowelCoeffs,
-                    gain: 0.05,
-                    pitchF0: 150.0, // 150Hz 有声音
-                    voiced: 1.0
-                )
-            )
+            frames.append([Float](repeating: -3.0, count: 64))
             f += 1
         }
 
-        let audio = vocoder.synthesize(frames: frames)
+        let audio = vocoder.synthesize(mel: frames)
         XCTAssertEqual(audio.count, frameCount * 160)
 
         var hasNonZero = false
@@ -264,7 +203,7 @@ final class DSPTests: XCTestCase {
         var sIdx = 0
         while sIdx < audio.count {
             let s = audio[sIdx]
-            XCTAssertEqual(s, s, "ボコーダー出力に NaN が混入しました: sample=\(sIdx)")
+            XCTAssertTrue(s.isFinite)
             if 0.0 < abs(s) {
                 hasNonZero = true
             }
@@ -274,55 +213,43 @@ final class DSPTests: XCTestCase {
             sIdx += 1
         }
 
-        XCTAssertTrue(hasNonZero, "合成音声が完全な無音です")
-        XCTAssertTrue(maxVal <= 1.0, "合成音声がクリッピングレベルを超過しています: \(maxVal)")
+        XCTAssertTrue(hasNonZero)
+        XCTAssertTrue(maxVal <= 1.0)
     }
 
     // MARK: - 5. NaN/Inf ガードおよび過大入力サチュレーション耐性テスト
 
-    func testLPCVocoderNaNAndOverdriveSafety() {
-        // SNN 音響モデルの学習初期や異常勾配によって異常パラメータが出力された場合でも、
-        // ボコーダーがクラッシュせず安全にフォールバックすることを証明する。
-        let vocoder = LPCVocoder(sampleRate: 16000.0, frameSize: 160, lpcOrder: 16)
+    func testNeuralVocoderNaNAndOverdriveSafety() {
+        // 極大入力や非有限値（NaN, ±Inf）が入力された場合でも、
+        // ボコーダーがクラッシュせず安全に有限値でフォールバックすることを証明する。
+        let vocoder = NeuralVocoder()
 
-        // 1. 巨大ゲインフレーム (Overdrive)
-        let overdriveFrame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.2, count: 16),
-            gain: 1000.0, // 極大ゲイン
-            pitchF0: 200.0,
-            voiced: 1.0
-        )
-        var outOverdrive = [Float](repeating: 0.0, count: 160)
-        outOverdrive.withUnsafeMutableBufferPointer { pDst in
-            vocoder.synthesizeFrame(frame: overdriveFrame, dst: pDst.baseAddress!)
-        }
+        // 1. 巨大値フレーム (Overdrive)
+        let overdriveFrame = [Float](repeating: 50.0, count: 64)
+        let outOverdrive = vocoder.synthesize(mel: [overdriveFrame])
+        XCTAssertEqual(outOverdrive.count, 160)
 
         var i = 0
         while i < 160 {
             let s = outOverdrive[i]
-            XCTAssertEqual(s, s, "Overdrive 入力で NaN が発生しました")
-            XCTAssertTrue(s <= 1.0, "Soft Limiter が 1.0 を超えるサンプルを許容しました: \(s)")
-            XCTAssertTrue(-1.0 <= s, "Soft Limiter が -1.0 を下回るサンプルを許容しました: \(s)")
+            XCTAssertTrue(s.isFinite)
+            XCTAssertTrue(-1.0 <= s)
+            XCTAssertTrue(s <= 1.0)
             i += 1
         }
 
         // 2. NaN 係数フレームの注入
-        let nanFrame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: Float.nan, count: 16),
-            gain: Float.nan,
-            pitchF0: 200.0,
-            voiced: 1.0
-        )
-        var outNaN = [Float](repeating: 0.0, count: 160)
-        outNaN.withUnsafeMutableBufferPointer { pDst in
-            vocoder.synthesizeFrame(frame: nanFrame, dst: pDst.baseAddress!)
-        }
+        var nanMel = [Float](repeating: -2.0, count: 64)
+        nanMel[0] = Float.nan
+        nanMel[1] = Float.infinity
+        nanMel[2] = -Float.infinity
+        let outNaN = vocoder.synthesize(mel: [nanMel])
+        XCTAssertEqual(outNaN.count, 160)
 
         i = 0
         while i < 160 {
             let s = outNaN[i]
-            XCTAssertEqual(s, s, "NaN 注入後の出力に NaN が漏洩しました")
-            XCTAssertEqual(s, 0.0, "NaN 注入時に 0.0 に安全フォールバックしていません")
+            XCTAssertTrue(s.isFinite)
             i += 1
         }
     }
@@ -425,27 +352,18 @@ final class DSPTests: XCTestCase {
         }
     }
 
-    // MARK: - 7. 無音・ゼロフレーム入力に対する完全ゼロ出力テスト
+    // MARK: - 7. 無音・微小 Mel 入力に対する安定出力テスト
 
-    func testLPCVocoderSilenceAndZeroFrame() {
-        // ポーズや文末において、乱数ノイズやパルス発振が漏れ出さず、
-        // 厳密に 0.0 のデジタル無音が生成されることを保証する。
-        let vocoder = LPCVocoder(sampleRate: 16000.0, frameSize: 160, lpcOrder: 16)
-        let silenceFrame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.0, count: 16),
-            gain: 0.0,
-            pitchF0: 0.0,
-            voiced: 0.0
-        )
-
-        var dst = [Float](repeating: 1.0, count: 160)
-        dst.withUnsafeMutableBufferPointer { pDst in
-            vocoder.synthesizeFrame(frame: silenceFrame, dst: pDst.baseAddress!)
-        }
-
+    func testNeuralVocoderSilenceHandling() {
+        // ポーズや文末において、極小対数 Mel 入力に対して
+        // 異常発散せず有限な波形が出力されることを保証する。
+        let vocoder = NeuralVocoder()
+        let silenceFrame = [Float](repeating: -20.0, count: 64)
+        let samples = vocoder.synthesize(mel: [silenceFrame])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
         while i < 160 {
-            XCTAssertEqual(dst[i], 0.0, "無音フレームで非ゼロ出力が発生しました: index=\(i)")
+            XCTAssertTrue(samples[i].isFinite)
             i += 1
         }
     }
@@ -479,26 +397,23 @@ final class DSPTests: XCTestCase {
         }
     }
 
-    // MARK: - 9. 反射係数クランプの極限境界値検証
+    // MARK: - 9. 極端な Mel ピーク入力に対するクランプ安定性テスト
 
-    func testMelToLPCReflectionCoefficientClamp() {
-        // 単一周波数成分が極端に突出した自己相関が入力された場合でも、
-        // 反射係数が確実にクランプされ、極の安定性が維持されることを検証する。
-        let melToLpc = MelToLPC(melChannels: 64, fftBins: 257, lpcOrder: 16)
+    func testNeuralVocoderExtremeMelPeakStability() {
+        // 単一周波数成分が極端に突出した対数 Mel が入力された場合でも、
+        // 内部畳み込みが発散せず、出力サンプルが [-1.0, 1.0] に安全に収まることを検証する。
+        let vocoder = NeuralVocoder()
+        var extremeMel = [Float](repeating: -10.0, count: 64)
+        extremeMel[10] = 50.0 // 極大ピーク
 
-        // 単一チャンネルのみが極端に巨大なスペクトル (ディラックのデルタ型 Mel)
-        var extremeMel = [Float](repeating: -20.0, count: 64)
-        extremeMel[10] = 30.0 // 極大ピーク
-
-        var outCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLpc.convert(mel: extremeMel, isLogMel: true, outCoeffs: &outCoeffs)
-
-        XCTAssertTrue(0.0 <= gain, "ゲインが負値になっています")
+        let samples = vocoder.synthesize(mel: [extremeMel])
+        XCTAssertEqual(samples.count, 160)
         var i = 0
-        while i < 16 {
-            let c = outCoeffs[i]
-            XCTAssertEqual(c, c, "クランプ後係数に NaN が混入しました: index=\(i)")
-            XCTAssertTrue(abs(c) < 50.0, "係数が異常発散しています: \(c)")
+        while i < 160 {
+            let s = samples[i]
+            XCTAssertTrue(s.isFinite)
+            XCTAssertTrue(-1.0 <= s)
+            XCTAssertTrue(s <= 1.0)
             i += 1
         }
     }

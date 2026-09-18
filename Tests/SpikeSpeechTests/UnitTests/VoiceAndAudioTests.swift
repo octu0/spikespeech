@@ -8,24 +8,18 @@ final class VoiceAndAudioTests: XCTestCase {
     // MARK: - 1. VoiceProfile 単体検証
 
     /// 既定の話者プロファイル（女性、男性、中性、子供、重低音）の生理音響パラメータ整合性を検証
+    /// 既定の話者プロファイル（女性、男性、中性、子供、重低音）の基音パラメータ整合性を検証
     func testVoiceProfilePresetsIntegrity() {
         // 女性ボイス（標準基準）
         let female = VoiceProfile.female
         XCTAssertEqual(female.name, "female")
         XCTAssertEqual(female.baseF0, 220.0)
-        XCTAssertEqual(female.glottal.openQuotient, 0.55)
-        XCTAssertEqual(female.glottal.returnQuotient, 0.16)
-        XCTAssertEqual(female.glottal.aspirationMix, 0.04)
-        XCTAssertEqual(female.tract.lengthScale, 1.00)
-        XCTAssertEqual(female.tract.bandwidthScale, 1.00)
         XCTAssertEqual(female.energyScale, 1.0)
 
-        // 男性ボイス（低域ピッチ 120Hz、締まった声帯 OQ 0.42、長い声道 0.85）
+        // 男性ボイス (低域ピッチ 120Hz)
         let male = VoiceProfile.male
         XCTAssertEqual(male.name, "male")
         XCTAssertTrue(male.baseF0 < 220.0)
-        XCTAssertTrue(male.glottal.openQuotient < female.glottal.openQuotient)
-        XCTAssertTrue(male.tract.lengthScale < female.tract.lengthScale)
 
         // 中性ボイス (baseF0 170Hz)
         let neutral = VoiceProfile.neutral
@@ -33,25 +27,21 @@ final class VoiceAndAudioTests: XCTestCase {
         XCTAssertTrue(neutral.baseF0 < female.baseF0)
         XCTAssertTrue(male.baseF0 < neutral.baseF0)
 
-        // 子供ボイス (baseF0 300Hz、短い声道 1.18、息漏れ 0.10)
+        // 子供ボイス (baseF0 300Hz)
         let child = VoiceProfile.child
         XCTAssertEqual(child.name, "child")
         XCTAssertTrue(female.baseF0 < child.baseF0)
-        XCTAssertTrue(female.tract.lengthScale < child.tract.lengthScale)
-        XCTAssertTrue(female.glottal.aspirationMix < child.glottal.aspirationMix)
 
-        // 重低音男性ボイス (baseF0 95Hz、極めて長い声道 0.80)
+        // 重低音男性ボイス (baseF0 95Hz)
         let deepMale = VoiceProfile.deepMale
         XCTAssertEqual(deepMale.name, "deepMale")
         XCTAssertTrue(deepMale.baseF0 < male.baseF0)
-        XCTAssertTrue(deepMale.tract.lengthScale < male.tract.lengthScale)
 
         // 既定値が female であること
         XCTAssertEqual(VoiceProfile.default, VoiceProfile.female)
 
         // 名前に基づくプリセット解決
         XCTAssertEqual(VoiceProfile.preset(named: "female"), VoiceProfile.female)
-        XCTAssertEqual(VoiceProfile.preset(named: "jsut"), VoiceProfile.female)
         XCTAssertEqual(VoiceProfile.preset(named: "male"), VoiceProfile.male)
         XCTAssertEqual(VoiceProfile.preset(named: "man"), VoiceProfile.male)
         XCTAssertEqual(VoiceProfile.preset(named: "neutral"), VoiceProfile.neutral)
@@ -67,8 +57,6 @@ final class VoiceAndAudioTests: XCTestCase {
         let customVoice = VoiceProfile(
             name: "custom_actor",
             baseF0: 185.0,
-            glottal: GlottalSource(openQuotient: 0.50, returnQuotient: 0.12, aspirationMix: 0.05, spectralTilt: -1.5),
-            tract: VocalTract(lengthScale: 0.92, bandwidthScale: 0.95),
             energyScale: 1.02
         )
 
@@ -80,8 +68,6 @@ final class VoiceAndAudioTests: XCTestCase {
 
         XCTAssertEqual(decoded.name, customVoice.name)
         XCTAssertEqual(decoded.baseF0, customVoice.baseF0)
-        XCTAssertEqual(decoded.glottal, customVoice.glottal)
-        XCTAssertEqual(decoded.tract, customVoice.tract)
         XCTAssertEqual(decoded.energyScale, customVoice.energyScale)
     }
 
@@ -419,26 +405,11 @@ final class VoiceAndAudioTests: XCTestCase {
         let femaleZeroCrossings = countBaseZeroCrossings(femaleSamples)
         let maleZeroCrossings = countBaseZeroCrossings(maleSamples)
 
-        var rawFemaleCrossings = 0
-        var fi = 1
-        while fi < femaleSamples.count {
-            if (femaleSamples[fi - 1] < 0.0 && 0.0 <= femaleSamples[fi]) || (0.0 <= femaleSamples[fi - 1] && femaleSamples[fi] < 0.0) {
-                rawFemaleCrossings += 1
-            }
-            fi += 1
-        }
-        var rawMaleCrossings = 0
-        var mi = 1
-        while mi < maleSamples.count {
-            if (maleSamples[mi - 1] < 0.0 && 0.0 <= maleSamples[mi]) || (0.0 <= maleSamples[mi - 1] && maleSamples[mi] < 0.0) {
-                rawMaleCrossings += 1
-            }
-            mi += 1
-        }
-
-        // 低域ピッチの男性ボイスはゼロ交差密度が低下する
-        XCTAssertTrue(rawMaleCrossings < rawFemaleCrossings, "男性ボイスの直接ゼロ交差数が女性ボイスを下回っていません: male=\(rawMaleCrossings), female=\(rawFemaleCrossings)")
-        XCTAssertTrue(maleZeroCrossings < femaleZeroCrossings, "男性ボイスの平滑化ゼロ交差数が女性ボイスを下回っていません: male=\(maleZeroCrossings), female=\(femaleZeroCrossings)")
+        // なぜ基音成分を平滑化したゼロ交差数を比較するか:
+        // 高周波フォルマント共鳴の交差を排し、低い基音を持つ男性ボイス（125Hz）が女性ボイス（220Hz）より
+        // 基音ゼロ交差数が確実に少なくなる周波数特性を検証するため。
+        XCTAssertTrue(maleZeroCrossings < femaleZeroCrossings, "男性ボイスの基音ゼロ交差数が女性ボイスを下回っていません: male=\(maleZeroCrossings), female=\(femaleZeroCrossings)")
+        XCTAssertTrue(0 < maleZeroCrossings, "平滑化ゼロ交差数がゼロです")
     }
 
     /// 話者切り替え時において、話者基音の絶対値が変わっても「発音・アクセントの響き（相対 F0 輪郭）」が
@@ -521,200 +492,66 @@ final class VoiceAndAudioTests: XCTestCase {
         XCTAssertTrue(0.99 <= corr, "話者差し替えによる相対アクセント相関が不十分です: r=\(corr)")
     }
 
-    /// ピッチ（baseF0）および声門励起を同一に保った条件下で、VocalTract.lengthScale（真の VTLN）の差異により合成波形・共鳴スペクトルが有意に変化することを実証
-    func testVocalTractVTLNModifiesLPCAndSpectrum() {
+    /// SpeakerConditioning 構造体の初期化、ゼロ値、および JSON 直列化・逆直列化を検証
+    func testSpeakerConditioningVectorRepresentation() throws {
+        XCTAssertEqual(SpeakerConditioning.defaultDimension, 128)
+
+        let zeroCond = SpeakerConditioning.zero
+        XCTAssertEqual(zeroCond.dimension, 128)
+        XCTAssertEqual(zeroCond.embedding.count, 128)
+        XCTAssertTrue(zeroCond.embedding.allSatisfy { $0 == 0.0 })
+
+        var customVec = [Float](repeating: 0.0, count: 128)
+        var i = 0
+        while i < 128 {
+            customVec[i] = Float(i) * 0.01
+            i += 1
+        }
+        let customCond = SpeakerConditioning(embedding: customVec)
+        XCTAssertEqual(customCond.dimension, 128)
+
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(customCond)
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(SpeakerConditioning.self, from: data)
+
+        XCTAssertEqual(decoded.dimension, customCond.dimension)
+        XCTAssertEqual(decoded.embedding, customCond.embedding)
+    }
+
+    /// VoiceProfile の差が言語 F0 (baseF0) のみであることを検証（受入条件 5）
+    func testVoiceProfileBaseF0DifferenceOnly() {
+        let female = VoiceProfile.female
+        let male = VoiceProfile.male
+
+        // baseF0 のみが異なり、声帯・声道物理共鳴モデル等の不要なスペクトル差分パラメータが存在しないこと
+        XCTAssertNotEqual(female.baseF0, male.baseF0)
+        XCTAssertEqual(female.energyScale, male.energyScale)
+    }
+
+    /// SpikeSpeechEngine の波形合成において SpeakerConditioning が正しく反映されることを検証
+    func testSpeakerConditioningAffectsSynthesize() {
         let engine = SpikeSpeechEngine()
-        let text = "あああああ"
+        let text = "こんにちは"
 
-        // 同一ピッチ・同一声帯音源で、声道長（lengthScale）のみ 1.00 vs 0.85（男性声道）のプロファイル
-        let baseProfile = VoiceProfile(
-            name: "standard_tract",
-            baseF0: 200.0,
-            glottal: GlottalSource(),
-            tract: VocalTract(lengthScale: 1.00, bandwidthScale: 1.00),
-            energyScale: 1.0
-        )
-        let longTractProfile = VoiceProfile(
-            name: "long_tract",
-            baseF0: 200.0,
-            glottal: GlottalSource(),
-            tract: VocalTract(lengthScale: 0.85, bandwidthScale: 0.90),
-            energyScale: 1.0
-        )
+        let speakerA = SpeakerConditioning(embedding: [Float](repeating: 0.5, count: 128))
+        let speakerB = SpeakerConditioning(embedding: [Float](repeating: -0.5, count: 128))
 
-        let samplesBase = engine.synthesize(text: text, voice: baseProfile)
-        let samplesScaled = engine.synthesize(text: text, voice: longTractProfile)
+        let pcmA = engine.synthesize(text: text, speaker: speakerA)
+        let pcmB = engine.synthesize(text: text, speaker: speakerB)
 
-        XCTAssertTrue(0 < samplesBase.count)
-        XCTAssertTrue(0 < samplesScaled.count)
+        XCTAssertFalse(pcmA.isEmpty)
+        XCTAssertFalse(pcmB.isEmpty)
+        XCTAssertEqual(pcmA.count, pcmB.count)
 
         var diffSum: Float = 0.0
-        let count = min(samplesBase.count, samplesScaled.count)
         var i = 0
-        while i < count {
-            diffSum += abs(samplesBase[i] - samplesScaled[i])
+        while i < pcmA.count {
+            diffSum += abs(pcmA[i] - pcmB[i])
             i += 1
         }
-        let avgDiff = diffSum / Float(count)
-        // Hz 空間でのフォルマント周波数シフトにより合成波形に統計的有意差が生じる
-        XCTAssertTrue(0.005 < avgDiff, "VTLN による合成波形差分が検出されません: diff=\(avgDiff)")
-    }
-
-    /// PhonemeAcousticPrior における真の VTLN による F1 フォルマントピークの周波数シフトを検証（相談書 §5.8 必須検定）
-    func testPhonemeAcousticPriorFormantPeakShift() {
-        // 女性基準 (lengthScale=1.00) と男性 (lengthScale=0.85: 長い声道によりフォルマントが低域へシフト)
-        let femalePrior = PhonemeAcousticPrior(tract: VocalTract(lengthScale: 1.00, bandwidthScale: 1.00))
-        let malePrior = PhonemeAcousticPrior(tract: VocalTract(lengthScale: 0.85, bandwidthScale: 1.00))
-
-        // 母音 /a/ (ID 5) の事前対数 Mel スペクトル（64 チャンネル）
-        let femaleA = femalePrior.getPriorMel(phoneId: 5)
-        let maleA = malePrior.getPriorMel(phoneId: 5)
-
-        // F1 フォルマント帯域（低周波側、チャンネル 0〜25）におけるピーク位置（argmax）を探索
-        var femalePeakBin = 0
-        var femaleMaxVal: Float = -100.0
-        var bin = 0
-        while bin < 25 {
-            if femaleMaxVal < femaleA[bin] {
-                femaleMaxVal = femaleA[bin]
-                femalePeakBin = bin
-            }
-            bin += 1
-        }
-
-        var malePeakBin = 0
-        var maleMaxVal: Float = -100.0
-        bin = 0
-        while bin < 25 {
-            if maleMaxVal < maleA[bin] {
-                maleMaxVal = maleA[bin]
-                malePeakBin = bin
-            }
-            bin += 1
-        }
-
-        // 男性声道（lengthScale=0.85）では F1 フォルマントピークのビン番号が女性基準よりも低周波側へ有意にシフトすることを実証
-        XCTAssertTrue(malePeakBin < femalePeakBin, "男性 Prior の F1 フォルマントピークが低域側へシフトしていません: maleBin=\(malePeakBin), femaleBin=\(femalePeakBin)")
-    }
-
-    /// 声帯音源 OQ（開口率）の違いによる高調波エネルギー減衰（H1-H2 相当）の物理特性変化を検証（相談書 §5.8 必須検定）
-    func testGlottalSourceHarmonicDecay() {
-        let pulse = RosenbergPulse(sampleRate: 16000.0)
-
-        // 女性基準の開口率 (OQ 0.55, RQ 0.16)
-        let femaleGlottal = GlottalSource(openQuotient: 0.55, returnQuotient: 0.16)
-        pulse.apply(glottal: femaleGlottal)
-
-        // 160Hz の声帯振動波形を 320 サンプル（2 周期分）生成
-        let periodSamples = Int(16000.0 / 160.0)
-        let totalSamples = periodSamples * 2
-        var femaleWave = [Float](repeating: 0.0, count: totalSamples)
-        var s = 0
-        while s < totalSamples {
-            femaleWave[s] = pulse.nextSample(f0: 160.0, removeDC: true)
-            s += 1
-        }
-
-        // 引き締まった重低音の急峻な声帯閉鎖 (OQ 0.38, RQ 0.08)
-        let deepGlottal = GlottalSource(openQuotient: 0.38, returnQuotient: 0.08)
-        pulse.apply(glottal: deepGlottal)
-        pulse.reset()
-        var deepWave = [Float](repeating: 0.0, count: totalSamples)
-        s = 0
-        while s < totalSamples {
-            deepWave[s] = pulse.nextSample(f0: 160.0, removeDC: true)
-            s += 1
-        }
-
-        // 基本波 H1 (160Hz, 周期 k=2) と第 2 高調波 H2 (320Hz, 周期 k=4) のフーリエ係数絶対値を離散フーリエ積分で計算
-        func computeHarmonicPower(wave: [Float], harmonicK: Int) -> Float {
-            var re: Float = 0.0
-            var im: Float = 0.0
-            let n = wave.count
-            var i = 0
-            while i < n {
-                let angle = (2.0 * Float.pi * Float(harmonicK) * Float(i)) / Float(n)
-                re += wave[i] * cosf(angle)
-                im -= wave[i] * sinf(angle)
-                i += 1
-            }
-            return (re * re) + (im * im)
-        }
-
-        let femaleH1 = computeHarmonicPower(wave: femaleWave, harmonicK: 2)
-        let femaleH2 = computeHarmonicPower(wave: femaleWave, harmonicK: 4)
-        let deepH1 = computeHarmonicPower(wave: deepWave, harmonicK: 2)
-        let deepH2 = computeHarmonicPower(wave: deepWave, harmonicK: 4)
-
-        let femaleRatio = femaleH2 / max(1e-6, femaleH1)
-        let deepRatio = deepH2 / max(1e-6, deepH1)
-
-        // 急峻な閉鎖特性（OQ 0.38）を持つ重低音男声は、開口率の緩やかな女性声（OQ 0.55）に比べて
-        // 高次倍音（第 2 高調波 H2）の相対エネルギー比率が有意に増大（H1-H2 減衰が小さくエッジが立つ）することを実証
-        XCTAssertTrue(femaleRatio < deepRatio, "急峻閉鎖パルスの高次倍音比率が女性パルスを上回っていません: femaleRatio=\(femaleRatio), deepRatio=\(deepRatio)")
-    }
-
-    /// 正のスペクトル傾斜 (spectralTilt: +1.0) により高周波エネルギーが増加することを検証（相談書 §5.8 必須検定）
-    func testSpectralTiltHighFrequencyEmphasis() {
-        let vocoderFlat = LPCVocoder()
-        vocoderFlat.apply(glottal: GlottalSource(spectralTilt: 0.0))
-
-        let vocoderTilted = LPCVocoder()
-        vocoderTilted.apply(glottal: GlottalSource(spectralTilt: 1.5))
-
-        // 全極フィルタメモリをゼロにした有声励起フレーム（同一ゲイン・同一基音）
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.0, count: 16),
-            gain: 1.0,
-            pitchF0: 200.0,
-            voiced: 1.0
-        )
-
-        var flatBuffer = [Float](repeating: 0.0, count: 160)
-        var tiltedBuffer = [Float](repeating: 0.0, count: 160)
-
-        flatBuffer.withUnsafeMutableBufferPointer { dst in
-            vocoderFlat.synthesizeFrame(frame: frame, dst: dst.baseAddress!)
-        }
-        tiltedBuffer.withUnsafeMutableBufferPointer { dst in
-            vocoderTilted.synthesizeFrame(frame: frame, dst: dst.baseAddress!)
-        }
-
-        // 高域（サンプル間差分エネルギー）の算出
-        var flatHighEnergy: Float = 0.0
-        var tiltedHighEnergy: Float = 0.0
-        var i = 1
-        while i < 160 {
-            let dFlat = flatBuffer[i] - flatBuffer[i - 1]
-            let dTilted = tiltedBuffer[i] - tiltedBuffer[i - 1]
-            flatHighEnergy += dFlat * dFlat
-            tiltedHighEnergy += dTilted * dTilted
-            i += 1
-        }
-
-        // 正の spectralTilt により高域微分エネルギーが有意に増加することを実証
-        XCTAssertTrue(flatHighEnergy < tiltedHighEnergy, "正の spectralTilt による高域エネルギー増加が検出されません: flat=\(flatHighEnergy), tilted=\(tiltedHighEnergy)")
-    }
-
-    /// RosenbergPulse の GlottalSource 動的更新を検証
-    func testGlottalSourceDynamicPulseModification() {
-        let pulse = RosenbergPulse(sampleRate: 16000.0)
-
-        // 標準開口率
-        let standardGlottal = GlottalSource(openQuotient: 0.55, returnQuotient: 0.16)
-        pulse.apply(glottal: standardGlottal)
-        let stdN1 = pulse.n1Ratio
-        let stdN2 = pulse.n2Ratio
-
-        // 重低音・引き締まった声帯（OQ 0.38, RQ 0.08）
-        let deepGlottal = GlottalSource(openQuotient: 0.38, returnQuotient: 0.08)
-        pulse.apply(glottal: deepGlottal)
-        let deepN1 = pulse.n1Ratio
-        let deepN2 = pulse.n2Ratio
-
-        // 開口時間比率および閉口時間比率が動的に短縮されることを検証
-        XCTAssertTrue(deepN1 < stdN1, "開口時間が引き締まり短縮されていること")
-        XCTAssertTrue(deepN2 < stdN2, "閉口急峻度が高まり短縮されていること")
+        let avgDiff = diffSum / Float(pcmA.count)
+        XCTAssertTrue(1e-5 < avgDiff, "話者条件付けによる波形差分が検出されません: diff=\(avgDiff)")
     }
 
     /// ProsodyModel において話者基音 baseF0 を差し替えても相対アクセント・抑揚が完全に保存されることを検証
@@ -782,11 +619,9 @@ final class VoiceAndAudioTests: XCTestCase {
         XCTAssertTrue(0 < streamChunkCount)
     }
 
-    /// 残差スケール residualScale の既定値が 1.0 であり、正本パイプラインで生成された学習目標残差と推論側の Prior 加算が
-    /// 数学的に完全可逆（往復復元）であることを実データで検証
+    /// 正本パイプラインで生成された学習目標残差が数学的に完全可逆（往復復元）であることを実データで検証
     func testResidualScaleConsistency() {
         let engine = SpikeSpeechEngine()
-        XCTAssertEqual(engine.residualScale, 1.0, "既定の残差スケールは 1.0 でなければなりません")
 
         let extractor = MelSpectrogramExtractor()
         let tracker = PitchTracker()
@@ -816,9 +651,6 @@ final class VoiceAndAudioTests: XCTestCase {
         let frameCount = min(pair.targets.count, originalMel.count)
         XCTAssertTrue(0 < frameCount)
 
-        // なぜ targets[t] が直接 targetMel[t] と厳密に一致することを検証するか:
-        // 手書き Prior 残差学習の完全撤廃に伴い、SNN の目標系列が実音声の絶対対数 Mel スペクトル（targetMel）
-        // と同一であることを数学的に保証し、ボコーダーの学習 Mel 分布と推論 Mel 分布の同一性を担保するため。
         var t = 0
         while t < frameCount {
             var c = 0
@@ -867,39 +699,6 @@ final class VoiceAndAudioTests: XCTestCase {
             i += 1
         }
         XCTAssertTrue(nonZeroMembrane, "フレーム間で膜電位が時間連続的に保持されていません")
-    }
-
-    /// computeBlendedPriorSequence が音素境界で隣接音素 Prior を滑らかにブレンドすることを検証
-    func testPriorBlendingSymmetry() {
-        let engine = SpikeSpeechEngine()
-        let activePrior = engine.acousticPrior
-
-        // 音素 ID 5 (/a/) から音素 ID 6 (/i/) への遷移
-        let framePhoneIds = [5, 5, 6, 6]
-        let blended = engine.computeBlendedPriorSequence(
-            framePhoneIds: framePhoneIds,
-            activePrior: activePrior,
-            melChannels: AudioConfig.melChannels
-        )
-
-        XCTAssertEqual(blended.count, 4)
-
-        let pureA = activePrior.getPriorMel(phoneId: 5)
-        let pureI = activePrior.getPriorMel(phoneId: 6)
-
-        // フレーム 0 は定常 /a/ なので pureA と完全一致
-        XCTAssertEqual(blended[0][10], pureA[10], accuracy: 1e-4)
-
-        // フレーム 1 は次音素 /i/ への調音結合により (0.70 * A) + (0.30 * I) にブレンド
-        let expectedBlend1 = (0.70 * pureA[10]) + (0.30 * pureI[10])
-        XCTAssertEqual(blended[1][10], expectedBlend1, accuracy: 1e-4)
-
-        // フレーム 2 は前音素 /a/ からの調音結合により (0.30 * A) + (0.70 * I) にブレンド
-        let expectedBlend2 = (0.30 * pureA[10]) + (0.70 * pureI[10])
-        XCTAssertEqual(blended[2][10], expectedBlend2, accuracy: 1e-4)
-
-        // フレーム 3 は定常 /i/ なので pureI と完全一致
-        XCTAssertEqual(blended[3][10], pureI[10], accuracy: 1e-4)
     }
 
     /// 学習データ構築パイプラインの正本（SpikeSpeechEngine.prepareTrainingPair）において、
@@ -961,7 +760,7 @@ final class VoiceAndAudioTests: XCTestCase {
             currentDir + "/Sources/SpikeSpeech/DSP/AudioFeatureExtractor.swift",
             currentDir + "/Sources/SpikeSpeech/DSP/PitchTracker.swift",
             currentDir + "/Sources/SpikeSpeech/SNN/SpikingAcousticDecoder.swift",
-            currentDir + "/script/dataset/jsut.swift",
+            currentDir + "/Sources/SpikeSpeech/DSP/NeuralVocoder.swift",
             currentDir + "/Sources/SpikeSpeech/Pipeline/SpikeSpeechEngine.swift",
             currentDir + "/Sources/SpikeSpeech/Pipeline/SpikeSpeechEngine+Training.swift",
             currentDir + "/Sources/SpikeSpeechWeb/Types.swift",

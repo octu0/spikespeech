@@ -16,9 +16,7 @@ final class Tier3CombinationTests: XCTestCase {
     private var vocabulary: PhonemeVocabulary!
     private var prosodyModel: ProsodyModel!
     private var lengthRegulator: LengthRegulator!
-    private var vocoder: LPCVocoder!
-    private var melToLPC: MelToLPC!
-    private var generator: SyntheticAudioGenerator!
+    private var vocoder: NeuralVocoder!
 
     override func setUp() {
         super.setUp()
@@ -28,9 +26,7 @@ final class Tier3CombinationTests: XCTestCase {
         self.vocabulary = PhonemeVocabulary()
         self.prosodyModel = ProsodyModel()
         self.lengthRegulator = LengthRegulator(hiddenDimension: 128)
-        self.vocoder = LPCVocoder()
-        self.melToLPC = MelToLPC()
-        self.generator = SyntheticAudioGenerator()
+        self.vocoder = NeuralVocoder()
         self.engine = SpikeSpeechEngine()
     }
 
@@ -143,11 +139,11 @@ final class Tier3CombinationTests: XCTestCase {
         XCTAssertTrue(out[0][0].isFinite)
     }
 
-    // MARK: - Pair 5: F10 (SNN音響出力) ＋ F7 (MelToLPC変換)
+    // MARK: - Pair 5: F10 (SNN音響出力) ＋ F6 (NeuralVocoder波形合成)
 
-    func testPair05_SNNAcoustic_MelToLPC_Conversion() {
-        // SNN デコーダーが生成した対数 Mel ベクトルから、Levinson-Durbin アルゴリズムを通じて
-        // 有効な LPC 声道多項式係数とゲインが導出されることを検証する。
+    func testPair05_SNNAcoustic_NeuralVocoder_Synthesis() {
+        // SNN デコーダーが生成した対数 Mel ベクトルから、NeuralVocoder を通じて
+        // 直接 16kHz PCM 波形が生成されることを検証する。
         let weights = SpikingNetworkWeights.randomWeights(inputDim: 16, maxHiddenDim: 128, outputDim: 64, timeSteps: 1, numLayers: 2)
         let decoder = SpikingAcousticDecoder(weights: weights)
         let workspace = AcousticWorkspace(maxHiddenDim: 128, outputDim: 64, numLayers: 2)
@@ -161,34 +157,21 @@ final class Tier3CombinationTests: XCTestCase {
             }
         }
 
-        var lpcCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: melOut, isLogMel: true, outCoeffs: &lpcCoeffs)
-        XCTAssertTrue(gain.isFinite)
-        XCTAssertTrue(0.0 <= gain)
-        var k = 0
-        while k < lpcCoeffs.count {
-            XCTAssertTrue(lpcCoeffs[k].isFinite)
-            k += 1
-        }
+        vocoder.reset()
+        let samples = vocoder.synthesize(mel: [melOut])
+        XCTAssertEqual(samples.count, 160)
+        XCTAssertTrue(samples[0].isFinite)
     }
 
-    // MARK: - Pair 6: F7 (MelToLPC) ＋ F6 (LPCボコーダー)
+    // MARK: - Pair 6: F6 (NeuralVocoder) ＋ 話者適応 (SpeakerConditioning)
 
-    func testPair06_MelToLPC_LPCVocoder_Waveform() {
-        // Mel 特徴量から導出された LPC パラメータフレームがボコーダーに渡され、
+    func testPair06_NeuralVocoder_SpeakerConditioning_Waveform() {
+        // 対数 Mel 特徴量と話者適応パラメータが NeuralVocoder に渡され、
         // 16kHz モノラル PCM サンプル列として破綻なく波形合成されることを検証する。
         let mel = [Float](repeating: -2.5, count: 64)
-        var lpcCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: mel, isLogMel: true, outCoeffs: &lpcCoeffs)
-
-        let frame = AcousticFrame(
-            lpcCoefficients: lpcCoeffs,
-            gain: gain,
-            pitchF0: 160.0,
-            voiced: 1.0
-        )
+        let cond = SpeakerConditioning(embedding: [Float](repeating: 0.1, count: 128))
         vocoder.reset()
-        let samples = vocoder.synthesize(frames: [frame, frame])
+        let samples = vocoder.synthesize(mel: [mel, mel], speaker: cond)
         XCTAssertEqual(samples.count, 320)
         var energy: Float = 0.0
         var i = 0
@@ -199,56 +182,49 @@ final class Tier3CombinationTests: XCTestCase {
         XCTAssertTrue(0.0 < energy)
     }
 
-    // MARK: - Pair 7: F6 (ボコーダー) ＋ F9 (Soft Limiter) ＋ F8 (WavEncoder)
+    // MARK: - Pair 7: F6 (NeuralVocoder) ＋ F8 (WavEncoder)
 
     func testPair07_Vocoder_SoftLimiter_WavEncoder() {
-        // ボコーダー出力の PCM サンプルがサチュレーション歪みなくリミッティングされ、
-        // 正常な 16kHz 16-bit Mono WAV バイナリ Data へ変換されることを検証する。
+        // ボコーダー出力の PCM サンプルが正常な 16kHz 16-bit Mono WAV バイナリ Data へ変換されることを検証する。
         vocoder.reset()
-        let frame = AcousticFrame(
-            lpcCoefficients: [Float](repeating: 0.02, count: 16),
-            gain: 0.8,
-            pitchF0: 130.0,
-            voiced: 1.0
-        )
-        let rawSamples = vocoder.synthesize(frames: [frame, frame, frame])
-        var limitedSamples = [Float](repeating: 0.0, count: rawSamples.count)
-        rawSamples.withUnsafeBufferPointer { pSrc in
-            limitedSamples.withUnsafeMutableBufferPointer { pDst in
-                VectorOperations.softLimitTanh(src: pSrc.baseAddress!, dst: pDst.baseAddress!, count: rawSamples.count)
-            }
-        }
-
-        let wavData = WavEncoder.encode(samples: limitedSamples, sampleRate: 16000)
+        let frame = [Float](repeating: -2.0, count: 64)
+        let rawSamples = vocoder.synthesize(mel: [frame, frame, frame])
+        let wavData = WavEncoder.encode(samples: rawSamples, sampleRate: 16000)
         XCTAssertEqual(wavData.count, 44 + (rawSamples.count * 2))
         XCTAssertEqual(wavData[0], 0x52) // 'R'
     }
 
-    // MARK: - Pair 8: F14 (SyntheticGenerator母音) ＋ F7 (MelToLPC反転)
+    // MARK: - Pair 8: 音響特徴量抽出 ＋ F6 (NeuralVocoder 再合成)
 
-    func testPair08_SyntheticVowel_MelToLPC_Inversion() {
-        // 自動生成した母音波形から抽出された Mel 特徴量に相当するスペクトルが
-        // MelToLPC によって安定した共鳴多項式へ再構成されることを検証する。
-        let vowelSamples = generator.generateVowel(vowel: .a, durationSeconds: 0.05, f0: 130.0)
-        XCTAssertTrue(0 < vowelSamples.count)
+    func testPair08_Spectrogram_NeuralVocoder_RoundTrip() {
+        // MelSpectrogramExtractor で抽出した対数 Mel から NeuralVocoder で波形再合成できることを検証する。
+        let extractor = MelSpectrogramExtractor(sampleRate: 16000, melChannels: 64, hopSize: 160, fftSize: 512)
+        var sineWave = [Float](repeating: 0.0, count: 640)
+        var s = 0
+        while s < 640 {
+            sineWave[s] = sinf(2.0 * Float.pi * 440.0 * Float(s) / 16000.0) * 0.5
+            s += 1
+        }
+        let melFrames = extractor.extractLogMel(pcm: sineWave)
+        XCTAssertTrue(0 < melFrames.count)
 
-        // 疑似 Mel スペクトル（母音 /a/ のホルマントピークを模した分布）
-        var syntheticMel = [Float](repeating: -5.0, count: 64)
-        syntheticMel[6] = 2.0  // F1 (約800Hz)
-        syntheticMel[11] = 1.0 // F2 (約1300Hz)
-
-        var lpcCoeffs = [Float](repeating: 0.0, count: 16)
-        let gain = melToLPC.convert(mel: syntheticMel, isLogMel: true, outCoeffs: &lpcCoeffs)
-        XCTAssertTrue(0.0 < gain)
-        XCTAssertTrue(lpcCoeffs[0].isFinite)
+        vocoder.reset()
+        let outAudio = vocoder.synthesize(mel: melFrames)
+        XCTAssertEqual(outAudio.count, melFrames.count * 160)
+        XCTAssertTrue(outAudio[0].isFinite)
     }
 
-    // MARK: - Pair 9: F14 (SyntheticGeneratorチャープ) ＋ F8 (WavEncoder)
+    // MARK: - Pair 9: 合成波形 ＋ F8 (WavEncoder)
 
     func testPair09_SyntheticChirp_WavEncoder_Integrity() {
-        // 20Hz〜8000Hz の広帯域チャープ波が量子化クリッピングを起こさずに WAV Data に変換され、
+        // 20Hz〜8000Hz の合成波形が WAV Data に変換され、
         // 44 バイトヘッダの各フィールドが仕様通りに保存されることを検証する。
-        let chirp = generator.generateChirp(startFreq: 50.0, endFreq: 4000.0, durationSeconds: 0.05)
+        var chirp = [Float](repeating: 0.0, count: 800)
+        var s = 0
+        while s < 800 {
+            chirp[s] = sinf(2.0 * Float.pi * (100.0 + Float(s) * 2.0) * Float(s) / 16000.0) * 0.5
+            s += 1
+        }
         let data = WavEncoder.encode(samples: chirp, sampleRate: 16000)
         XCTAssertEqual(data.count, 44 + (chirp.count * 2))
 
@@ -256,16 +232,15 @@ final class Tier3CombinationTests: XCTestCase {
         XCTAssertEqual(bAudioFormat, 1) // Linear PCM
     }
 
-    // MARK: - Pair 10: F14 (擬似音声データ) ＋ F11 (MLX順伝播)
+    // MARK: - Pair 10: 言語特徴量 ＋ F11 (MLX順伝播)
 
     func testPair10_SyntheticPhrase_BPTT_Forward() {
-        // SyntheticAudioGenerator の擬似正解フレーズから抽出した特徴量が
-        // MLX ネットワークの forward 計算グラフに受け渡され、損失計算可能なテンソルが得られることを検証する。
-        let corpus = generator.generateStandardCorpus()
-        let first = corpus[0]
+        // テキストから抽出した言語特徴量が MLX ネットワークの forward 計算グラフに渡され、
+        // 損失計算可能なテンソルが得られることを検証する。
+        let text = "こんにちは"
         let feat = engine.encodeLinguisticFeatures(
             features: engine.lengthRegulator.processText(
-                text: first.text,
+                text: text,
                 normalizer: engine.normalizer,
                 prosodyModel: engine.prosodyModel,
                 vocabulary: engine.vocabulary
@@ -332,10 +307,10 @@ final class Tier3CombinationTests: XCTestCase {
         XCTAssertTrue(out[0].isFinite)
     }
 
-    // MARK: - Pair 13: F1〜F5 (言語) ＋ F10 (SNN) ＋ F6/F7 (ボコーダー) ＋ F8 (WAV)
+    // MARK: - Pair 13: F1〜F5 (言語) ＋ F10 (SNN) ＋ F6 (NeuralVocoder) ＋ F8 (WAV)
 
     func testPair13_FullPipeline_Linguistics_To_Wav() {
-        // 生テキストから形態素解析、正規化、韻律、Length Regulation、SNN推論、MelToLPC、ボコーダー、WAVエンコードまでの
+        // 生テキストから形態素解析、正規化、韻律、Length Regulation、SNN推論、NeuralVocoder、WAVエンコードまでの
         // データフローが中間の型変換破綻や情報欠落なしに一貫して接続することを検証する。
         let text = "春の風"
         let norm = normalizer.normalize(text: text)
@@ -365,10 +340,10 @@ final class Tier3CombinationTests: XCTestCase {
         }
     }
 
-    // MARK: - Pair 15: F5 (ピッチスケール) ＋ F6 (ボコーダーF0励起)
+    // MARK: - Pair 15: F5 (ピッチスケール) ＋ F6 (NeuralVocoder F0調整)
 
     func testPair15_ProsodyPitchScale_VocoderF0Excitation() {
-        // pitchScale = 1.5 でピッチが高くなった際、Rosenberg パルスのパルス周期が短縮され、
+        // pitchScale = 1.5 でピッチが高くなった際、F0 輪郭が変調され、
         // 合成波形が異なる周波数スペクトルを呈することを検証する。
         let waveLow = engine.synthesize(text: "あめ", pitch: 0.8)
         let waveHigh = engine.synthesize(text: "あめ", pitch: 1.5)

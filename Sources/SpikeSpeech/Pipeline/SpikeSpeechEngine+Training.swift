@@ -75,12 +75,12 @@ extension SpikeSpeechEngine {
         return (leadSilence: leadSilence, speechFrames: speechFrames, trailSilence: trailSilence)
     }
 
-    /// テキストと音声波形から VAD アライメント・Blended Prior 目標残差ペアを生成する唯一の正本メソッド
+    /// テキストと音声波形から VAD アライメント・目標 Mel 系列ペアを生成する唯一の正本メソッド
     ///
     /// なぜ本メソッドを唯一の正本として一元化するか:
-    /// 学習スクリプト（train CLI、dataset CLI、単体テスト）ごとに目標残差やアライメントの計算が分散すると、
-    /// 重みスライスや残差スケール、エネルギー分布の不一致が再発するため、
-    /// 推論エンジンと同一の数理基盤（Blended Prior、Length Regulator、Vocab）から 1 箇所で生成する。
+    /// 学習スクリプト（train CLI、dataset CLI、単体テスト）ごとに目標特徴量やアライメントの計算が分散すると、
+    /// 重みスライスやスケール、エネルギー分布の不一致が再発するため、
+    /// 推論エンジンと同一の数理基盤（Length Regulator、Vocab）から 1 箇所で生成する。
     public func prepareTrainingPair(
         text: String,
         pcm16k: [Float],
@@ -96,8 +96,8 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        // なぜ女性話者（JSUT）の baseF0 でアライメントし applyFluctuation: false にするか:
-        // 教師データ（JSUT コーパス）は成人女性単一話者の実録音音声であり、実音声のピッチ帯域（~220Hz）と
+        // なぜ女性話者の baseF0 でアライメントし applyFluctuation: false にするか:
+        // 教師データは成人女性単一話者の実録音音声であり、実音声のピッチ帯域（~220Hz）と
         // 一致させる必要がある。また学習時は実音声波形との決定論的な時間軸対応関係を確立する必要があり、
         // 1/f ゆらぎを混入させるとアライメントが汚染されて音素境界が不正確になるため。
         let baseLinguistic = lengthRegulator.processText(
@@ -281,9 +281,9 @@ extension SpikeSpeechEngine {
         var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: finalCount)
 
         // 目標 Mel 系列を実音声の絶対対数 Mel スペクトル（targetMel）として直接設定
-        // なぜ手書き Prior（PhonemeAcousticPrior）の残差学習を完全撤廃するか:
-        // SNN 音響モデルが実音声データ（JSUT）の絶対対数 Mel スペクトルを直接予測するように学習することで、
-        // 手書きフォルマント表の不自然なロボット感・機械的歪みを排し、
+        // なぜ事前知識の残差学習を完全撤廃するか:
+        // SNN 音響モデルが実音声データの絶対対数 Mel スペクトルを直接予測するように学習することで、
+        // 不自然なロボット感・機械的歪みを排し、
         // ニューラルボコーダーの学習 Mel 分布と推論 Mel 分布を完全に一致させるため。
         let melCh = AudioConfig.melChannels
         var t = 0

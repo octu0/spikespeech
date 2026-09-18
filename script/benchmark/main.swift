@@ -149,25 +149,22 @@ func main() {
         print("----------------------------------------------------------")
     }
 
-    // 3. LPC ボコーダー & MelToLPC の計測
+    // 3. ニューラルボコーダー (NeuralVocoder) の計測
     if mode == "all" || mode == "vocoder" {
-        print("3. LPC ボコーダー & MelToLPC 波形合成")
-        let melToLPC = MelToLPC()
-        let vocoder = LPCVocoder()
+        print("3. ニューラルボコーダー (NeuralVocoder) 波形合成")
+        let vocoder = NeuralVocoder()
 
         let testFrameCount = 100
-        let dummyMel = [Float](repeating: 0.2, count: AudioConfig.melChannels)
-        var lpcCoeffs = [Float](repeating: 0.0, count: AudioConfig.lpcOrder)
-        let gain = melToLPC.convert(mel: dummyMel, isLogMel: true, outCoeffs: &lpcCoeffs)
-        let frame = AcousticFrame(lpcCoefficients: lpcCoeffs, gain: gain, pitchF0: 130.0, voiced: 1.0)
-        let frames = [AcousticFrame](repeating: frame, count: testFrameCount)
+        let dummyMel = [[Float]](repeating: [Float](repeating: 0.2, count: AudioConfig.melChannels), count: testFrameCount)
+        let dummyF0 = [Float](repeating: 130.0, count: testFrameCount)
+        let dummyVoiced = [Float](repeating: 1.0, count: testFrameCount)
 
-        vocoder.synthesize(frames: frames)
+        vocoder.synthesize(mel: dummyMel, f0Contour: dummyF0, voicedFlags: dummyVoiced)
 
         let tStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         var iter = 0
         while iter < iterations {
-            vocoder.synthesize(frames: frames)
+            vocoder.synthesize(mel: dummyMel, f0Contour: dummyF0, voicedFlags: dummyVoiced)
             iter += 1
         }
         let tEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
