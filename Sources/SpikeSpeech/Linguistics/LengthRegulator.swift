@@ -20,37 +20,37 @@ public final class LengthRegulator: Sendable {
 
         switch category {
         case .vowel:
-            // 狭母音 (i, u) は開口度が小さく短め (約 70ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 85ms) に設定
+            // 狭母音 (i, u) は開口度が小さく短め (約 105ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 125ms) に設定
             switch symbol {
             case "i", "u":
-                baseFrames = 7.5
+                baseFrames = 10.5
             default:
-                baseFrames = 8.5
+                baseFrames = 12.5
             }
         case .consonant:
-            // 摩擦音 (s, sh, h) は十分な乱流気流知覚のため長め (約 60ms)、破裂音 (k, t, p) は閉鎖期無音 (約 30ms) と急峻な解放バースト (約 15ms) を確保するため 4.5 フレーム (約 45ms)
+            // 摩擦音 (s, sh, h) は十分な乱流気流知覚のため長め (約 80ms)、破裂音 (k, t, p) は閉鎖期無音 (約 40ms) と急峻な解放バースト (約 20ms) を確保するため 6.0 フレーム (約 60ms)
             switch symbol {
             case "s", "sh", "h", "z", "j":
-                baseFrames = 6.0
+                baseFrames = 8.0
             case "k", "t", "p", "g", "d", "b":
-                baseFrames = 4.5
+                baseFrames = 6.0
             default:
-                baseFrames = 5.0
+                baseFrames = 7.0
             }
         case .contracted:
-            baseFrames = 5.0
+            baseFrames = 7.0
         case .geminate:
-            // 促音 (っ) は明瞭な音節境界知覚のため十分な無音閉鎖間隔 (約 105ms) を確保
-            baseFrames = 10.5
+            // 促音 (っ) は明瞭な音節境界知覚のため十分な無音閉鎖間隔 (約 140ms) を確保
+            baseFrames = 14.0
         case .nasalSyllable:
-            baseFrames = 8.0
+            baseFrames = 11.0
         case .prolonged:
-            baseFrames = 9.0
+            baseFrames = 13.0
         case .pause:
             if symbol == "<sil>" {
                 baseFrames = 30.0
             } else {
-                baseFrames = 15.0
+                baseFrames = 18.0
             }
         }
 
@@ -225,7 +225,8 @@ public final class LengthRegulator: Sendable {
         vocabulary: PhonemeVocabulary,
         speedFactor: Float = 1.0,
         baseF0: Float = 220.0,
-        applyFluctuation: Bool = true
+        applyFluctuation: Bool = true,
+        addBoundarySilence: Bool = false
     ) -> LinguisticFeatures {
         if text.isEmpty {
             return LinguisticFeatures(phoneIds: [], durations: [], f0Contour: [], voicedFlags: [], energyContour: [], totalFrames: 0)
@@ -406,6 +407,52 @@ public final class LengthRegulator: Sendable {
 
             curFrame += dur
             phIter += 1
+        }
+
+        if addBoundarySilence {
+            var leadSil = Int(roundf(6.0 / safeSpeedFactor))
+            if leadSil < 1 {
+                leadSil = 1
+            }
+            var trailSil = Int(roundf(10.0 / safeSpeedFactor))
+            if trailSil < 1 {
+                trailSil = 1
+            }
+
+            var newPhoneIds: [Int32] = []
+            newPhoneIds.reserveCapacity(phoneIds.count + 2)
+            newPhoneIds.append(Int32(PhonemeVocabulary.silId))
+            newPhoneIds.append(contentsOf: phoneIds)
+            newPhoneIds.append(Int32(PhonemeVocabulary.silId))
+
+            var newDurations: [Int32] = []
+            newDurations.reserveCapacity(durations.count + 2)
+            newDurations.append(Int32(leadSil))
+            newDurations.append(contentsOf: durations)
+            newDurations.append(Int32(trailSil))
+
+            let newTotalFrames = totalFrames + leadSil + trailSil
+
+            var newF0 = [Float](repeating: 0.0, count: leadSil)
+            newF0.append(contentsOf: f0Contour)
+            newF0.append(contentsOf: [Float](repeating: 0.0, count: trailSil))
+
+            var newVoiced = [Float](repeating: 0.0, count: leadSil)
+            newVoiced.append(contentsOf: voicedFlags)
+            newVoiced.append(contentsOf: [Float](repeating: 0.0, count: trailSil))
+
+            var newEnergy = [Float](repeating: 0.0, count: leadSil)
+            newEnergy.append(contentsOf: baseEnergyContour)
+            newEnergy.append(contentsOf: [Float](repeating: 0.0, count: trailSil))
+
+            return LinguisticFeatures(
+                phoneIds: newPhoneIds,
+                durations: newDurations,
+                f0Contour: newF0,
+                voicedFlags: newVoiced,
+                energyContour: newEnergy,
+                totalFrames: newTotalFrames
+            )
         }
 
         return LinguisticFeatures(

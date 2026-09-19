@@ -107,7 +107,8 @@ extension SpikeSpeechEngine {
             vocabulary: vocabulary,
             speedFactor: 1.0,
             baseF0: VoiceProfile.female.baseF0,
-            applyFluctuation: false
+            applyFluctuation: false,
+            addBoundarySilence: false
         )
 
         let origTotalFrames = baseLinguistic.totalFrames
