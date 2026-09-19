@@ -265,10 +265,12 @@ final class SNNTests: XCTestCase {
             XCTAssertEqual(weights.wLayers.count, restored.wLayers.count)
             XCTAssertEqual(weights.bHLayers.count, restored.bHLayers.count)
             XCTAssertEqual(weights.gammaRMS.count, restored.gammaRMS.count)
+            XCTAssertEqual(weights.wConv.count, restored.wConv.count)
             XCTAssertEqual(weights.wOut.count, restored.wOut.count)
             XCTAssertEqual(weights.bOut.count, restored.bOut.count)
             XCTAssertEqual(weights.wIn[0], restored.wIn[0])
             XCTAssertEqual(weights.wRec[0], restored.wRec[0])
+            XCTAssertEqual(weights.wConv[0][0], restored.wConv[0][0])
         } catch {
             XCTFail("SpikingNetworkWeights の Codable 処理に失敗しました: \(error)")
         }
@@ -282,11 +284,11 @@ final class SNNTests: XCTestCase {
             maxHiddenDim: 64,
             outputDim: 16,
             timeSteps: 2,
-            numLayers: 2,
+            numLayers: 4,
             seed: 999
         )
         let decoder = SpikingAcousticDecoder(weights: weights)
-        let workspace = AcousticWorkspace(maxHiddenDim: 64, outputDim: 16, numLayers: 2)
+        let workspace = AcousticWorkspace(maxHiddenDim: 64, outputDim: 16, numLayers: 4)
 
         var seq = [[Float]](repeating: [Float](repeating: 0.1, count: 32), count: 20)
         var t = 0
@@ -310,7 +312,7 @@ final class SNNTests: XCTestCase {
             inputDim: 128,
             maxHiddenDim: 64,
             outputDim: 64,
-            numLayers: 2
+            numLayers: 4
         )
         let decoder = SpikingAcousticDecoder(weights: weights)
         let workspace = AcousticWorkspace(
@@ -337,5 +339,50 @@ final class SNNTests: XCTestCase {
             i += 1
         }
         XCTAssertTrue(nonZeroMembrane, "フレーム間で膜電位が時間連続的に保持されていません")
+    }
+
+    // MARK: - 8. 4 ブロック SNN および時間畳み込みの検証
+
+    func testFourBlockSNNTemporalConvolutionDynamics() {
+        let weights = SpikingNetworkWeights.randomWeights(
+            inputDim: 64,
+            maxHiddenDim: 128,
+            outputDim: 40,
+            timeSteps: 2,
+            numLayers: 4,
+            seed: 2026
+        )
+        XCTAssertEqual(weights.numLayers, 4)
+        XCTAssertEqual(weights.wConv.count, 3)
+
+        let decoder = SpikingAcousticDecoder(weights: weights)
+        let workspace = AcousticWorkspace(maxHiddenDim: 128, outputDim: 40, numLayers: 4)
+
+        // 時間方向のステップ入力（インパルス）系列を流し、前後フレームへのコンテキスト拡散を検証
+        var impulseSeq = [[Float]](repeating: [Float](repeating: 0.0, count: 64), count: 10)
+        impulseSeq[4][0] = 3.0 // 中央フレームのみ強い入力
+
+        let out = decoder.decodeSequence(featuresSeq: impulseSeq, workspace: workspace)
+        XCTAssertEqual(out.count, 10)
+
+        // 時間畳み込みにより、インパルスフレーム(4)だけでなく後続フレーム(5, 6)にも非ゼロ信号が伝播することを確認
+        var frame5Sum: Float = 0.0
+        var c = 0
+        while c < 40 {
+            frame5Sum += abs(out[5][c])
+            c += 1
+        }
+        XCTAssertTrue(0.0 < frame5Sum, "時間畳み込みによる時間方向コンテキスト混合が観測されません")
+    }
+
+    // MARK: - 9. こんにちは TTS 発話長 1.0 秒以上の死守検証
+
+    func testKonnichiwaDurationNotLessThanOneSecond() {
+        let engine = SpikeSpeechEngine()
+        let audio = engine.synthesize(text: "こんにちは")
+        let durationSec = Float(audio.count) / 16000.0
+
+        // 受入基準: こんにちは TTS が 1.0 秒未満にならない
+        XCTAssertTrue(1.0 <= durationSec, "こんにちはの発話長が 1.0 秒未満です: \(durationSec) 秒 (\(audio.count) サンプル)")
     }
 }

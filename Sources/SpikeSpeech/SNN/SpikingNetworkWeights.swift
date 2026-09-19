@@ -30,6 +30,9 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 層 1 以降の RMSNorm ゲイン
     public let gammaRMS: [[Float]]
 
+    /// 層 1 以降の時間畳み込み（フレーム間混合）重み [numLayers - 1][3 * maxHiddenDim]
+    public let wConv: [[Float]]
+
     /// リードアウト射影重み
     public let wOut: [Float]
 
@@ -41,6 +44,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// ソースコード内に辞書データをハードコードすることを排し、教師データから学習した
     /// 語彙知識をモデルの音響重みと一体化して永続化・更新可能にするため。
     public let lexicon: [LexiconEntry]
+
+    /// 学習済み韻律予測器（Duration & F0）重み
+    /// なぜ SNN 音響重みとともに記録するか:
+    /// 音素継続長および F0 抑揚輪郭を実音声から学習した予測器重みとして一体化・永続化し、
+    /// 推論時に主経路として自然な抑揚とテンポを生成可能にするため。
+    public let prosodyWeights: ProsodyWeights?
 
     /// 総層数
     public var numLayers: Int {
@@ -59,9 +68,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wLayers: [[Float]] = [],
         bHLayers: [[Float]] = [],
         gammaRMS: [[Float]] = [],
+        wConv: [[Float]] = [],
         wOut: [Float],
         bOut: [Float],
-        lexicon: [LexiconEntry] = []
+        lexicon: [LexiconEntry] = [],
+        prosodyWeights: ProsodyWeights? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -74,15 +85,17 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.wLayers = wLayers
         self.bHLayers = bHLayers
         self.gammaRMS = gammaRMS
+        self.wConv = wConv
         self.wOut = wOut
         self.bOut = bOut
         self.lexicon = lexicon
+        self.prosodyWeights = prosodyWeights
     }
 
     private enum CodingKeys: String, CodingKey {
         case inputDim, maxHiddenDim, outputDim, timeSteps, lifConfig
-        case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wOut, bOut
-        case lexicon
+        case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wConv, wOut, bOut
+        case lexicon, prosodyWeights
     }
 
     public init(from decoder: Decoder) throws {
@@ -98,6 +111,56 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.wLayers = try container.decode([[Float]].self, forKey: .wLayers)
         self.bHLayers = try container.decode([[Float]].self, forKey: .bHLayers)
         self.gammaRMS = try container.decode([[Float]].self, forKey: .gammaRMS)
+        // なぜ decodeIfPresent を用いて wConv を復元するか:
+        // 旧バージョンの重みファイルを読み込んだ場合でも後方互換性を担保し、安全に時間平滑化デフォルト重みで初期化するため。
+        switch try container.decodeIfPresent([[Float]].self, forKey: .wConv) {
+        case .some(let conv):
+            var upgradedConv: [[Float]] = []
+            var l = 0
+            while l < conv.count {
+                let layerConv = conv[l]
+                let k = layerConv.count / max(1, self.maxHiddenDim)
+                switch k {
+                case 5:
+                    upgradedConv.append(layerConv)
+                case 3:
+                    // 既存 K=3 を K=5 (中央 3 タップ) に滑らかに引き継ぐ
+                    var cArr5 = [Float](repeating: 0.0, count: 5 * self.maxHiddenDim)
+                    var c = 0
+                    while c < self.maxHiddenDim {
+                        cArr5[(0 * self.maxHiddenDim) + c] = 0.10
+                        cArr5[(1 * self.maxHiddenDim) + c] = layerConv[(0 * self.maxHiddenDim) + c]
+                        cArr5[(2 * self.maxHiddenDim) + c] = layerConv[(1 * self.maxHiddenDim) + c]
+                        cArr5[(3 * self.maxHiddenDim) + c] = layerConv[(2 * self.maxHiddenDim) + c]
+                        cArr5[(4 * self.maxHiddenDim) + c] = 0.10
+                        c += 1
+                    }
+                    upgradedConv.append(cArr5)
+                default:
+                    upgradedConv.append(layerConv)
+                }
+                l += 1
+            }
+            self.wConv = upgradedConv
+        case .none:
+            var defaultConv: [[Float]] = []
+            var l = 0
+            while l < self.wLayers.count {
+                var cArr = [Float](repeating: 0.0, count: 5 * self.maxHiddenDim)
+                var c = 0
+                while c < self.maxHiddenDim {
+                    cArr[(0 * self.maxHiddenDim) + c] = 0.10
+                    cArr[(1 * self.maxHiddenDim) + c] = 0.20
+                    cArr[(2 * self.maxHiddenDim) + c] = 0.40
+                    cArr[(3 * self.maxHiddenDim) + c] = 0.20
+                    cArr[(4 * self.maxHiddenDim) + c] = 0.10
+                    c += 1
+                }
+                defaultConv.append(cArr)
+                l += 1
+            }
+            self.wConv = defaultConv
+        }
         self.wOut = try container.decode([Float].self, forKey: .wOut)
         self.bOut = try container.decode([Float].self, forKey: .bOut)
         // なぜ decodeIfPresent を用いるか:
@@ -108,6 +171,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         case .none:
             self.lexicon = []
         }
+        self.prosodyWeights = try container.decodeIfPresent(ProsodyWeights.self, forKey: .prosodyWeights)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -123,9 +187,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         try container.encode(wLayers, forKey: .wLayers)
         try container.encode(bHLayers, forKey: .bHLayers)
         try container.encode(gammaRMS, forKey: .gammaRMS)
+        try container.encode(wConv, forKey: .wConv)
         try container.encode(wOut, forKey: .wOut)
         try container.encode(bOut, forKey: .bOut)
         try container.encode(lexicon, forKey: .lexicon)
+        try container.encodeIfPresent(prosodyWeights, forKey: .prosodyWeights)
     }
 
     /// 語彙知識を付与した新しい重みインスタンスを生成する
@@ -144,9 +210,33 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wLayers: self.wLayers,
             bHLayers: self.bHLayers,
             gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
             wOut: self.wOut,
             bOut: self.bOut,
-            lexicon: newLexicon
+            lexicon: newLexicon,
+            prosodyWeights: self.prosodyWeights
+        )
+    }
+
+    /// 韻律予測器重みを付与した新しい重みインスタンスを生成する
+    public func withProsodyWeights(_ newProsodyWeights: ProsodyWeights?) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: newProsodyWeights
         )
     }
 
@@ -166,9 +256,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wLayers: self.wLayers,
             bHLayers: self.bHLayers,
             gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
             wOut: self.wOut,
             bOut: newBOut,
-            lexicon: self.lexicon
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights
         )
     }
 
@@ -255,10 +347,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
-        numLayers: Int = 2,
+        numLayers: Int = 4,
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
         seed: UInt64 = 42,
-        lexicon: [LexiconEntry] = []
+        lexicon: [LexiconEntry] = [],
+        prosodyWeights: ProsodyWeights? = nil
     ) -> SpikingNetworkWeights {
         return standardInit(
             inputDim: inputDim,
@@ -268,7 +361,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             numLayers: numLayers,
             lifConfig: lifConfig,
             seed: seed,
-            lexicon: lexicon
+            lexicon: lexicon,
+            prosodyWeights: prosodyWeights
         )
     }
 
@@ -278,10 +372,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
-        numLayers: Int = 2,
+        numLayers: Int = 4,
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
         seed: UInt64 = 42,
-        lexicon: [LexiconEntry] = []
+        lexicon: [LexiconEntry] = [],
+        prosodyWeights: ProsodyWeights? = nil
     ) -> SpikingNetworkWeights {
         var rngState = seed
         let scaleIn = sqrt(2.0 / Float(inputDim))
@@ -316,6 +411,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         var wLayers: [[Float]] = []
         var bHLayers: [[Float]] = []
         var gammaRMS: [[Float]] = []
+        var wConv: [[Float]] = []
 
         let safeLayers = max(1, numLayers)
         var l = 1
@@ -329,6 +425,26 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wLayers.append(wLayer)
             bHLayers.append([Float](repeating: 0.0, count: maxHiddenDim))
             gammaRMS.append([Float](repeating: 1.0, count: maxHiddenDim))
+
+            // なぜ K=5 [0.10, 0.20, 0.40, 0.20, 0.10] の対称畳み込みで初期化するか:
+            // 初期状態から上位ブロックの時間方向平滑化とコアーティキュレーションを促し、
+            // Mel スペクトログラムの横縞・平坦倍音化を未然に防止して学習を安定化させるため。
+            var convLayer = [Float](repeating: 0.0, count: 5 * maxHiddenDim)
+            var c = 0
+            while c < maxHiddenDim {
+                let n0 = nextUniform(scale: 0.01)
+                let n1 = nextUniform(scale: 0.01)
+                let n2 = nextUniform(scale: 0.01)
+                let n3 = nextUniform(scale: 0.01)
+                let n4 = nextUniform(scale: 0.01)
+                convLayer[(0 * maxHiddenDim) + c] = 0.10 + n0
+                convLayer[(1 * maxHiddenDim) + c] = 0.20 + n1
+                convLayer[(2 * maxHiddenDim) + c] = 0.40 + n2
+                convLayer[(3 * maxHiddenDim) + c] = 0.20 + n3
+                convLayer[(4 * maxHiddenDim) + c] = 0.10 + n4
+                c += 1
+            }
+            wConv.append(convLayer)
             l += 1
         }
 
@@ -353,9 +469,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wLayers: wLayers,
             bHLayers: bHLayers,
             gammaRMS: gammaRMS,
+            wConv: wConv,
             wOut: wOut,
             bOut: bOut,
-            lexicon: lexicon
+            lexicon: lexicon,
+            prosodyWeights: prosodyWeights
         )
     }
 

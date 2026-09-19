@@ -34,6 +34,9 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     /// 層 1 以降の RMSNorm ゲイン
     public var gammaRMS: [MLXArray]
 
+    /// 層 1 以降の時間畳み込み（フレーム間混合）重み [3, maxHiddenDim]
+    public var wConv: [MLXArray]
+
     /// リードアウト射影重み
     public var wOut: MLXArray
 
@@ -46,7 +49,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     public var lexicon: [LexiconEntry]
 
     public init(
-        numLayers: Int = 2,
+        numLayers: Int = 4,
         inputDim: Int = 128,
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
@@ -75,16 +78,33 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         var wl: [MLXArray] = []
         var bl: [MLXArray] = []
         var gl: [MLXArray] = []
+        var wc: [MLXArray] = []
         var l = 1
         while l < safeLayers {
             wl.append(MLXRandom.uniform(low: -scaleLayer, high: scaleLayer, [maxHiddenDim, maxHiddenDim]))
             bl.append(MLXArray.zeros([maxHiddenDim]))
             gl.append(MLXArray.ones([maxHiddenDim]))
+
+            // 時間畳み込み（長時間混合）重み初期化: K=5 [0.10, 0.20, 0.40, 0.20, 0.10] に微小ノイズ
+            var convInit = [Float](repeating: 0.0, count: 5 * maxHiddenDim)
+            var c = 0
+            while c < maxHiddenDim {
+                convInit[(0 * maxHiddenDim) + c] = 0.10
+                convInit[(1 * maxHiddenDim) + c] = 0.20
+                convInit[(2 * maxHiddenDim) + c] = 0.40
+                convInit[(3 * maxHiddenDim) + c] = 0.20
+                convInit[(4 * maxHiddenDim) + c] = 0.10
+                c += 1
+            }
+            let baseConv = MLXArray(convInit, [5, maxHiddenDim])
+            let noiseConv = MLXRandom.uniform(low: -0.01, high: 0.01, [5, maxHiddenDim])
+            wc.append(baseConv + noiseConv)
             l += 1
         }
         self.wLayers = wl
         self.bHLayers = bl
         self.gammaRMS = gl
+        self.wConv = wc
 
         self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
         self.bOut = MLXArray.zeros([outputDim])
@@ -123,6 +143,30 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             self.wLayers[l] = MLXArray(weights.wLayers[l], [hSize, hSize]).transposed()
             self.bHLayers[l] = MLXArray(weights.bHLayers[l], [hSize])
             self.gammaRMS[l] = MLXArray(weights.gammaRMS[l], [hSize])
+            if l < weights.wConv.count {
+                let savedConv = weights.wConv[l]
+                let kSize = savedConv.count / max(1, hSize)
+                switch kSize {
+                case 5:
+                    self.wConv[l] = MLXArray(savedConv, [5, hSize])
+                case 3:
+                    // 既存 K=3 重みを K=5 (中央 3 タップ) に滑らかに引き継ぎ、完全ウォームスタート
+                    var upgradedConv = [Float](repeating: 0.0, count: 5 * hSize)
+                    var c = 0
+                    while c < hSize {
+                        upgradedConv[(0 * hSize) + c] = 0.05
+                        upgradedConv[(1 * hSize) + c] = savedConv[(0 * hSize) + c]
+                        upgradedConv[(2 * hSize) + c] = savedConv[(1 * hSize) + c]
+                        upgradedConv[(3 * hSize) + c] = savedConv[(2 * hSize) + c]
+                        upgradedConv[(4 * hSize) + c] = 0.05
+                        c += 1
+                    }
+                    self.wConv[l] = MLXArray(upgradedConv, [5, hSize])
+                default:
+                    break
+                }
+                arraysToEval.append(self.wConv[l])
+            }
             arraysToEval.append(self.wLayers[l])
             arraysToEval.append(self.bHLayers[l])
             arraysToEval.append(self.gammaRMS[l])
@@ -139,6 +183,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             arraysToEval.append(wLayers[l])
             arraysToEval.append(bHLayers[l])
             arraysToEval.append(gammaRMS[l])
+            arraysToEval.append(wConv[l])
             l += 1
         }
         eval(arraysToEval)
@@ -146,11 +191,13 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         var wl: [[Float]] = []
         var bl: [[Float]] = []
         var gl: [[Float]] = []
+        var wc: [[Float]] = []
         l = 0
         while l < wLayers.count {
             wl.append(self.wLayers[l].transposed().asArray(Float.self))
             bl.append(self.bHLayers[l].asArray(Float.self))
             gl.append(self.gammaRMS[l].asArray(Float.self))
+            wc.append(self.wConv[l].asArray(Float.self))
             l += 1
         }
 
@@ -166,6 +213,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             wLayers: wl,
             bHLayers: bl,
             gammaRMS: gl,
+            wConv: wc,
             wOut: self.wOut.transposed().asArray(Float.self),
             bOut: self.bOut.asArray(Float.self),
             lexicon: self.lexicon
@@ -173,7 +221,8 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     }
 
     /// 音響系列の多層 SNN 順伝播計算を実行する。
-    /// 層0 の再帰結合と上位層の RMSNorm 電流および前層入力電流残差加算により、多層化時のスパイク減衰を防ぐ。
+    /// 層0 の再帰結合と上位ブロックのフレーム間時間畳み込み（1D Depthwise Conv）および RMSNorm 残差加算により、
+    /// Mel スペクトログラムの横縞・平坦倍音化を根本から排し、滑らかなフォルマント軌跡を形成する。
     public func forward(
         features: MLXArray,
         bpttWindow: Int = 16
@@ -191,15 +240,16 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         let vMax = LIFNeuronEngine.vClampMax
         let readoutK = LIFNeuronEngine.readoutClipInThresholdUnits
 
-        // 直流入力電流の事前計算
+        // ------------------------------------------------------------
+        // ブロック 0: 層 0 再帰 LIF
+        // ------------------------------------------------------------
         let currentSeq0 = matmul(features, self.wIn) + self.bH
+        var v0 = MLXArray.zeros([batchSize, hSize])
+        var s0 = MLXArray.zeros([batchSize, hSize])
+        var a0 = MLXArray.zeros([batchSize, hSize])
 
-        var v = [MLXArray](repeating: MLXArray.zeros([batchSize, hSize]), count: numLayers)
-        var s = [MLXArray](repeating: MLXArray.zeros([batchSize, hSize]), count: numLayers)
-        var a = [MLXArray](repeating: MLXArray.zeros([batchSize, hSize]), count: numLayers)
-
-        var readoutList: [MLXArray] = []
-        readoutList.reserveCapacity(seqLen)
+        var layer0Readouts: [MLXArray] = []
+        layer0Readouts.reserveCapacity(seqLen)
 
         var t = 0
         while t < seqLen {
@@ -207,56 +257,116 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             var readoutSum = MLXArray.zeros([batchSize, hSize])
 
             if (t % bpttWindow) == 0 {
-                var l = 0
-                while l < numLayers {
-                    v[l] = stopGradient(v[l])
-                    s[l] = stopGradient(s[l])
-                    a[l] = stopGradient(a[l])
-                    l += 1
-                }
+                v0 = stopGradient(v0)
+                s0 = stopGradient(s0)
+                a0 = stopGradient(a0)
             }
 
             var step = 0
             while step < timeSteps {
-                var current = current0_t + matmul(stopGradient(s[0]), self.wRec)
-                var l = 0
-                while l < numLayers {
-                    let isLast = (l + 1) == numLayers
+                let current = current0_t + matmul(stopGradient(s0), self.wRec)
+                v0 = clip(((v0 * beta) * (1.0 - s0)) + current, min: vMin, max: vMax)
+                a0 = (a0 * rho) + (s0 * gamma)
+                let dynVTh = vTh + a0
+                s0 = SurrogateGradients.fastSigmoidSTE(v: v0, vTh: dynVTh, alpha: alpha)
+                readoutSum = readoutSum + clip(v0 / vTh, min: -readoutK, max: readoutK)
+                step += 1
+            }
 
-                    if 0 < l {
-                        let upperIdx = l - 1
-                        let denseCur = matmul(s[l - 1], self.wLayers[upperIdx]) + self.bHLayers[upperIdx]
-                        let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
-                        let rms = sqrt(meanSq + 1e-5)
-                        current = (denseCur / rms) * self.gammaRMS[upperIdx] + current
-                    }
+            layer0Readouts.append(readoutSum / Float(timeSteps))
+            t += 1
+        }
 
-                    if isLast {
-                        v[l] = clip((v[l] * beta) + current, min: vMin, max: vMax)
-                    } else {
-                        v[l] = clip(((v[l] * beta) * (1.0 - s[l])) + current, min: vMin, max: vMax)
-                    }
+        var prevBlockH = stacked(layer0Readouts, axis: 1) // [batchSize, seqLen, hSize]
 
-                    a[l] = (a[l] * rho) + (s[l] * gamma)
-                    let dynVTh = vTh + a[l]
-                    s[l] = SurrogateGradients.fastSigmoidSTE(v: v[l], vTh: dynVTh, alpha: alpha)
+        // ------------------------------------------------------------
+        // 上位ブロック 1 ..< numLayers
+        // 時間畳み込み（Depthwise 1D Conv, K=3）＋ チャネル結合 ＋ RMSNorm ＋ 残差加算 ＋ LIF
+        // ------------------------------------------------------------
+        var blockIdx = 1
+        while blockIdx < numLayers {
+            let upperIdx = blockIdx - 1
+            let isLast = (blockIdx + 1) == numLayers
 
-                    if isLast {
-                        readoutSum = readoutSum + clip(v[l] / vTh, min: -readoutK, max: readoutK)
-                        let sHard = (dynVTh .<= v[l]).asType(.float32)
-                        v[l] = clip(v[l] - (sHard * vTh), min: vMin, max: vMax)
-                    }
-                    l += 1
+            // 1. 時間畳み込み（K=5, Dilation d = 1 << upperIdx, replicate パディング左右 2d）
+            let d = 1 << upperIdx
+
+            let padLeft = prevBlockH[0..., 0..<1, 0...]
+            var leftPads: [MLXArray] = []
+            var p = 0
+            while p < (2 * d) {
+                leftPads.append(padLeft)
+                p += 1
+            }
+            let hLeft = concatenated(leftPads, axis: 1)
+
+            let padRight = prevBlockH[0..., (seqLen - 1)..<seqLen, 0...]
+            var rightPads: [MLXArray] = []
+            p = 0
+            while p < (2 * d) {
+                rightPads.append(padRight)
+                p += 1
+            }
+            let hRight = concatenated(rightPads, axis: 1)
+            let hPadded = concatenated([hLeft, prevBlockH, hRight], axis: 1) // [batchSize, seqLen + 4*d, hSize]
+
+            let w0 = self.wConv[upperIdx][0]
+            let w1 = self.wConv[upperIdx][1]
+            let w2 = self.wConv[upperIdx][2]
+            let w3 = self.wConv[upperIdx][3]
+            let w4 = self.wConv[upperIdx][4]
+
+            let part0 = hPadded[0..., 0..<seqLen, 0...] * w0
+            let part1 = hPadded[0..., d..<(seqLen + d), 0...] * w1
+            let part2 = hPadded[0..., (2 * d)..<(seqLen + (2 * d)), 0...] * w2
+            let part3 = hPadded[0..., (3 * d)..<(seqLen + (3 * d)), 0...] * w3
+            let part4 = hPadded[0..., (4 * d)..<(seqLen + (4 * d)), 0...] * w4
+            let zConv = (((part0 + part1) + part2) + part3) + part4
+            let mConv = zConv + prevBlockH // 残差接続
+
+            // 2. チャネル間結合 (Pointwise Dense) ＋ RMSNorm ＋ 残差加算
+            let denseCur = matmul(mConv, self.wLayers[upperIdx]) + self.bHLayers[upperIdx]
+            let meanSq = mean(denseCur * denseCur, axis: -1, keepDims: true)
+            let rms = sqrt(meanSq + 1e-5)
+            let currentSeq = (denseCur / rms) * self.gammaRMS[upperIdx] + mConv
+
+            // 3. 上位ブロック全時間軸一括 LIF 時間ステップ実行
+            // 時間畳み込み（1D Depthwise Conv）により系列全体の時間相関が既に注入されているため、
+            // フレームごとの反復・テンソル配列 append・stacked による Metal バッファ肥大化（499,000 リミット超過）を完全根絶し、
+            // [batchSize, seqLen, hSize] の一括テンソル演算として 4 内部ステップを並列実行する。
+            var vL = MLXArray.zeros([batchSize, seqLen, hSize])
+            var sL = MLXArray.zeros([batchSize, seqLen, hSize])
+            var aL = MLXArray.zeros([batchSize, seqLen, hSize])
+            var readoutSum = MLXArray.zeros([batchSize, seqLen, hSize])
+
+            var step = 0
+            while step < timeSteps {
+                if isLast {
+                    vL = clip((vL * beta) + currentSeq, min: vMin, max: vMax)
+                } else {
+                    vL = clip(((vL * beta) * (1.0 - sL)) + currentSeq, min: vMin, max: vMax)
+                }
+
+                aL = (aL * rho) + (sL * gamma)
+                let dynVTh = vTh + aL
+                sL = SurrogateGradients.fastSigmoidSTE(v: vL, vTh: dynVTh, alpha: alpha)
+
+                readoutSum = readoutSum + clip(vL / vTh, min: -readoutK, max: readoutK)
+                if isLast {
+                    let sHard = (dynVTh .<= vL).asType(.float32)
+                    vL = clip(vL - (sHard * vTh), min: vMin, max: vMax)
                 }
                 step += 1
             }
 
-            readoutList.append(readoutSum / Float(timeSteps))
-            t += 1
+            prevBlockH = readoutSum / Float(timeSteps)
+            blockIdx += 1
         }
 
-        let stackedReadout = stacked(readoutList, axis: 1)
-        return matmul(stackedReadout, self.wOut) + self.bOut
+        // ------------------------------------------------------------
+        // 最終線形射影: 最上位ブロック出力 -> Mel スペクトル
+        // ------------------------------------------------------------
+        return matmul(prevBlockH, self.wOut) + self.bOut
     }
 }
 
@@ -267,6 +377,7 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingAcousticNetwork
     public let optimizer: AdamW
     public let bpttWindow: Int
+    private let lossAndGrad: (MLXSpikingAcousticNetwork, [MLXArray]) -> ([MLXArray], ModuleParameters)
 
     public init(
         network: MLXSpikingAcousticNetwork,
@@ -285,10 +396,39 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             weightDecay: weightDecay,
             biasCorrection: true
         )
+        let resolvedBPTT: Int
         if bpttWindow <= 1 {
-            self.bpttWindow = 1
+            resolvedBPTT = 1
         } else {
-            self.bpttWindow = bpttWindow
+            resolvedBPTT = bpttWindow
+        }
+        self.bpttWindow = resolvedBPTT
+
+        // なぜキャッシュ上限を 32MB に制限するか:
+        // デフォルトでは RAM の 1.5 倍まで解放済み Metal バッファがアロケータのプールに保持され続け、
+        // 異なる系列長の音声学習を数百ステップ回すとバッファ個数が 499,000 個を超過してクラッシュするため。
+        Memory.cacheLimit = 32 * 1024 * 1024
+
+        // なぜ valueAndGrad を init で一度だけ束縛するか:
+        // 毎ミニバッチでのクロージャ生成とグラフ登録の反復による Metal 内部オブジェクト肥大化を防ぐため。
+        self.lossAndGrad = valueAndGrad(model: network) { (model: MLXSpikingAcousticNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let fArr = arrays[0]
+            let tArr = arrays[1]
+            let mArr = arrays[2]
+
+            let pred = model.forward(features: fArr, bpttWindow: resolvedBPTT)
+            let l1Loss = AcousticLossFunctions.spectralL1Loss(
+                predicted: pred,
+                target: tArr,
+                mask: mArr
+            )
+            let deltaLoss = AcousticLossFunctions.spectralDeltaLoss(
+                predicted: pred,
+                target: tArr,
+                mask: mArr
+            )
+            let totalLoss = l1Loss + (deltaLoss * 0.5)
+            return [totalLoss]
         }
     }
 
@@ -342,28 +482,8 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
         targets: MLXArray,
         mask: MLXArray? = nil
     ) -> Float {
-        let lg = valueAndGrad(model: network) { (model: MLXSpikingAcousticNetwork, arrays: [MLXArray]) -> [MLXArray] in
-            let fArr = arrays[0]
-            let tArr = arrays[1]
-            let mArr = arrays[2]
-
-            let pred = model.forward(features: fArr, bpttWindow: self.bpttWindow)
-            let l1Loss = AcousticLossFunctions.spectralL1Loss(
-                predicted: pred,
-                target: tArr,
-                mask: mArr
-            )
-            let deltaLoss = AcousticLossFunctions.spectralDeltaLoss(
-                predicted: pred,
-                target: tArr,
-                mask: mArr
-            )
-            let totalLoss = l1Loss + (deltaLoss * 0.5)
-            return [totalLoss]
-        }
-
         let maskArray = mask ?? MLXArray.ones([features.shape[0], features.shape[1]])
-        let (lossVals, grads) = lg(network, [features, targets, maskArray])
+        let (lossVals, grads) = self.lossAndGrad(network, [features, targets, maskArray])
         let lossVal = lossVals[0]
         var safeGrads = grads
         if let recG = safeGrads[unwrapping: "wRec"] {
@@ -380,8 +500,11 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
 
         optimizer.update(model: network, gradients: clippedGrads)
         eval(network, optimizer, lossVal)
+        Stream.gpu.synchronize()
 
-        return lossVal.item(Float.self)
+        let lossResult = lossVal.item(Float.self)
+        Memory.clearCache()
+        return lossResult
     }
 
     /// 各パラメータの生の勾配ノルムおよびクリップ前後の診断
@@ -458,15 +581,17 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             t += 1
         }
 
-        let fArr = MLXArray(flatFeat, [1, alignedLen, inDim])
-        let tArr = MLXArray(flatTgt, [1, alignedLen, outDim])
-        let mArr = MLXArray(flatMask, [1, alignedLen])
+        return autoreleasepool {
+            let fArr = MLXArray(flatFeat, [1, alignedLen, inDim])
+            let tArr = MLXArray(flatTgt, [1, alignedLen, outDim])
+            let mArr = MLXArray(flatMask, [1, alignedLen])
 
-        return trainBatch(
-            features: fArr,
-            targets: tArr,
-            mask: mArr
-        )
+            return trainBatch(
+                features: fArr,
+                targets: tArr,
+                mask: mArr
+            )
+        }
     }
 }
 #endif

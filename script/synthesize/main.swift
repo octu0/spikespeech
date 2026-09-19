@@ -13,6 +13,7 @@ func main() {
     var voiceName: String = "female"
     var benchmark: Bool = false
     var copyInputPath: String? = nil
+    var ablateInputPath: String? = nil
 
     var i = 1
     while i < args.count {
@@ -22,6 +23,12 @@ func main() {
             let nextIdx = i + 1
             if nextIdx < args.count {
                 copyInputPath = args[nextIdx]
+                i += 1
+            }
+        case "--ablate":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                ablateInputPath = args[nextIdx]
                 i += 1
             }
         case "-t", "--text":
@@ -212,6 +219,10 @@ func main() {
         return
     }
 
+    if ablateInputPath != nil && text.isEmpty {
+        text = "水をマレーシアから買わなくてはならないのです"
+    }
+
     if text.isEmpty {
         print("エラー: 入力テキストが指定されていません。-t \"日本語テキスト\" を指定してください。")
         print("ヘルプ表示: synthesize --help")
@@ -247,6 +258,192 @@ func main() {
 
     let voiceProfile = VoiceProfile.preset(named: voiceName)
     let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+    if let ablateTeacherPath = ablateInputPath {
+        // Ablation 4本切り分けモード
+        print("=== Ablation 4本切り分けモードを開始します ===")
+        print("教師 WAV: \(ablateTeacherPath)")
+        print("入力テキスト: 「\(text)」")
+
+        let wavReader = WavAudioReader()
+        let rawPCM: [Float]
+        do {
+            rawPCM = try wavReader.loadWav16k(from: ablateTeacherPath)
+        } catch {
+            print("エラー: 教師 WAV の読み込みに失敗しました (\(ablateTeacherPath)): \(error)")
+            return
+        }
+
+        var peak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawPCM.count {
+            let a = abs(rawPCM[pIdx])
+            if peak < a { peak = a }
+            pIdx += 1
+        }
+        var pcm16k = rawPCM
+        if 0.01 < peak {
+            let normFactor = 0.85 / peak
+            var s = 0
+            while s < pcm16k.count {
+                pcm16k[s] = pcm16k[s] * normFactor
+                s += 1
+            }
+        }
+
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let pitchTracker = PitchTracker()
+        let teacherMel = melExtractor.extractLogMel(pcm: pcm16k)
+        let teacherPitch = pitchTracker.track(pcm: pcm16k)
+        let tTeacherFrames = teacherMel.count
+
+        // テキストからの言語・韻律・SNN 音響特徴量抽出
+        engine.workspace.reset()
+        engine.neuralVocoder.reset()
+
+        let effectiveBaseF0 = voiceProfile.baseF0 * pitch
+        let linguisticFeatures = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: speed,
+            baseF0: effectiveBaseF0,
+            addBoundarySilence: true
+        )
+        let totalPredFrames = linguisticFeatures.totalFrames
+        let inputSeq = engine.encodeLinguisticFeatures(features: linguisticFeatures)
+        let snnAcousticSeq = engine.decoder.decodeSequence(featuresSeq: inputSeq, workspace: engine.workspace)
+        let melChannels = AudioConfig.melChannels
+        var predMel = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalPredFrames)
+        var t = 0
+        while t < totalPredFrames {
+            if t < snnAcousticSeq.count {
+                let outDim = snnAcousticSeq[t].count
+                let copyCount = min(melChannels, outDim)
+                var c = 0
+                while c < copyCount {
+                    predMel[t][c] = snnAcousticSeq[t][c]
+                    c += 1
+                }
+            }
+            t += 1
+        }
+        let predF0 = linguisticFeatures.f0Contour
+        let predVoiced = linguisticFeatures.voicedFlags
+
+        // リサンプリング関数（線形補間）
+        func resampleContour(source: [Float], targetCount: Int) -> [Float] {
+            if targetCount <= 0 || source.isEmpty {
+                return []
+            }
+            if source.count == 1 || targetCount == 1 {
+                return [Float](repeating: source[0], count: targetCount)
+            }
+            var result = [Float](repeating: 0.0, count: targetCount)
+            let srcMax = Float(source.count - 1)
+            let tgtMax = Float(targetCount - 1)
+            var i = 0
+            while i < targetCount {
+                let relPos = (Float(i) / tgtMax) * srcMax
+                let idx0 = Int(relPos)
+                let idx1 = min(source.count - 1, idx0 + 1)
+                let frac = relPos - Float(idx0)
+                result[i] = (source[idx0] * (1.0 - frac)) + (source[idx1] * frac)
+                i += 1
+            }
+            return result
+        }
+
+        func resampleVoiced(source: [Float], targetCount: Int) -> [Float] {
+            let res = resampleContour(source: source, targetCount: targetCount)
+            var binaryVoiced = [Float](repeating: 0.0, count: targetCount)
+            var i = 0
+            while i < targetCount {
+                if 0.5 <= res[i] {
+                    binaryVoiced[i] = 1.0
+                }
+                i += 1
+            }
+            return binaryVoiced
+        }
+
+        let vocoder = NeuralVocoder(weights: vocWeights)
+
+        func saveWav(samples: [Float], path: String, label: String) {
+            let wavData = WavEncoder.encode(samples: samples)
+            let url = URL(fileURLWithPath: path)
+            let dir = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: dir.path) != true {
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            try? wavData.write(to: url)
+            var maxAbs: Float = 0.0
+            var sumSq: Double = 0.0
+            var s = 0
+            while s < samples.count {
+                let v = samples[s]
+                let a = abs(v)
+                if maxAbs < a { maxAbs = a }
+                sumSq += Double(v * v)
+                s += 1
+            }
+            var rms: Float = 0.0
+            if 0 < samples.count {
+                rms = Float(sqrt(sumSq / Double(samples.count)))
+            }
+            let dur = Float(samples.count) / Float(AudioConfig.sampleRate)
+            print("[\(label)] 出力: \(path) (サンプル数=\(samples.count), 時間=\(String(format: "%.2f", dur))秒, 最大振幅=\(String(format: "%.4f", maxAbs)), RMS=\(String(format: "%.4f", rms)))")
+        }
+
+        // 1. ablate_copy.wav: 教師 Mel + 教師 F0
+        vocoder.reset()
+        let copySamples = vocoder.synthesize(
+            mel: teacherMel,
+            f0Contour: teacherPitch.f0,
+            voicedFlags: teacherPitch.voiced
+        )
+        saveWav(samples: copySamples, path: ".tmp/wave15/ablate_copy.wav", label: "Ablation 1: 教師 Mel + 教師 F0")
+
+        // 2. ablate_teacherMel_predF0.wav: 教師 Mel + 予測 F0 (長さを教師 Mel にリサンプル)
+        vocoder.reset()
+        let predF0OnTeacher = resampleContour(source: predF0, targetCount: tTeacherFrames)
+        let predVoicedOnTeacher = resampleVoiced(source: predVoiced, targetCount: tTeacherFrames)
+        let teacherMelPredF0Samples = vocoder.synthesize(
+            mel: teacherMel,
+            f0Contour: predF0OnTeacher,
+            voicedFlags: predVoicedOnTeacher
+        )
+        saveWav(samples: teacherMelPredF0Samples, path: ".tmp/wave15/ablate_teacherMel_predF0.wav", label: "Ablation 2: 教師 Mel + 予測 F0")
+
+        // 3. ablate_predMel_teacherF0.wav: 予測 Mel + 教師 F0 (長さを予測 Mel にリサンプル)
+        vocoder.reset()
+        let teacherF0OnPred = resampleContour(source: teacherPitch.f0, targetCount: totalPredFrames)
+        let teacherVoicedOnPred = resampleVoiced(source: teacherPitch.voiced, targetCount: totalPredFrames)
+        let predMelTeacherF0Samples = vocoder.synthesize(
+            mel: predMel,
+            f0Contour: teacherF0OnPred,
+            voicedFlags: teacherVoicedOnPred
+        )
+        saveWav(samples: predMelTeacherF0Samples, path: ".tmp/wave15/ablate_predMel_teacherF0.wav", label: "Ablation 3: 予測 Mel + 教師 F0")
+
+        // 4. ablate_tts.wav: 予測 Mel + 予測 F0 (通常 TTS)
+        vocoder.reset()
+        let ttsSamples = vocoder.synthesize(
+            mel: predMel,
+            f0Contour: predF0,
+            voicedFlags: predVoiced
+        )
+        saveWav(samples: ttsSamples, path: ".tmp/wave15/ablate_tts.wav", label: "Ablation 4: 予測 Mel + 予測 F0")
+
+        print("=== Ablation 4本切り分けの生成が完了しました ===")
+        return
+    }
+
     print("音声合成を開始します: 「\(text)」 (話者: \(voiceProfile.name), 速度: \(speed), ピッチ: \(pitch))")
 
     let startTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)

@@ -14,9 +14,9 @@ public final class ProsodyModel: Sendable {
 
     public init(
         baseF0: Float = 220.0,
-        phraseAmp: Float = 0.08,
+        phraseAmp: Float = 0.18,
         phraseDecay: Float = 0.70,
-        accentAmp: Float = 0.12,
+        accentAmp: Float = 0.32,
         accentAttack: Float = 15.0,
         accentDecay: Float = 16.0
     ) {
@@ -92,11 +92,16 @@ public final class ProsodyModel: Sendable {
             // 句読点・記号の場合は現在の句を完了し、ポーズ付きで閉じる
             if m.pos == .symbol {
                 if currentMoras.isEmpty != true {
-                    // 現在の句にトーンを適用
+                    // 現在の句にトーンとアクセント核を適用
                     let tones = computeMoraTones(moraCount: currentMoras.count, accentKernel: Int(currentKernel))
                     var k = 0
                     while k < currentMoras.count {
                         currentMoras[k].tone = tones[k]
+                        if 0 < currentKernel && (k + 1) == Int(currentKernel) {
+                            currentMoras[k].isAccentKernel = true
+                        } else {
+                            currentMoras[k].isAccentKernel = false
+                        }
                         k += 1
                     }
                     var pauseDur = 30
@@ -131,6 +136,11 @@ public final class ProsodyModel: Sendable {
                 var k = 0
                 while k < currentMoras.count {
                     currentMoras[k].tone = tones[k]
+                    if 0 < currentKernel && (k + 1) == Int(currentKernel) {
+                        currentMoras[k].isAccentKernel = true
+                    } else {
+                        currentMoras[k].isAccentKernel = false
+                    }
                     k += 1
                 }
                 phrases.append(AccentPhrase(moras: currentMoras, pauseAfter: false, pauseDurationFrames: 0, isQuestion: false))
@@ -152,6 +162,11 @@ public final class ProsodyModel: Sendable {
             var k = 0
             while k < currentMoras.count {
                 currentMoras[k].tone = tones[k]
+                if 0 < currentKernel && (k + 1) == Int(currentKernel) {
+                    currentMoras[k].isAccentKernel = true
+                } else {
+                    currentMoras[k].isAccentKernel = false
+                }
                 k += 1
             }
             var isQuestion = false

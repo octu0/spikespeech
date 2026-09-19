@@ -385,4 +385,149 @@ public enum LIFNeuronEngine {
             i += 1
         }
     }
+
+    /// 隠れ層ニューロンの 1 ステップスカラー更新（ハードリセット ＋ Readout 積算）
+    ///
+    /// 学習側 MLX のダイナミクスと厳密に一致させ、発火ニューロンの膜電位をゼロリセットしつつ
+    /// 膜電位のアナログ値を積算バッファに加算する。
+    @inline(__always)
+    public static func stepHardResetReadoutScalarAdaptive(
+        config: LIFConfig,
+        vPrev: Float,
+        sPrev: Float,
+        aPrev: Float,
+        inputCurrent: Float
+    ) -> (vNext: Float, sNext: Float, aNext: Float, readout: Float) {
+        let vDecayed = config.beta * vPrev * (1.0 - sPrev)
+        let vNext = clampMembrane(vDecayed + inputCurrent)
+        let aNext = (config.rho * aPrev) + (config.gamma * sPrev)
+        let dynVTh = config.vTh + aNext
+        var sNext: Float = 0.0
+        if dynVTh <= vNext {
+            sNext = 1.0
+        }
+        let readout = scaleReadout(vNext, vTh: config.vTh)
+        return (vNext: vNext, sNext: sNext, aNext: aNext, readout: readout)
+    }
+
+    /// 隠れ層ニューロンの SIMD8 一括並列更新（ハードリセット ＋ Readout 積算）
+    ///
+    /// 学習側 MLX と完全一致するダイナミクスで、ブロック 0 および上位隠れ層の
+    /// 膜電位減衰、スパイク発火、適応閾値更新、およびアナログ積算をベクトル実行する。
+    @inline(__always)
+    public static func stepHardResetReadoutAdaptiveSIMD8(
+        config: LIFConfig,
+        vPtr: UnsafeMutablePointer<Float>,
+        sPtr: UnsafeMutablePointer<Float>,
+        aPtr: UnsafeMutablePointer<Float>,
+        curPtr: UnsafePointer<Float>,
+        readoutSumPtr: UnsafeMutablePointer<Float>,
+        count: Int
+    ) {
+        let limit = count - (count % 8)
+        let betaVec = SIMD8<Float>(repeating: config.beta)
+        let oneVec = SIMD8<Float>(repeating: 1.0)
+        let rhoVec = SIMD8<Float>(repeating: config.rho)
+        let gammaVec = SIMD8<Float>(repeating: config.gamma)
+        let vThVec = SIMD8<Float>(repeating: config.vTh)
+        let lowVec = SIMD8<Float>(repeating: vClampMin)
+        let highVec = SIMD8<Float>(repeating: vClampMax)
+        let zeroVec = SIMD8<Float>(repeating: 0.0)
+        let k = readoutClipInThresholdUnits
+        let negKVec = SIMD8<Float>(repeating: -k)
+        let posKVec = SIMD8<Float>(repeating: k)
+        var invThVec = SIMD8<Float>(repeating: 0.0)
+        if config.vTh != 0.0 {
+            invThVec = SIMD8<Float>(repeating: 1.0 / config.vTh)
+        }
+
+        var i = 0
+        while i < limit {
+            let vPrev = SIMD8<Float>(
+                vPtr[i + 0], vPtr[i + 1], vPtr[i + 2], vPtr[i + 3],
+                vPtr[i + 4], vPtr[i + 5], vPtr[i + 6], vPtr[i + 7]
+            )
+            let sPrev = SIMD8<Float>(
+                sPtr[i + 0], sPtr[i + 1], sPtr[i + 2], sPtr[i + 3],
+                sPtr[i + 4], sPtr[i + 5], sPtr[i + 6], sPtr[i + 7]
+            )
+            let aPrev = SIMD8<Float>(
+                aPtr[i + 0], aPtr[i + 1], aPtr[i + 2], aPtr[i + 3],
+                aPtr[i + 4], aPtr[i + 5], aPtr[i + 6], aPtr[i + 7]
+            )
+            let inCur = SIMD8<Float>(
+                curPtr[i + 0], curPtr[i + 1], curPtr[i + 2], curPtr[i + 3],
+                curPtr[i + 4], curPtr[i + 5], curPtr[i + 6], curPtr[i + 7]
+            )
+
+            let vDecayed = betaVec * vPrev * (oneVec - sPrev)
+            let vRaw = vDecayed + inCur
+            var vNext = vRaw.replacing(with: lowVec, where: vRaw .< lowVec)
+            vNext = vNext.replacing(with: highVec, where: highVec .< vNext)
+            let aNext = (rhoVec * aPrev) + (gammaVec * sPrev)
+            let dynVTh = vThVec + aNext
+            let sNext = zeroVec.replacing(with: oneVec, where: dynVTh .<= vNext)
+
+            var scaled = vNext * invThVec
+            scaled = scaled.replacing(with: negKVec, where: scaled .< negKVec)
+            scaled = scaled.replacing(with: posKVec, where: posKVec .< scaled)
+            let sumPrev = SIMD8<Float>(
+                readoutSumPtr[i + 0], readoutSumPtr[i + 1], readoutSumPtr[i + 2], readoutSumPtr[i + 3],
+                readoutSumPtr[i + 4], readoutSumPtr[i + 5], readoutSumPtr[i + 6], readoutSumPtr[i + 7]
+            )
+            let sumNext = sumPrev + scaled
+
+            vPtr[i + 0] = vNext[0]
+            vPtr[i + 1] = vNext[1]
+            vPtr[i + 2] = vNext[2]
+            vPtr[i + 3] = vNext[3]
+            vPtr[i + 4] = vNext[4]
+            vPtr[i + 5] = vNext[5]
+            vPtr[i + 6] = vNext[6]
+            vPtr[i + 7] = vNext[7]
+
+            sPtr[i + 0] = sNext[0]
+            sPtr[i + 1] = sNext[1]
+            sPtr[i + 2] = sNext[2]
+            sPtr[i + 3] = sNext[3]
+            sPtr[i + 4] = sNext[4]
+            sPtr[i + 5] = sNext[5]
+            sPtr[i + 6] = sNext[6]
+            sPtr[i + 7] = sNext[7]
+
+            aPtr[i + 0] = aNext[0]
+            aPtr[i + 1] = aNext[1]
+            aPtr[i + 2] = aNext[2]
+            aPtr[i + 3] = aNext[3]
+            aPtr[i + 4] = aNext[4]
+            aPtr[i + 5] = aNext[5]
+            aPtr[i + 6] = aNext[6]
+            aPtr[i + 7] = aNext[7]
+
+            readoutSumPtr[i + 0] = sumNext[0]
+            readoutSumPtr[i + 1] = sumNext[1]
+            readoutSumPtr[i + 2] = sumNext[2]
+            readoutSumPtr[i + 3] = sumNext[3]
+            readoutSumPtr[i + 4] = sumNext[4]
+            readoutSumPtr[i + 5] = sumNext[5]
+            readoutSumPtr[i + 6] = sumNext[6]
+            readoutSumPtr[i + 7] = sumNext[7]
+            i += 8
+        }
+
+        while i < count {
+            let res = stepHardResetReadoutScalarAdaptive(
+                config: config,
+                vPrev: vPtr[i],
+                sPrev: sPtr[i],
+                aPrev: aPtr[i],
+                inputCurrent: curPtr[i]
+            )
+            vPtr[i] = res.vNext
+            sPtr[i] = res.sNext
+            aPtr[i] = res.aNext
+            readoutSumPtr[i] += res.readout
+            i += 1
+        }
+    }
 }

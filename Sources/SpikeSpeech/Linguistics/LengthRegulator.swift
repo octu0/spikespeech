@@ -16,41 +16,41 @@ public final class LengthRegulator: Sendable {
     /// 累積和量子化に入力する浮動小数点継続時間列を生成し、
     /// 丸め誤差の累積による発話時間ドリフトをゼロにする。
     public func floatDurationFrames(category: PhonemeCategory, symbol: String, speed: Float = 1.0) -> Float {
-        var baseFrames: Float = 8.0
+        var baseFrames: Float = 6.0
 
         switch category {
         case .vowel:
-            // 狭母音 (i, u) は開口度が小さく短め (約 105ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 125ms) に設定
+            // 狭母音 (i, u) は開口度が小さく短め (約 60ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 75ms) に設定
             switch symbol {
             case "i", "u":
-                baseFrames = 10.5
-            default:
-                baseFrames = 12.5
-            }
-        case .consonant:
-            // 摩擦音 (s, sh, h) は十分な乱流気流知覚のため長め (約 80ms)、破裂音 (k, t, p) は閉鎖期無音 (約 40ms) と急峻な解放バースト (約 20ms) を確保するため 6.0 フレーム (約 60ms)
-            switch symbol {
-            case "s", "sh", "h", "z", "j":
-                baseFrames = 8.0
-            case "k", "t", "p", "g", "d", "b":
                 baseFrames = 6.0
             default:
-                baseFrames = 7.0
+                baseFrames = 7.5
+            }
+        case .consonant:
+            // 摩擦音 (s, sh, h) は乱流気流知覚のため 4.5 フレーム (約 45ms)、破裂音 (k, t, p) は閉鎖期無音と解放バーストを合わせ 3.5 フレーム (約 35ms)
+            switch symbol {
+            case "s", "sh", "h", "z", "j":
+                baseFrames = 4.5
+            case "k", "t", "p", "g", "d", "b":
+                baseFrames = 3.5
+            default:
+                baseFrames = 4.0
             }
         case .contracted:
-            baseFrames = 7.0
+            baseFrames = 4.0
         case .geminate:
-            // 促音 (っ) は明瞭な音節境界知覚のため十分な無音閉鎖間隔 (約 140ms) を確保
-            baseFrames = 14.0
+            // 促音 (っ) は閉鎖間隔 8.0 フレーム (約 80ms) を確保
+            baseFrames = 8.0
         case .nasalSyllable:
-            baseFrames = 11.0
+            baseFrames = 7.0
         case .prolonged:
-            baseFrames = 13.0
+            baseFrames = 7.5
         case .pause:
             if symbol == "<sil>" {
-                baseFrames = 30.0
+                baseFrames = 20.0
             } else {
-                baseFrames = 18.0
+                baseFrames = 15.0
             }
         }
 
@@ -223,6 +223,7 @@ public final class LengthRegulator: Sendable {
         normalizer: TextNormalizer,
         prosodyModel: ProsodyModel,
         vocabulary: PhonemeVocabulary,
+        prosodyPredictor: ProsodyPredictor? = nil,
         speedFactor: Float = 1.0,
         baseF0: Float = 220.0,
         applyFluctuation: Bool = true,
@@ -250,61 +251,69 @@ public final class LengthRegulator: Sendable {
         // 2. アクセント句・モーラ階層構築
         var phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
 
-        // 3. 各音素および休止の浮動小数点 Duration 系列の収集
-        var rawFloatDurations: [Float] = []
-        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
-        var pIdx = 0
-        while pIdx < phrases.count {
-            let phrase = phrases[pIdx]
-            let isLastPhrase = (pIdx + 1) == phrases.count
-            var mIdx = 0
-            while mIdx < phrase.moras.count {
-                let mora = phrase.moras[mIdx]
-                let isLastMora = (mIdx + 1) == phrase.moras.count
-                var shouldLengthen = false
-                if isLastMora {
-                    if phrase.pauseAfter || isLastPhrase {
-                        shouldLengthen = true
-                    }
-                }
-
-                var phIdx = 0
-                while phIdx < mora.phonemes.count {
-                    let token = mora.phonemes[phIdx]
-                    var scaled = floatDurationFrames(category: token.category, symbol: token.symbol, speed: safeSpeedFactor)
-
-                    // 生理学的 1/f テンポゆらぎの適用 (推論時のみ適用し、学習時アライメントの汚染を防止)
-                    if applyFluctuation {
-                        let tempoScale = bioFluctuation.computeTempoScale()
-                        scaled *= tempoScale
-                    }
-
-                    // 文末または読点ポーズ直前のモーラを自然に約1.25倍伸張（Phrase-Final Lengthening）
-                    if shouldLengthen {
-                        switch token.category {
-                        case .vowel, .nasalSyllable, .prolonged:
-                            scaled *= 1.25
-                        default:
-                            break
+        // 3. 各音素および休止の Duration 系列の確定（学習済み予測器を主経路とし、未指定時は規則表）
+        let quantizedDurations: [Int]
+        switch prosodyPredictor {
+        case .some(let predictor):
+            quantizedDurations = predictor.predictDurations(
+                phrases: phrases,
+                vocabulary: vocabulary,
+                lengthRegulator: self,
+                speedFactor: safeSpeedFactor,
+                applyFluctuation: applyFluctuation
+            )
+        case .none:
+            var rawFloatDurations: [Float] = []
+            var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
+            var pIdx = 0
+            while pIdx < phrases.count {
+                let phrase = phrases[pIdx]
+                let isLastPhrase = (pIdx + 1) == phrases.count
+                var mIdx = 0
+                while mIdx < phrase.moras.count {
+                    let mora = phrase.moras[mIdx]
+                    let isLastMora = (mIdx + 1) == phrase.moras.count
+                    var shouldLengthen = false
+                    if isLastMora {
+                        if phrase.pauseAfter || isLastPhrase {
+                            shouldLengthen = true
                         }
                     }
-                    rawFloatDurations.append(scaled)
-                    phIdx += 1
+
+                    var phIdx = 0
+                    while phIdx < mora.phonemes.count {
+                        let token = mora.phonemes[phIdx]
+                        var scaled = floatDurationFrames(category: token.category, symbol: token.symbol, speed: safeSpeedFactor)
+
+                        if applyFluctuation {
+                            let tempoScale = bioFluctuation.computeTempoScale()
+                            scaled *= tempoScale
+                        }
+
+                        if shouldLengthen {
+                            switch token.category {
+                            case .vowel, .nasalSyllable, .prolonged:
+                                scaled *= 1.25
+                            default:
+                                break
+                            }
+                        }
+                        rawFloatDurations.append(scaled)
+                        phIdx += 1
+                    }
+                    mIdx += 1
                 }
-                mIdx += 1
+                if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
+                    rawFloatDurations.append(Float(phrase.pauseDurationFrames))
+                }
+                pIdx += 1
             }
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                rawFloatDurations.append(Float(phrase.pauseDurationFrames))
-            }
-            pIdx += 1
+            quantizedDurations = quantizeDurations(durations: rawFloatDurations)
         }
 
-        // 4. 累積和量子化による整数フレーム確定 (累積丸めドリフトゼロ)
-        let quantizedDurations = quantizeDurations(durations: rawFloatDurations)
-
-        // 5. 量子化されたフレーム数を各音素および休止へ反映
+        // 4. 量子化されたフレーム数を各音素および休止へ反映
         var qIdx = 0
-        pIdx = 0
+        var pIdx = 0
         while pIdx < phrases.count {
             var mIdx = 0
             while mIdx < phrases[pIdx].moras.count {
@@ -327,7 +336,7 @@ public final class LengthRegulator: Sendable {
             pIdx += 1
         }
 
-        // 6. フラットな音素列と Duration 列の抽出
+        // 5. フラットな音素列と Duration 列の抽出
         var phoneIds: [Int32] = []
         var durations: [Int32] = []
 
@@ -347,52 +356,71 @@ public final class LengthRegulator: Sendable {
             pListIdx += 1
         }
 
-        // 7. F0 輪郭パラメータの生成
-        // なぜ baseF0 を渡すか:
-        // 話者の絶対基音周波数を直接注入し、句成分・アクセント成分・生体ゆらぎが話者基音にスケールされた
-        // 物理的に正しい絶対 F0 輪郭を算出するため。
-        let (f0Contour, voicedFlags, totalFrames) = prosodyModel.generateF0Contour(
-            phrases: phrases,
-            vocabulary: vocabulary,
-            baseF0: baseF0,
-            fluctuation: &bioFluctuation,
-            applyFluctuation: applyFluctuation
-        )
+        // 6. F0 輪郭パラメータの生成（学習済み予測器を主経路とし、未指定時は藤崎モデル規則）
+        let f0Contour: [Float]
+        let voicedFlags: [Float]
+        let totalFrames: Int
+        switch prosodyPredictor {
+        case .some(let predictor):
+            let predRes = predictor.predictF0Contour(
+                phrases: phrases,
+                vocabulary: vocabulary,
+                baseF0: baseF0,
+                prosodyModel: prosodyModel,
+                durations: quantizedDurations,
+                applyFluctuation: applyFluctuation
+            )
+            f0Contour = predRes.f0Contour
+            voicedFlags = predRes.voicedFlags
+            totalFrames = predRes.totalFrames
+        case .none:
+            var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
+            let fujisakiRes = prosodyModel.generateF0Contour(
+                phrases: phrases,
+                vocabulary: vocabulary,
+                baseF0: baseF0,
+                fluctuation: &bioFluctuation,
+                applyFluctuation: applyFluctuation
+            )
+            f0Contour = fujisakiRes.f0Contour
+            voicedFlags = fujisakiRes.voicedFlags
+            totalFrames = fujisakiRes.totalFrames
+        }
 
         // 8. 音素物理カテゴリに基づく音響エネルギー輪郭の生成
-        // なぜ一律固定値（0.60/0.10）ではなく音素カテゴリ別物理プロファイルにするか:
-        // 学習時は PitchTracker の実測 RMS を発話内ピーク 0.80（母音部約 0.80、摩擦部 0.20〜0.30、閉鎖部 0.02、無音 0.0）
-        // に正規化して SNN に供給しているため、推論時も母音ピーク 0.80 の同一分布を供給して分布外（OOD）入力を防ぐ。
+        // なぜ一律固定値ではなく音素カテゴリ別物理プロファイル＋半正弦波窓にするか:
+        // 学習側 PitchTracker の実測 RMS は発話内ピーク 0.70〜0.80 で母音平均約 0.20〜0.25 であるため、
+        // 推論時も半正弦波窓により中央ピーク 0.70、両端で滑らかに遷移させ、膜電位飽和を防ぎ過渡的フォルマント変化を維持する。
         var baseEnergyContour = [Float](repeating: 0.0, count: totalFrames)
         var curFrame = 0
         var phIter = 0
         while phIter < phoneIds.count {
             let pid = Int(phoneIds[phIter])
             let dur = Int(durations[phIter])
-            var targetEnergy: Float = 0.0
+            let peakEnergy: Float
 
             switch true {
             case vocabulary.isPauseOrSilence(id: pid):
-                targetEnergy = 0.0
+                peakEnergy = 0.0
             case vocabulary.isUnvoicedStop(id: pid):
-                targetEnergy = 0.02 // 閉鎖無音区間
+                peakEnergy = 0.02 // 閉鎖無音区間
             case vocabulary.isUnvoicedFricative(id: pid):
-                targetEnergy = 0.25 // 無声摩擦気流
+                peakEnergy = 0.18 // 無声摩擦気流
             case vocabulary.isAffricate(id: pid):
-                targetEnergy = 0.20 // 破擦音
+                peakEnergy = 0.15 // 破擦音
             case vocabulary.isVoicedStop(id: pid):
-                targetEnergy = 0.35 // 有声破裂音
+                peakEnergy = 0.25 // 有声破裂音
             default:
                 let symbol = vocabulary.token(for: pid)
                 if vocabulary.isVoiced(symbol: symbol) {
                     switch symbol {
                     case "a", "i", "u", "e", "o", "N", "_":
-                        targetEnergy = 0.80 // 母音・撥音・長音（学習側ピーク 0.80 と完全一致）
+                        peakEnergy = 0.70 // 母音・撥音・長音
                     default:
-                        targetEnergy = 0.45 // その他有声子音（鼻音・半母音・弾音など）
+                        peakEnergy = 0.35 // その他有声子音（鼻音・半母音・弾音など）
                     }
                 } else {
-                    targetEnergy = 0.15
+                    peakEnergy = 0.10
                 }
             }
 
@@ -400,7 +428,14 @@ public final class LengthRegulator: Sendable {
             while f < dur {
                 let frameIdx = curFrame + f
                 if frameIdx < totalFrames {
-                    baseEnergyContour[frameIdx] = targetEnergy
+                    switch (peakEnergy <= 0.05, dur <= 2) {
+                    case (true, _), (_, true):
+                        baseEnergyContour[frameIdx] = peakEnergy
+                    default:
+                        let phase = (Float(f) + 0.5) / Float(dur)
+                        let window = sinf(Float.pi * phase)
+                        baseEnergyContour[frameIdx] = peakEnergy * (0.25 + (0.75 * window))
+                    }
                 }
                 f += 1
             }
@@ -410,13 +445,13 @@ public final class LengthRegulator: Sendable {
         }
 
         if addBoundarySilence {
-            var leadSil = Int(roundf(6.0 / safeSpeedFactor))
-            if leadSil < 1 {
-                leadSil = 1
+            var leadSil = Int(roundf(26.0 / safeSpeedFactor))
+            if leadSil < 20 {
+                leadSil = 20
             }
-            var trailSil = Int(roundf(10.0 / safeSpeedFactor))
-            if trailSil < 1 {
-                trailSil = 1
+            var trailSil = Int(roundf(32.0 / safeSpeedFactor))
+            if trailSil < 25 {
+                trailSil = 25
             }
 
             var newPhoneIds: [Int32] = []

@@ -39,10 +39,13 @@ public final class AcousticWorkspace: @unchecked Sendable {
     /// 各層のニューロン状態
     public var layerStates: [LIFState]
 
+    /// 時間畳み込み（フレーム間混合）電流作業バッファ
+    public var convCurrents: [Float]
+
     /// 高速バルクゼロクリア用の参照テンプレートバッファ
     private let zeroFloats: [Float]
 
-    public init(maxHiddenDim: Int = 1024, outputDim: Int = 80, numLayers: Int = 2) {
+    public init(maxHiddenDim: Int = 1024, outputDim: Int = 80, numLayers: Int = 4) {
         let safeLayers = max(1, numLayers)
         self.maxHiddenDim = maxHiddenDim
         self.outputDim = outputDim
@@ -51,6 +54,7 @@ public final class AcousticWorkspace: @unchecked Sendable {
         self.inputCurrents = [Float](repeating: 0.0, count: maxHiddenDim)
         self.stepCurrents = [Float](repeating: 0.0, count: maxHiddenDim)
         self.stepCurrentsPrev = [Float](repeating: 0.0, count: maxHiddenDim)
+        self.convCurrents = [Float](repeating: 0.0, count: maxHiddenDim)
         self.activeSpikes = [Int](repeating: 0, count: maxHiddenDim)
         self.activeLayerSpikes = [Int](repeating: 0, count: maxHiddenDim)
         self.activeReadoutIndices = [Int](repeating: 0, count: maxHiddenDim)
@@ -89,6 +93,11 @@ public final class AcousticWorkspace: @unchecked Sendable {
             }
         }
         stepCurrentsPrev.withUnsafeMutableBufferPointer { dst in
+            zeroFloats.withUnsafeBufferPointer { src in
+                dst.baseAddress!.update(from: src.baseAddress!, count: hDim)
+            }
+        }
+        convCurrents.withUnsafeMutableBufferPointer { dst in
             zeroFloats.withUnsafeBufferPointer { src in
                 dst.baseAddress!.update(from: src.baseAddress!, count: hDim)
             }

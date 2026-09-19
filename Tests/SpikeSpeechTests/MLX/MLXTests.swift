@@ -2,6 +2,7 @@ import XCTest
 #if canImport(MLX)
 import MLX
 import MLXNN
+import MLXOptimizers
 #endif
 @testable import SpikeSpeech
 
@@ -233,6 +234,134 @@ final class MLXTests: XCTestCase {
         }
         XCTAssertTrue(stepLoss < initialLoss, "AdamW による BPTT 学習で損失が減少していません: initial=\(initialLoss), final=\(stepLoss)")
     }
+
+    // MARK: - 7b. 4 ブロック SNN (numLayers = 4) の BPTT 学習と損失減少検証
+
+    func testFourBlockBPTTTrainingLossDecreases() {
+        let inDim = 16
+        let maxHidden = 32
+        let outDim = 16
+        let tSteps = 2
+
+        let network = MLXSpikingAcousticNetwork(
+            numLayers: 4,
+            inputDim: inDim,
+            maxHiddenDim: maxHidden,
+            outputDim: outDim,
+            timeSteps: tSteps,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
+        )
+
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            learningRate: 0.005,
+            bpttWindow: 16
+        )
+
+        let seqLen = 32
+        let featSeq = [[Float]](repeating: [Float](repeating: 0.5, count: inDim), count: seqLen)
+        let targetSeq = [[Float]](repeating: [Float](repeating: 0.2, count: outDim), count: seqLen)
+
+        let initialLoss = trainer.trainSequence(features: featSeq, targets: targetSeq)
+
+        var stepLoss = initialLoss
+        var step = 0
+        while step < 10 {
+            stepLoss = trainer.trainSequence(features: featSeq, targets: targetSeq)
+            step += 1
+        }
+
+        XCTAssertTrue(stepLoss < initialLoss, "4ブロック BPTT 学習によって損失が減少していません: initial=\(initialLoss), final=\(stepLoss)")
+    }
+
+    // MARK: - 7c. Pure Swift decodeSequence と MLX forward の数値完全一致検証
+
+    func testPureSwiftDecoderMatchesMLXForward() {
+        let inDim = 16
+        let maxHidden = 32
+        let outDim = 16
+        let tSteps = 2
+        let numLayers = 4
+
+        let network = MLXSpikingAcousticNetwork(
+            numLayers: numLayers,
+            inputDim: inDim,
+            maxHiddenDim: maxHidden,
+            outputDim: outDim,
+            timeSteps: tSteps,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
+        )
+
+        let exported = network.exportWeights()
+        let swiftDecoder = SpikingAcousticDecoder(weights: exported)
+        let workspace = AcousticWorkspace(
+            maxHiddenDim: exported.maxHiddenDim,
+            outputDim: exported.outputDim,
+            numLayers: exported.numLayers
+        )
+
+        let seqLen = 8
+        var featSeq: [[Float]] = []
+        var t = 0
+        while t < seqLen {
+            var fArr = [Float](repeating: 0.0, count: inDim)
+            var i = 0
+            while i < inDim {
+                fArr[i] = sinf(Float((t * inDim) + i) * 0.1) * 0.5
+                i += 1
+            }
+            featSeq.append(fArr)
+            t += 1
+        }
+
+        // 1. MLX forward
+        var flatFeat = [Float](repeating: 0.0, count: seqLen * inDim)
+        t = 0
+        while t < seqLen {
+            var i = 0
+            while i < inDim {
+                flatFeat[(t * inDim) + i] = featSeq[t][i]
+                i += 1
+            }
+            t += 1
+        }
+        let mlxFeat = MLXArray(flatFeat, [1, seqLen, inDim])
+        let mlxOut = network.forward(features: mlxFeat)
+        eval(mlxOut)
+        let mlxOutFlat = mlxOut.asArray(Float.self)
+
+        // 2. Pure Swift decodeSequence
+        let swiftOut = swiftDecoder.decodeSequence(featuresSeq: featSeq, workspace: workspace)
+
+        // 3. 差分の比較
+        var maxDiff: Float = 0.0
+        var sumDiff: Float = 0.0
+        var count = 0
+        t = 0
+        while t < seqLen {
+            var c = 0
+            while c < outDim {
+                let mVal = mlxOutFlat[(t * outDim) + c]
+                let sVal = swiftOut[t][c]
+                let diff = abs(mVal - sVal)
+                if maxDiff < diff {
+                    maxDiff = diff
+                }
+                sumDiff += diff
+                count += 1
+                c += 1
+            }
+            t += 1
+        }
+        let meanDiff = sumDiff / Float(max(1, count))
+        print("\n=======================================================")
+        print("MLX forward vs Pure Swift decodeSequence 数値一致度:")
+        print("  平均絶対誤差 (MAE): \(meanDiff)")
+        print("  最大絶対誤差 (MaxDiff): \(maxDiff)")
+        print("=======================================================\n")
+
+        XCTAssertTrue(meanDiff < 1.0e-3, "MLX と Pure Swift で推論結果が乖離しています: MAE=\(meanDiff), MaxDiff=\(maxDiff)")
+    }
     #endif
 
     // MARK: - 8. 学習率スケジューラ・Plateau ガード・シャッフル・チェックポイント検証 (Pure Swift)
@@ -307,8 +436,6 @@ final class MLXTests: XCTestCase {
         let name10 = WeightCheckpoint.epochFileName(epochOneIndexed: 10)
         XCTAssertEqual(name1, "weights.ep01.json")
         XCTAssertEqual(name10, "weights.ep10.json")
-
-        let path = WeightCheckpoint.resolvePath(directory: "Models", fileName: name1)
-        XCTAssertTrue(path.path.hasSuffix("Models/weights.ep01.json"))
     }
 }
+

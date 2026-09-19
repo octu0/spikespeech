@@ -63,7 +63,7 @@ public final class PitchTracker: @unchecked Sendable {
         hopSize: Int = AudioConfig.hopSize, // 160
         minF0: Float = 60.0,
         maxF0: Float = 500.0,
-        voicingThreshold: Float = 0.35
+        voicingThreshold: Float = 0.45
     ) {
         self.sampleRate = sampleRate
         self.frameLength = frameLength
@@ -256,23 +256,21 @@ public final class PitchTracker: @unchecked Sendable {
         // 単純に相関最大値だけを選ぶと、倍音周期（2tau, 3tau）やフレームシフト境界（160サンプル=100Hz）の
         // 構造的アーティファクトに相関ピークが奪われ、オクターブ低周波誤認や 100Hz への縮退を引き起こす。
         // 有声域として十分な強度（voicingThreshold 以上）を持ち、かつ大域最大相関の有意な比率を持つ
-        // 最初の（最短ラグの）極大ピークを採用することで、真の声帯振動周期を正確に特定する。
-        var significantThreshold = globalMaxPeak * 0.60
-        if significantThreshold < voicingThreshold {
-            significantThreshold = voicingThreshold
-        }
-        if 0.45 < significantThreshold {
-            significantThreshold = 0.45
-        }
+        // 最初の（最短ラグの）極大ピークを採用することで、真の声帯振動周期を特定する。
+        // 4. 大域相関最大ピークの特定とオクターブ跳躍防止アルゴリズム
+        // なぜ単純な最短ラグ優先（First Significant Peak）を排し大域相関最大基準とするか:
+        // 短いラグから走査して閾値を超えた最初のピークを選ぶと、真の基本波（相関 0.85〜0.95）が存在するにもかかわらず
+        // 手前にある第2倍音フォルマント（相関 0.50〜0.70）を誤認して 400Hz 超へ跳躍するオクターブ倍周波化が発生する。
+        // 原則として大域最大相関ピーク（maxLag）を基本波とし、maxLag の約半分（0.44〜0.56倍）に
+        // maxVal * 0.92 以上の極めて強力な相関が存在する場合（倍周期誤検出）のみ手前を採用する。
+        var maxPeakIdx = -1
+        var maxPeakVal: Float = -1.0
 
-        var bestLag = 0
         var pIdx = 0
         while pIdx < peakLags.count {
             let pLag = peakLags[pIdx]
             let pVal = peakVals[pIdx]
 
-            // フレームシフト周期（160サンプル = 100Hz）近傍のアーティファクト排除:
-            // 手前に十分な有声相関の先行ピークが存在する場合、フレーム境界ピークによる誤検出を防止する。
             let isHopArtifact: Bool
             if (hopSize - 12) <= pLag && pLag <= (hopSize + 12) {
                 isHopArtifact = true
@@ -280,36 +278,55 @@ public final class PitchTracker: @unchecked Sendable {
                 isHopArtifact = false
             }
 
-            if isHopArtifact != true && significantThreshold <= pVal {
-                bestLag = pLag
-                break
+            if isHopArtifact != true {
+                if maxPeakVal < pVal {
+                    maxPeakVal = pVal
+                    maxPeakIdx = pIdx
+                }
             }
             pIdx += 1
         }
 
-        if bestLag <= 0 {
-            // ホップアーティファクト以外のピークからフォールバック探索
-            let fallbackThreshold = globalMaxPeak * 0.80
-            pIdx = 0
-            while pIdx < peakLags.count {
-                let pLag = peakLags[pIdx]
-                let pVal = peakVals[pIdx]
-                let isHopArtifact: Bool
-                if (hopSize - 12) <= pLag && pLag <= (hopSize + 12) {
-                    isHopArtifact = true
+        var bestLag = 0
+        if 0 <= maxPeakIdx {
+            let primaryLag = peakLags[maxPeakIdx]
+            bestLag = primaryLag
+
+            // 倍周期誤認の検証: primaryLag の約 1/2 または 1/3 に極めて強い先行ピークがあるか検査
+            let primaryFloat = Float(primaryLag)
+            let subharmonicThreshold = maxPeakVal * 0.92
+
+            var sIdx = 0
+            while sIdx < maxPeakIdx {
+                let candLag = peakLags[sIdx]
+                let candVal = peakVals[sIdx]
+                let candFloat = Float(candLag)
+                let ratio = candFloat / primaryFloat
+
+                let isHalf: Bool
+                if 0.44 <= ratio && ratio <= 0.56 {
+                    isHalf = true
                 } else {
-                    isHopArtifact = false
+                    isHalf = false
                 }
-                if isHopArtifact != true && fallbackThreshold <= pVal {
-                    bestLag = pLag
+
+                let isThird: Bool
+                if 0.28 <= ratio && ratio <= 0.38 {
+                    isThird = true
+                } else {
+                    isThird = false
+                }
+
+                if (isHalf || isThird) && subharmonicThreshold <= candVal {
+                    bestLag = candLag
                     break
                 }
-                pIdx += 1
+                sIdx += 1
             }
         }
 
         if bestLag <= 0 {
-            // ホップ周期近傍しかピークが存在しない場合、真の低域声帯振動（globalMaxPeak >= 0.65）である場合のみ有声採用
+            // ホップ周期近傍しかピークが存在しない場合、真の低域声帯振動（0.65 <= globalMaxPeak）である場合のみ有声採用
             if 0.65 <= globalMaxPeak {
                 bestLag = peakLags[0]
             } else {

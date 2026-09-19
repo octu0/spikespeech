@@ -8,6 +8,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
     public let normalizer: TextNormalizer
     public let prosodyModel: ProsodyModel
+    public let prosodyPredictor: ProsodyPredictor
     public let vocabulary: PhonemeVocabulary
     public let lengthRegulator: LengthRegulator
     public let decoder: SpikingAcousticDecoder
@@ -66,6 +67,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         let morphology = ViterbiMorphology(lexicon: effectiveWeights.lexicon)
         self.normalizer = TextNormalizer(morphology: morphology)
         self.prosodyModel = ProsodyModel()
+        self.prosodyPredictor = ProsodyPredictor(weights: effectiveWeights.prosodyWeights)
         self.vocabulary = PhonemeVocabulary()
         self.lengthRegulator = LengthRegulator(hiddenDimension: effectiveWeights.inputDim)
         self.decoder = SpikingAcousticDecoder(weights: effectiveWeights)
@@ -321,13 +323,14 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         workspace.reset()
         neuralVocoder.reset()
 
-        // 1. テキスト正規化および言語韻律処理（話者基音 baseF0 にユーザー指定 pitch を一元反映）
+        // 1. テキスト正規化および言語韻律処理（学習済み韻律予測器を主経路とし、話者基音 baseF0 にユーザー指定 pitch を一元反映）
         let effectiveBaseF0 = voice.baseF0 * safePitch
         let linguisticFeatures = lengthRegulator.processText(
             text: text,
             normalizer: normalizer,
             prosodyModel: prosodyModel,
             vocabulary: vocabulary,
+            prosodyPredictor: prosodyPredictor,
             speedFactor: safeSpeed,
             baseF0: effectiveBaseF0,
             addBoundarySilence: true
@@ -379,10 +382,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             linguisticFeatures: linguisticFeatures,
             totalFrames: totalFrames
         )
-        let stopBurstMask = computeStopBurstMask(
-            linguisticFeatures: linguisticFeatures,
-            totalFrames: totalFrames
-        )
         let frameSize = AudioConfig.hopSize
         var fIdx = 0
         while fIdx < totalFrames {
@@ -413,16 +412,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     }
                 }
             case false:
-                let isBurst = stopBurstMask[fIdx]
-                if isBurst {
-                    let startSample = fIdx * frameSize
-                    let endSample = min(rawSamples.count, startSample + frameSize)
-                    var s = startSample
-                    while s < endSample {
-                        rawSamples[s] = rawSamples[s] * 0.020
-                        s += 1
-                    }
-                }
+                break
             }
             fIdx += 1
         }

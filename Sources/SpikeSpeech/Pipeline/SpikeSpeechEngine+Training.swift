@@ -299,4 +299,302 @@ extension SpikeSpeechEngine {
 
         return (features: safeFeatures, targets: safeTargets)
     }
+
+    /// テキストと実音声波形から韻律予測器（Duration & F0）学習用サンプルを抽出する
+    public func prepareProsodyTrainingSample(
+        text: String,
+        pcm16k: [Float],
+        pitchTracker: PitchTracker
+    ) -> ProsodyTrainingSample? {
+        if pcm16k.isEmpty {
+            return nil
+        }
+        let targetFrames = pcm16k.count / AudioConfig.hopSize
+        if targetFrames <= 0 {
+            return nil
+        }
+
+        let morphemes = normalizer.normalize(text: text)
+        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+        if phrases.isEmpty {
+            return nil
+        }
+
+        let boundaries = detectSpeechBoundaries(
+            pcm: pcm16k,
+            hopSize: AudioConfig.hopSize,
+            totalFrames: targetFrames
+        )
+        let speechFrames = boundaries.speechFrames
+
+        let baseLinguistic = lengthRegulator.processText(
+            text: text,
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.female.baseF0,
+            applyFluctuation: false,
+            addBoundarySilence: false
+        )
+        let origTotalFrames = baseLinguistic.totalFrames
+        let phoneCount = baseLinguistic.phoneIds.count
+
+        if speechFrames <= 0 || speechFrames < phoneCount || origTotalFrames <= 0 {
+            return nil
+        }
+
+        let stretchRatio = Float(speechFrames) / Float(max(1, origTotalFrames))
+        var scaledDurations = [Float](repeating: 0.0, count: phoneCount)
+        var p = 0
+        while p < phoneCount {
+            let origD = Float(baseLinguistic.durations[p])
+            scaledDurations[p] = max(1.0, origD * stretchRatio)
+            p += 1
+        }
+        let quantizedDurations = lengthRegulator.quantizeDurations(durations: scaledDurations)
+        var sumQuantized = 0
+        var q = 0
+        while q < quantizedDurations.count {
+            sumQuantized += quantizedDurations[q]
+            q += 1
+        }
+        var speechDurations = quantizedDurations
+        let diff = speechFrames - sumQuantized
+        if diff < 0 {
+            var remaining = -diff
+            var roundIdx = speechDurations.count - 1
+            var consecutiveFailures = 0
+            while 0 < remaining && 0 <= roundIdx {
+                let dIdx = roundIdx % speechDurations.count
+                if 1 < speechDurations[dIdx] {
+                    speechDurations[dIdx] -= 1
+                    remaining -= 1
+                    consecutiveFailures = 0
+                } else {
+                    consecutiveFailures += 1
+                    if speechDurations.count <= consecutiveFailures {
+                        break
+                    }
+                }
+                roundIdx -= 1
+                if roundIdx < 0 && 0 < remaining {
+                    roundIdx = speechDurations.count - 1
+                }
+            }
+        }
+        if 0 < diff && 0 < speechDurations.count {
+            var remainingDiff = diff
+            var roundIdx = 0
+            while 0 < remainingDiff {
+                let dIdx = roundIdx % speechDurations.count
+                speechDurations[dIdx] += 1
+                remainingDiff -= 1
+                roundIdx += 1
+            }
+        }
+
+        // 量子化された音素長をアクセント句・モーラ・音素構造に反映する
+        // なぜ durationFrames を反映するか:
+        // buildAccentPhrases 直後の音素は durationFrames=0 で初期化されており、
+        // これを更新しないと generateF0Contour が空の F0 輪郭を返してしまい、
+        // 有声フレームの有声 F0 MAE 学習が完全にゼロマスクされて学習不能となるため。
+        var updatedPhrases = phrases
+        var phCount = 0
+        var upIdx = 0
+        while upIdx < updatedPhrases.count {
+            var umIdx = 0
+            while umIdx < updatedPhrases[upIdx].moras.count {
+                var uphIdx = 0
+                while uphIdx < updatedPhrases[upIdx].moras[umIdx].phonemes.count {
+                    if phCount < speechDurations.count {
+                        updatedPhrases[upIdx].moras[umIdx].phonemes[uphIdx].durationFrames = speechDurations[phCount]
+                        phCount += 1
+                    }
+                    uphIdx += 1
+                }
+                umIdx += 1
+            }
+            upIdx += 1
+        }
+
+        // 1. 各音素の Duration 特徴量と教師 Duration
+        var durFeats = [[Float]]()
+        var ruleDurs = [Float]()
+        var targetDurs = [Float]()
+
+        var pIdx = 0
+        var speechPhonemeIdx = 0
+        while pIdx < updatedPhrases.count {
+            let phrase = updatedPhrases[pIdx]
+            var mIdx = 0
+            while mIdx < phrase.moras.count {
+                let mora = phrase.moras[mIdx]
+                let isLastMora = (mIdx + 1) == phrase.moras.count
+                var phIdx = 0
+                while phIdx < mora.phonemes.count {
+                    let token = mora.phonemes[phIdx]
+                    let isLastPhoneme = (phIdx + 1) == mora.phonemes.count
+                    let ruleDur = lengthRegulator.floatDurationFrames(category: token.category, symbol: token.symbol, speed: 1.0)
+
+                    let feat = ProsodyPredictor.extractDurationFeatures(
+                        token: token,
+                        mora: mora,
+                        phrase: phrase,
+                        isLastMoraInPhrase: isLastMora,
+                        isLastPhonemeInMora: isLastPhoneme,
+                        ruleDuration: ruleDur,
+                        inputDim: 72
+                    )
+
+                    var targDur = ruleDur
+                    if speechPhonemeIdx < speechDurations.count {
+                        targDur = Float(speechDurations[speechPhonemeIdx])
+                    }
+
+                    durFeats.append(feat)
+                    ruleDurs.append(ruleDur)
+                    targetDurs.append(targDur)
+
+                    speechPhonemeIdx += 1
+                    phIdx += 1
+                }
+                mIdx += 1
+            }
+            pIdx += 1
+        }
+
+        // 2. 実測 PitchTracker F0 と藤崎規則 F0
+        let pitchResult = pitchTracker.track(pcm: pcm16k)
+        var bio = BiologicalFluctuation(seed: 2026)
+        let (fujisakiF0, _, totalF) = prosodyModel.generateF0Contour(
+            phrases: updatedPhrases,
+            vocabulary: vocabulary,
+            baseF0: VoiceProfile.female.baseF0,
+            fluctuation: &bio,
+            applyFluctuation: false
+        )
+
+        var f0Feats = [[Float]]()
+        var fujiF0s = [Float]()
+        var targF0s = [Float]()
+        var vMasks = [Float]()
+
+        let leadSilence = boundaries.leadSilence
+        var curF = 0
+        pIdx = 0
+        while pIdx < updatedPhrases.count {
+            let phrase = updatedPhrases[pIdx]
+            let phraseTotalFrames = phrase.moras.reduce(0) { total, mora in
+                total + mora.phonemes.reduce(0) { $0 + $1.durationFrames }
+            }
+            let phraseStartF = curF
+
+            var mIdx = 0
+            while mIdx < phrase.moras.count {
+                let mora = phrase.moras[mIdx]
+                let isHigh = (mora.tone == .high)
+
+                var phIdx = 0
+                while phIdx < mora.phonemes.count {
+                    let token = mora.phonemes[phIdx]
+                    let dur = max(1, token.durationFrames)
+                    let isVoiced = vocabulary.isVoiced(symbol: token.symbol)
+
+                    var f = 0
+                    while f < dur {
+                        let fujiIdx = curF + f
+                        let audioFrameIdx = leadSilence + curF + f
+
+                        var baseF: Float = 0.0
+                        if fujiIdx < fujisakiF0.count {
+                            baseF = fujisakiF0[fujiIdx]
+                        }
+
+                        var actualF0: Float = 0.0
+                        var actualVoiced: Float = 0.0
+                        if audioFrameIdx < pitchResult.frameCount {
+                            actualF0 = pitchResult.f0[audioFrameIdx]
+                            actualVoiced = pitchResult.voiced[audioFrameIdx]
+                        }
+
+                        // 境界付近（±2フレーム）の微小アライメントズレ耐性
+                        // なぜ近傍探索を行うか:
+                        // 規則長からの線形伸縮と実音声の発音タイミングの間には 10〜20ms（1〜2フレーム）の微小な物理的ズレがあり、
+                        // 1 点サンプリングでは母音の立ち上がりで無声フレーム（0 Hz）を誤って拾ったり mask=0 となって
+                        // 学習サンプルが脱落・汚染されるのを防ぎ、真の有声 F0 目標値を安定して捕捉するため。
+                        if isVoiced && (actualVoiced < 0.5 || actualF0 < 120.0 || 420.0 < actualF0) {
+                            var offset = -2
+                            while offset <= 2 {
+                                let candIdx = audioFrameIdx + offset
+                                if 0 <= candIdx && candIdx < pitchResult.frameCount {
+                                    let candVoiced = pitchResult.voiced[candIdx]
+                                    let candF0 = pitchResult.f0[candIdx]
+                                    if 0.5 <= candVoiced && 120.0 <= candF0 && candF0 <= 420.0 {
+                                        actualF0 = candF0
+                                        actualVoiced = candVoiced
+                                        break
+                                    }
+                                }
+                                offset += 1
+                            }
+                        }
+
+                        let pProg = Float(f) / Float(dur)
+                        let phraseFrame = (curF - phraseStartF) + f
+                        let phProg = Float(phraseFrame) / Float(max(1, phraseTotalFrames))
+                        let sProg = Float(fujiIdx) / Float(max(1, totalF))
+                        let isAccentNucleus = mora.isAccentKernel
+                        let isFlatAccent = phrase.moras.allSatisfy { $0.isAccentKernel != true }
+                        let isVowel = (token.category == .vowel)
+
+                        let feat = ProsodyPredictor.extractF0Features(
+                            phoneId: token.id,
+                            phonemeProgress: pProg,
+                            duration: dur,
+                            fujisakiF0: baseF,
+                            isHighTone: isHigh,
+                            phraseProgress: phProg,
+                            isVoiced: isVoiced,
+                            sentenceProgress: sProg,
+                            isQuestion: phrase.isQuestion,
+                            isAccentNucleus: isAccentNucleus,
+                            isFlatAccent: isFlatAccent,
+                            isVowel: isVowel,
+                            inputDim: 76
+                        )
+
+                        var mask: Float = 0.0
+                        if isVoiced && 0.5 <= actualVoiced && 120.0 <= actualF0 && actualF0 <= 420.0 {
+                            mask = 1.0
+                        }
+
+                        f0Feats.append(feat)
+                        fujiF0s.append(baseF)
+                        targF0s.append(actualF0)
+                        vMasks.append(mask)
+
+                        f += 1
+                    }
+                    curF += dur
+                    phIdx += 1
+                }
+                mIdx += 1
+            }
+            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
+                curF += phrase.pauseDurationFrames
+            }
+            pIdx += 1
+        }
+
+        return ProsodyTrainingSample(
+            durationFeatures: durFeats,
+            ruleDurations: ruleDurs,
+            targetDurations: targetDurs,
+            f0Features: f0Feats,
+            fujisakiF0: fujiF0s,
+            targetF0: targF0s,
+            voicedMask: vMasks
+        )
+    }
 }
