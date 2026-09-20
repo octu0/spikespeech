@@ -105,30 +105,46 @@ extension SpikeSpeechEngine {
         let speechFrames = boundaries.speechFrames
         let trailSilence = boundaries.trailSilence
 
-        // なぜ女性話者の baseF0 でアライメントし applyFluctuation: false にするか:
-        // 教師データは成人女性単一話者の実録音音声であり、実音声のピッチ帯域（~220Hz）と
-        // 一致させる必要がある。また targetSpeechFrames: speechFrames を渡すことで、
-        // 規則表の引き伸ばしではなく、その WAV の実際の発話長 ÷ モーラ数 M = framesPerMora から
-        // データ駆動型で厳密に音素フレーム数を算出する。
-        let baseLinguistic = lengthRegulator.processText(
-            text: text,
-            normalizer: normalizer,
-            prosodyModel: prosodyModel,
-            vocabulary: vocabulary,
-            speedFactor: 1.0,
-            baseF0: VoiceProfile.female.baseF0,
-            applyFluctuation: false,
-            addBoundarySilence: false,
-            targetSpeechFrames: speechFrames
-        )
+        let morphemes = normalizer.normalize(text: text)
+        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+        if phrases.isEmpty {
+            return nil
+        }
 
-        let origTotalFrames = baseLinguistic.totalFrames
-        let phoneCount = baseLinguistic.phoneIds.count
+        var phoneIds: [Int32] = []
+        var pIdx = 0
+        while pIdx < phrases.count {
+            var mIdx = 0
+            while mIdx < phrases[pIdx].moras.count {
+                var phIdx = 0
+                while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
+                    phoneIds.append(Int32(phrases[pIdx].moras[mIdx].phonemes[phIdx].id))
+                    phIdx += 1
+                }
+                mIdx += 1
+            }
+            pIdx += 1
+        }
 
-        // なぜ音素数と発話フレーム数の境界検査を行うか:
-        // 発話区間フレーム数がゼロまたは音素数未満の場合、各音素に最低 1 フレームを割り当てることが物理的に不可能となり
-        // 時間軸アライメントが破綻するため、安全に nil を返してデータセットの品質を保護する。
+        let phoneCount = phoneIds.count
         if speechFrames <= 0 || speechFrames < phoneCount {
+            return nil
+        }
+
+        // なぜ音響エネルギー同期アライメント器（AcousticEnergyAligner）を唯一の正本とするか:
+        // 発話区間をモーラ数で等時間割り（speechFrames / M）すると、実音声波形で子音・母音が鳴る時刻と
+        // 音素ラベルの時刻が物理的に乖離し、SNN が誤ったスペクトルを学習して声質だけ残り言葉が消滅するため。
+        // 短時間平滑化エネルギーの累積等分および局所エネルギー谷スナップにより、WAV の実音声エネルギー境界で
+        // 音素フレーム数を物理的に決定し、教師 Mel と厳密に完全同期させる。
+        let energyAligner = AcousticEnergyAligner()
+        guard let speechDurations = energyAligner.alignPhonemes(
+            pcm: pcm16k,
+            hopSize: AudioConfig.hopSize,
+            leadSilence: leadSilence,
+            speechFrames: speechFrames,
+            phrases: phrases,
+            lengthRegulator: lengthRegulator
+        ) else {
             return nil
         }
 
@@ -136,133 +152,79 @@ extension SpikeSpeechEngine {
         var fullPhoneIds: [Int32] = []
         var fullDurations: [Int] = []
 
-        if origTotalFrames <= 0 || phoneCount <= 0 {
-            alignedFeatures = [[Float]](repeating: [Float](repeating: 0.0, count: weights.inputDim), count: targetFrames)
-            fullPhoneIds = [Int32(PhonemeVocabulary.silId)]
-            fullDurations = [targetFrames]
-        } else {
-            var speechDurations = [Int](repeating: 0, count: phoneCount)
-            var sumDurations = 0
-            var p = 0
-            while p < phoneCount {
-                let d = Int(baseLinguistic.durations[p])
-                speechDurations[p] = max(1, d)
-                sumDurations += speechDurations[p]
-                p += 1
-            }
-
-            let diff = speechFrames - sumDurations
-            if diff < 0 {
-                // 負の差分: 1 フレームを超えて短縮可能な音素に対して均等に巡回削減
-                var remaining = -diff
-                var roundIdx = speechDurations.count - 1
-                var consecutiveFailures = 0
-                while 0 < remaining && 0 <= roundIdx {
-                    let dIdx = roundIdx % speechDurations.count
-                    if 1 < speechDurations[dIdx] {
-                        speechDurations[dIdx] -= 1
-                        remaining -= 1
-                        consecutiveFailures = 0
-                    } else {
-                        consecutiveFailures += 1
-                        if speechDurations.count <= consecutiveFailures {
-                            break
-                        }
-                    }
-                    roundIdx -= 1
-                    if roundIdx < 0 && 0 < remaining {
-                        roundIdx = speechDurations.count - 1
-                    }
-                }
-            }
-            if 0 < diff && 0 < speechDurations.count {
-                // なぜ打ち切りなしの巡回配分を行うか:
-                // 差分フレームが音素数を超える場合であっても、余りフレームを一切捨てずに全音素へ均等に 1 フレームずつ
-                // 何周でも巡回加算することで、合計フレーム数を speechFrames と厳密に完全一致させるため。
-                var remainingDiff = diff
-                var roundIdx = 0
-                while 0 < remainingDiff {
-                    let dIdx = roundIdx % speechDurations.count
-                    speechDurations[dIdx] += 1
-                    remainingDiff -= 1
-                    roundIdx += 1
-                }
-            }
-
-            if 0 < leadSilence {
-                fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-                fullDurations.append(leadSilence)
-            }
-
-            var bIdx = 0
-            while bIdx < phoneCount {
-                fullPhoneIds.append(baseLinguistic.phoneIds[bIdx])
-                fullDurations.append(speechDurations[bIdx])
-                bIdx += 1
-            }
-
-            if 0 < trailSilence {
-                fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-                fullDurations.append(trailSilence)
-            }
-
-            // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間 RMS 抽出
-            let pitchResult = pitchTracker.track(pcm: pcm16k)
-
-            // なぜ学習データ構築時に発話ピーク正規化を行うか:
-            // 実録音のゲインばらつきを吸収し、発話内ピーク（有声母音）を正確に 0.80（推論側の母音エネルギー 0.80）
-            // にスケーリングすることで、推論時のエネルギー条件付け特徴量（ch70）の確率分布と 1 対 1 で整合させるため。
-            var maxEnergy: Float = 0.0
-            var ef = 0
-            while ef < pitchResult.frameCount {
-                if maxEnergy < pitchResult.energy[ef] {
-                    maxEnergy = pitchResult.energy[ef]
-                }
-                ef += 1
-            }
-            var normScale: Float = 1.0
-            if 0.01 < maxEnergy {
-                normScale = 0.80 / maxEnergy
-            }
-
-            var alignedF0 = [Float](repeating: 0.0, count: targetFrames)
-            var alignedVoiced = [Float](repeating: 0.0, count: targetFrames)
-            var alignedEnergy = [Float](repeating: 0.0, count: targetFrames)
-            var f = 0
-            while f < targetFrames {
-                if f < pitchResult.frameCount {
-                    alignedF0[f] = pitchResult.f0[f]
-                    alignedVoiced[f] = pitchResult.voiced[f]
-                    let scaledVal = pitchResult.energy[f] * normScale
-                    if 1.0 < scaledVal {
-                        alignedEnergy[f] = 1.0
-                    } else {
-                        alignedEnergy[f] = scaledVal
-                    }
-                }
-                f += 1
-            }
-
-            var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
-            var dIdx = 0
-            while dIdx < fullDurations.count {
-                int32Durations[dIdx] = Int32(fullDurations[dIdx])
-                dIdx += 1
-            }
-
-            let alignedLinguistic = LinguisticFeatures(
-                phoneIds: fullPhoneIds,
-                durations: int32Durations,
-                f0Contour: alignedF0,
-                voicedFlags: alignedVoiced,
-                energyContour: alignedEnergy,
-                totalFrames: targetFrames
-            )
-
-            alignedFeatures = encodeLinguisticFeatures(
-                features: alignedLinguistic
-            )
+        if 0 < leadSilence {
+            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
+            fullDurations.append(leadSilence)
         }
+
+        var bIdx = 0
+        while bIdx < phoneCount {
+            fullPhoneIds.append(phoneIds[bIdx])
+            fullDurations.append(speechDurations[bIdx])
+            bIdx += 1
+        }
+
+        if 0 < trailSilence {
+            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
+            fullDurations.append(trailSilence)
+        }
+
+        // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間 RMS 抽出
+        let pitchResult = pitchTracker.track(pcm: pcm16k)
+
+        // なぜ学習データ構築時に発話ピーク正規化を行うか:
+        // 実録音のゲインばらつきを吸収し、発話内ピーク（有声母音）を正確に 0.80（推論側の母音エネルギー 0.80）
+        // にスケーリングすることで、推論時のエネルギー条件付け特徴量（ch70）の確率分布と 1 対 1 で整合させるため。
+        var maxEnergy: Float = 0.0
+        var ef = 0
+        while ef < pitchResult.frameCount {
+            if maxEnergy < pitchResult.energy[ef] {
+                maxEnergy = pitchResult.energy[ef]
+            }
+            ef += 1
+        }
+        var normScale: Float = 1.0
+        if 0.01 < maxEnergy {
+            normScale = 0.80 / maxEnergy
+        }
+
+        var alignedF0 = [Float](repeating: 0.0, count: targetFrames)
+        var alignedVoiced = [Float](repeating: 0.0, count: targetFrames)
+        var alignedEnergy = [Float](repeating: 0.0, count: targetFrames)
+        var f = 0
+        while f < targetFrames {
+            if f < pitchResult.frameCount {
+                alignedF0[f] = pitchResult.f0[f]
+                alignedVoiced[f] = pitchResult.voiced[f]
+                let scaledVal = pitchResult.energy[f] * normScale
+                if 1.0 < scaledVal {
+                    alignedEnergy[f] = 1.0
+                } else {
+                    alignedEnergy[f] = scaledVal
+                }
+            }
+            f += 1
+        }
+
+        var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
+        var dIdx = 0
+        while dIdx < fullDurations.count {
+            int32Durations[dIdx] = Int32(fullDurations[dIdx])
+            dIdx += 1
+        }
+
+        let alignedLinguistic = LinguisticFeatures(
+            phoneIds: fullPhoneIds,
+            durations: int32Durations,
+            f0Contour: alignedF0,
+            voicedFlags: alignedVoiced,
+            energyContour: alignedEnergy,
+            totalFrames: targetFrames
+        )
+
+        alignedFeatures = encodeLinguisticFeatures(
+            features: alignedLinguistic
+        )
 
         let finalCount = min(alignedFeatures.count, targetMel.count)
         var safeFeatures = alignedFeatures
