@@ -375,14 +375,41 @@ final class SNNTests: XCTestCase {
         XCTAssertTrue(0.0 < frame5Sum, "時間畳み込みによる時間方向コンテキスト混合が観測されません")
     }
 
-    // MARK: - 9. こんにちは TTS 発話長 1.0 秒以上の死守検証
+    // MARK: - 9. こんにちは TTS 発話本体長 (0.70–0.95 秒) および文頭末無音 (80–160 ms) の適正化検証
 
     func testKonnichiwaDurationNotLessThanOneSecond() {
         let engine = SpikeSpeechEngine()
-        let audio = engine.synthesize(text: "こんにちは")
-        let durationSec = Float(audio.count) / 16000.0
+        let ling = engine.lengthRegulator.processText(
+            text: "こんにちは",
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            addBoundarySilence: true
+        )
 
-        // 受入基準: こんにちは TTS が 1.0 秒未満にならない
-        XCTAssertTrue(1.0 <= durationSec, "こんにちはの発話長が 1.0 秒未満です: \(durationSec) 秒 (\(audio.count) サンプル)")
+        let leadSilFrames = Int(ling.durations.first ?? 0)
+        let trailSilFrames = Int(ling.durations.last ?? 0)
+        let totalSilFrames = leadSilFrames + trailSilFrames
+        let bodyFrames = ling.totalFrames - totalSilFrames
+
+        let bodyDurationSec = Float(bodyFrames) * 0.010
+        let totalSilSec = Float(totalSilFrames) * 0.010
+        let moraMs = (bodyDurationSec / 5.0) * 1000.0
+
+        let audio = engine.synthesize(text: "こんにちは")
+        let totalDurationSec = Float(audio.count) / 16000.0
+
+        print("[Konnichiwa Tempo Check] 全体: \(totalDurationSec)s, 本体: \(bodyDurationSec)s, 先頭無音: \(Float(leadSilFrames) * 0.010)s, 末尾無音: \(Float(trailSilFrames) * 0.010)s, モーラ速度: \(moraMs) ms/モーラ")
+
+        // 受入基準 1: 先頭末尾無音は Copy-synth 程度（80–160 ms）
+        XCTAssertTrue(0.08 <= totalSilSec, "文頭末無音合計が 80 ms 未満です: \(totalSilSec) 秒")
+        XCTAssertTrue(totalSilSec <= 0.16, "文頭末無音合計が 160 ms を超えています (260+320ms は禁止): \(totalSilSec) 秒")
+
+        // 受入基準 2: 発話本体は 0.70–0.95 秒 (150–180 ms/モーラ)
+        XCTAssertTrue(0.70 <= bodyDurationSec, "こんにちはの発話本体が 0.70 秒未満です: \(bodyDurationSec) 秒")
+        XCTAssertTrue(bodyDurationSec <= 0.95, "こんにちはの発話本体が 0.95 秒を超過しています: \(bodyDurationSec) 秒")
+        XCTAssertTrue(150.0 <= moraMs, "モーラあたり速度が 150 ms 未満です: \(moraMs) ms/モーラ")
+        XCTAssertTrue(moraMs <= 180.0, "モーラあたり速度が 180 ms を超過しています: \(moraMs) ms/モーラ")
     }
 }

@@ -564,7 +564,7 @@ func main() {
         warmupEpochs: warmupEpochs,
         totalEpochs: epochs
     )
-    var plateau = PlateauGuard(patience: 2, factor: 0.5, relThreshold: 0.005)
+    var plateau = PlateauGuard(patience: 4, factor: 0.7, relThreshold: 0.002)
 
     var trainer = MLXAcousticBPTTTrainer(
         network: network,
@@ -579,6 +579,7 @@ func main() {
     var finalLoss: Float = 0.0
     var bestLoss = Float.greatestFiniteMagnitude
     var bestEpoch = -1
+    var bestSNNWeights: SpikingNetworkWeights = effectiveWeights
 
     let outputURL = URL(fileURLWithPath: outputPath)
     let outputDir = outputURL.deletingLastPathComponent().path
@@ -660,6 +661,7 @@ func main() {
         if avgLoss < bestLoss {
             bestLoss = avgLoss
             bestEpoch = epoch + 1
+            bestSNNWeights = network.exportWeights()
         }
 
         // なぜ毎エポックスナップショットを保存するか:
@@ -786,7 +788,7 @@ func main() {
         print("韻律最適化完了: 最良有声 F0 MAE: \(String(format: "%.2f", bestProsodyMAE)) Hz (ターゲット < 20 Hz を達成)")
     }
 
-    let exportedWeights = network.exportWeights().withProsodyWeights(finalProsodyWeights)
+    let exportedWeights = bestSNNWeights.withProsodyWeights(finalProsodyWeights)
     do {
         try WeightCheckpoint.atomicWritePretty(exportedWeights, to: outputURL)
         let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0

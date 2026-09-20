@@ -143,7 +143,10 @@ public final class ProsodyModel: Sendable {
                     }
                     k += 1
                 }
-                phrases.append(AccentPhrase(moras: currentMoras, pauseAfter: false, pauseDurationFrames: 0, isQuestion: false))
+                // なぜ句境界で5フレーム (50ms) の自然な語間マイクロポーズを挿入するか:
+                // 自立語同士が間髪入れずに密着して文前半と後半のテンポ知覚が歪むのを防ぎ、
+                // 日本語の自然な呼吸律動と文節ごとの均等な会話速度（150〜160ms/モーラ）を確立するため。
+                phrases.append(AccentPhrase(moras: currentMoras, pauseAfter: true, pauseDurationFrames: 5, isQuestion: false))
                 currentMoras = []
                 currentKernel = 0
             }

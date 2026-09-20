@@ -446,6 +446,28 @@ func main() {
 
     print("音声合成を開始します: 「\(text)」 (話者: \(voiceProfile.name), 速度: \(speed), ピッチ: \(pitch))")
 
+    let dbgLinguistic = engine.lengthRegulator.processText(
+        text: text,
+        normalizer: engine.normalizer,
+        prosodyModel: engine.prosodyModel,
+        vocabulary: engine.vocabulary,
+        prosodyPredictor: engine.prosodyPredictor,
+        speedFactor: speed,
+        baseF0: voiceProfile.baseF0 * pitch,
+        addBoundarySilence: true
+    )
+    print("=== 音素別継続時間分析 (通常合成) ===")
+    var dbgP2 = 0
+    while dbgP2 < dbgLinguistic.phoneIds.count {
+        let pid = Int(dbgLinguistic.phoneIds[dbgP2])
+        let dur = dbgLinguistic.durations[dbgP2]
+        let sym = engine.vocabulary.token(for: pid)
+        print("[\(dbgP2)] ID:\(pid) (\(sym)): \(dur) frames (\(dur * 10) ms)")
+        dbgP2 += 1
+    }
+    print("合計フレーム数: \(dbgLinguistic.totalFrames) (\(dbgLinguistic.totalFrames * 10) ms)")
+    print("=====================================")
+
     let startTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
     let wavData = engine.synthesizeWav(
@@ -492,6 +514,45 @@ func main() {
             rms = Float(sqrt(sumSq / Double(sCount)))
         }
         print("波形統計: サンプル数=\(sCount), 最大絶対振幅=\(String(format: "%.4f", maxAbs)), RMS=\(String(format: "%.4f", rms)), クリップ率=\(String(format: "%.2f", Float(clipCount) / Float(max(1, sCount)) * 100.0))%")
+
+        print("--- 音素区間別実測 RMS / dB ---")
+        var phStartSample = 0
+        var curPhIdx = 0
+        while curPhIdx < dbgLinguistic.phoneIds.count {
+            let pid = Int(dbgLinguistic.phoneIds[curPhIdx])
+            let durFrames = Int(dbgLinguistic.durations[curPhIdx])
+            let phLenSamples = durFrames * 160
+            let phEndSample = min(sCount, phStartSample + phLenSamples)
+            let sym = engine.vocabulary.token(for: pid)
+
+            var phSumSq: Double = 0.0
+            var sampleCount = 0
+            pcmBytes.withUnsafeBytes { rawPtr in
+                let ptr16 = rawPtr.bindMemory(to: Int16.self)
+                var s = phStartSample
+                while s < phEndSample {
+                    let v = Float(ptr16[s]) / 32767.0
+                    phSumSq += Double(v * v)
+                    sampleCount += 1
+                    s += 1
+                }
+            }
+            var phRms: Float = 0.0
+            var phDb: Float = -99.0
+            if 0 < sampleCount {
+                phRms = Float(sqrt(phSumSq / Double(sampleCount)))
+                if 0.00001 < phRms {
+                    phDb = 20.0 * log10f(phRms)
+                }
+            }
+            let startSec = Float(phStartSample) / 16000.0
+            let endSec = Float(phEndSample) / 16000.0
+            print("[\(curPhIdx)] \(sym) (\(String(format: "%.3f", startSec))s - \(String(format: "%.3f", endSec))s, \(durFrames * 10)ms): RMS=\(String(format: "%.4f", phRms)), dB=\(String(format: "%.1f", phDb)) dB")
+
+            phStartSample = phEndSample
+            curPhIdx += 1
+        }
+        print("-------------------------------")
         if 20060 < sCount {
             var sampleStr = ""
             pcmBytes.withUnsafeBytes { rawPtr in

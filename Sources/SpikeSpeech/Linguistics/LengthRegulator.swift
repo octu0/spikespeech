@@ -16,40 +16,47 @@ public final class LengthRegulator: Sendable {
     /// 累積和量子化に入力する浮動小数点継続時間列を生成し、
     /// 丸め誤差の累積による発話時間ドリフトをゼロにする。
     public func floatDurationFrames(category: PhonemeCategory, symbol: String, speed: Float = 1.0) -> Float {
-        var baseFrames: Float = 6.0
+        var baseFrames: Float = 12.0
 
         switch category {
         case .vowel:
-            // 狭母音 (i, u) は開口度が小さく短め (約 60ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 75ms) に設定
+            // 狭母音 (i, u) は 12.0 フレーム (約 120ms)、広母音 (a, o, e) は 13.0 フレーム (約 130ms) に設定
             switch symbol {
             case "i", "u":
-                baseFrames = 6.0
+                baseFrames = 12.0
             default:
-                baseFrames = 7.5
+                baseFrames = 13.0
             }
         case .consonant:
-            // 摩擦音 (s, sh, h) は乱流気流知覚のため 4.5 フレーム (約 45ms)、破裂音 (k, t, p) は閉鎖期無音と解放バーストを合わせ 3.5 フレーム (約 35ms)
+            // 摩擦音 (s, sh, h, z, j) は乱流気流知覚のため 5.0 フレーム (約 50ms)、破擦音 (ch) は 5.0 フレーム
+            // 破裂音 (k, t, p, g, d, b) は気流閉鎖期の過剰な無音分断（> 30ms）を防止するため 2.0 フレーム (約 20ms)
+            // その他子音 (n, m, r, w, y) は 3.5 フレーム (約 35ms)
+            // CV モーラ合計で約 150〜170ms (15〜17フレーム) となり教師 Copy-synth の 160ms/モーラに均等合致
             switch symbol {
-            case "s", "sh", "h", "z", "j":
-                baseFrames = 4.5
+            case "s", "sh", "h", "z", "j", "ch":
+                baseFrames = 5.0
             case "k", "t", "p", "g", "d", "b":
-                baseFrames = 3.5
+                baseFrames = 2.0
             default:
-                baseFrames = 4.0
+                baseFrames = 3.5
             }
         case .contracted:
-            baseFrames = 4.0
+            baseFrames = 3.0
         case .geminate:
-            // 促音 (っ) は閉鎖間隔 8.0 フレーム (約 80ms) を確保
-            baseFrames = 8.0
+            // 促音 (っ) は閉鎖間隔 14.0 フレーム (約 140ms、1モーラ分) を確保
+            baseFrames = 14.0
         case .nasalSyllable:
-            baseFrames = 7.0
+            // 撥音 (ん) は 15.0 フレーム (約 150ms、1モーラ分) を確保
+            baseFrames = 15.0
         case .prolonged:
-            baseFrames = 7.5
+            // 長音 (ー, _) は先行母音を適度に伸長する 13.0 フレーム (約 130ms)
+            // 先行母音 (約 130ms) と合わせて約 260ms (2拍分) となり、文全体で均等な 160ms/モーラ の会話速度を担保する
+            baseFrames = 13.0
         case .pause:
-            if symbol == "<sil>" {
-                baseFrames = 20.0
-            } else {
+            switch symbol == "<sil>" {
+            case true:
+                baseFrames = 10.0
+            case false:
                 baseFrames = 15.0
             }
         }
@@ -445,13 +452,13 @@ public final class LengthRegulator: Sendable {
         }
 
         if addBoundarySilence {
-            var leadSil = Int(roundf(26.0 / safeSpeedFactor))
-            if leadSil < 20 {
-                leadSil = 20
+            var leadSil = Int(roundf(6.0 / safeSpeedFactor))
+            if leadSil < 4 {
+                leadSil = 4
             }
-            var trailSil = Int(roundf(32.0 / safeSpeedFactor))
-            if trailSil < 25 {
-                trailSil = 25
+            var trailSil = Int(roundf(8.0 / safeSpeedFactor))
+            if trailSil < 5 {
+                trailSil = 5
             }
 
             var newPhoneIds: [Int32] = []

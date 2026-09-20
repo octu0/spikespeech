@@ -234,16 +234,15 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             let dur = Int(linguisticFeatures.durations[pIdx])
 
             let isPause = vocabulary.isPauseOrSilence(id: pid)
-            let isStop = vocabulary.isUnvoicedStop(id: pid)
 
             var f = 0
             while f < dur {
                 let frameIdx = curF + f
                 if frameIdx < totalFrames {
-                    switch (isPause, isStop && f < (dur - 1)) {
-                    case (true, _), (_, true):
+                    switch isPause {
+                    case true:
                         silenceMask[frameIdx] = true
-                    default:
+                    case false:
                         silenceMask[frameIdx] = false
                     }
                 }
