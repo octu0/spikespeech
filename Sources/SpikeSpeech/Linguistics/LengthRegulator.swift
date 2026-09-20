@@ -16,46 +16,44 @@ public final class LengthRegulator: Sendable {
     /// 累積和量子化に入力する浮動小数点継続時間列を生成し、
     /// 丸め誤差の累積による発話時間ドリフトをゼロにする。
     public func floatDurationFrames(category: PhonemeCategory, symbol: String, speed: Float = 1.0) -> Float {
-        var baseFrames: Float = 12.0
+        var baseFrames: Float = 6.0
 
         switch category {
         case .vowel:
-            // 狭母音 (i, u) は 12.0 フレーム (約 120ms)、広母音 (a, o, e) は 13.0 フレーム (約 130ms) に設定
+            // 狭母音 (i, u) は開口度が小さく短め (約 60ms)、広母音 (a, o, e) は明瞭な調音のため長め (約 75ms) に設定
             switch symbol {
             case "i", "u":
-                baseFrames = 12.0
+                baseFrames = 6.0
             default:
-                baseFrames = 13.0
+                baseFrames = 7.5
             }
         case .consonant:
-            // 摩擦音 (s, sh, h, z, j) は乱流気流知覚のため 5.0 フレーム (約 50ms)、破擦音 (ch) は 5.0 フレーム
-            // 破裂音 (k, t, p, g, d, b) は気流閉鎖期の過剰な無音分断（> 30ms）を防止するため 2.0 フレーム (約 20ms)
-            // その他子音 (n, m, r, w, y) は 3.5 フレーム (約 35ms)
-            // CV モーラ合計で約 150〜170ms (15〜17フレーム) となり教師 Copy-synth の 160ms/モーラに均等合致
+            // 摩擦音 (s, sh, h, z, j) は乱流気流知覚のため 4.5 フレーム (約 45ms)
+            // 破裂音 (k, t, p, g, d, b) は閉鎖期と解放バーストを合わせ 3.5 フレーム (約 35ms)
+            // その他子音 (n, m, r, w, y) は 4.0 フレーム (約 40ms)
             switch symbol {
-            case "s", "sh", "h", "z", "j", "ch":
-                baseFrames = 5.0
+            case "s", "sh", "h", "z", "j":
+                baseFrames = 4.5
             case "k", "t", "p", "g", "d", "b":
-                baseFrames = 2.0
-            default:
                 baseFrames = 3.5
+            default:
+                baseFrames = 4.0
             }
         case .contracted:
-            baseFrames = 3.0
+            baseFrames = 4.0
         case .geminate:
-            // 促音 (っ) は閉鎖間隔 14.0 フレーム (約 140ms、1モーラ分) を確保
-            baseFrames = 14.0
+            // 促音 (っ) は閉鎖間隔 8.0 フレーム (約 80ms) を確保
+            baseFrames = 8.0
         case .nasalSyllable:
-            // 撥音 (ん) は 15.0 フレーム (約 150ms、1モーラ分) を確保
-            baseFrames = 15.0
+            // 撥音 (ん) は 7.0 フレーム (約 70ms)
+            baseFrames = 7.0
         case .prolonged:
-            // 長音 (ー, _) は先行母音を適度に伸長する 13.0 フレーム (約 130ms)
-            // 先行母音 (約 130ms) と合わせて約 260ms (2拍分) となり、文全体で均等な 160ms/モーラ の会話速度を担保する
-            baseFrames = 13.0
+            // 長音 (ー, _) は先行母音の伸長 7.5 フレーム (約 75ms)
+            baseFrames = 7.5
         case .pause:
             switch symbol == "<sil>" {
             case true:
-                baseFrames = 10.0
+                baseFrames = 20.0
             case false:
                 baseFrames = 15.0
             }
@@ -84,6 +82,152 @@ public final class LengthRegulator: Sendable {
             scaled = 1000.0
         }
         return scaled
+    }
+
+    /// モーラ内の各音素が占める継続時間比率（合計 1.0）を算出する
+    /// なぜ比率モデルを採用するか:
+    /// 日本語はモーラ等時性言語であり、発話速度の変化に対してモーラ長全体が伸縮する。
+    /// 絶対ミリ秒ではなくモーラ内の音素比率（C/V比率）として定義することで、
+    /// 学習データの任意の発話速度（framesPerMora）および推論時の平均発話速度に対して
+    /// 完全に同一の音素配分比率を維持するため。
+    public func moraPhonemeRatios(phonemes: [PhonemeToken]) -> [Float] {
+        if phonemes.isEmpty {
+            return []
+        }
+        if phonemes.count == 1 {
+            return [1.0]
+        }
+        if phonemes.count == 2 {
+            let p0 = phonemes[0]
+            var cRatio: Float = 0.30
+            switch p0.category {
+            case .consonant:
+                switch p0.symbol {
+                case "s", "sh", "h", "z", "j", "ch":
+                    cRatio = 0.35
+                case "k", "t", "p", "g", "d", "b":
+                    cRatio = 0.30
+                default:
+                    cRatio = 0.30
+                }
+            default:
+                cRatio = 0.30
+            }
+            let vRatio = 1.0 - cRatio
+            return [cRatio, vRatio]
+        }
+        if phonemes.count == 3 {
+            return [0.20, 0.15, 0.65]
+        }
+        let invCount = 1.0 / Float(phonemes.count)
+        return [Float](repeating: invCount, count: phonemes.count)
+    }
+
+    /// アクセント句列からデータ駆動型の音素継続フレーム系列を算出する
+    /// - Parameters:
+    ///   - phrases: アクセント句列
+    ///   - targetSpeechFrames: 学習時に WAV の VAD から得られた発話区間総フレーム数 S（推論時は nil）
+    ///   - averageFramesPerMora: 推論時の標準平均モーラ長（1フレーム=10ms、16.0 = 160ms/モーラ）
+    ///   - speedFactor: 発話速度スケーリング係数（1.0 = 標準）
+    ///   - applyFluctuation: 生体ゆらぎ適用フラグ
+    ///   - text: ゆらぎシード用テキスト
+    public func computeDataDrivenDurations(
+        phrases: [AccentPhrase],
+        targetSpeechFrames: Int? = nil,
+        averageFramesPerMora: Float = 16.0,
+        speedFactor: Float = 1.0,
+        applyFluctuation: Bool = true,
+        text: String = ""
+    ) -> [Float] {
+        var totalMoras = 0
+        var pIdx = 0
+        while pIdx < phrases.count {
+            totalMoras += phrases[pIdx].moras.count
+            pIdx += 1
+        }
+        if totalMoras <= 0 {
+            return []
+        }
+
+        var safeSpeed = speedFactor
+        if safeSpeed.isFinite != true {
+            safeSpeed = 1.0
+        }
+        if safeSpeed < 0.1 {
+            safeSpeed = 0.1
+        }
+        if 10.0 < safeSpeed {
+            safeSpeed = 10.0
+        }
+
+        let effectiveFramesPerMora: Float
+        switch targetSpeechFrames {
+        case .some(let targetFrames):
+            var fixedPauseFrames = 0
+            var ph = 0
+            while ph < phrases.count {
+                if phrases[ph].pauseAfter && 0 < phrases[ph].pauseDurationFrames {
+                    fixedPauseFrames += phrases[ph].pauseDurationFrames
+                }
+                ph += 1
+            }
+            let netSpeechFrames = max(totalMoras, targetFrames - fixedPauseFrames)
+            effectiveFramesPerMora = Float(netSpeechFrames) / Float(totalMoras)
+        case .none:
+            effectiveFramesPerMora = averageFramesPerMora / safeSpeed
+        }
+
+        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
+        var rawDurations: [Float] = []
+
+        pIdx = 0
+        while pIdx < phrases.count {
+            let phrase = phrases[pIdx]
+            let isLastPhrase = (pIdx + 1) == phrases.count
+            var mIdx = 0
+            while mIdx < phrase.moras.count {
+                let mora = phrase.moras[mIdx]
+                let isLastMora = (mIdx + 1) == phrase.moras.count
+                var shouldLengthen = false
+                if isLastMora {
+                    if phrase.pauseAfter || isLastPhrase {
+                        shouldLengthen = true
+                    }
+                }
+
+                let ratios = moraPhonemeRatios(phonemes: mora.phonemes)
+                var rIdx = 0
+                while rIdx < mora.phonemes.count {
+                    let r = ratios[rIdx]
+                    var d = max(1.0, r * effectiveFramesPerMora)
+
+                    if applyFluctuation {
+                        let tempoScale = bioFluctuation.computeTempoScale()
+                        d *= tempoScale
+                    }
+
+                    if shouldLengthen {
+                        let token = mora.phonemes[rIdx]
+                        switch token.category {
+                        case .vowel, .nasalSyllable, .prolonged:
+                            d *= 1.15
+                        default:
+                            break
+                        }
+                    }
+
+                    rawDurations.append(d)
+                    rIdx += 1
+                }
+                mIdx += 1
+            }
+            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
+                rawDurations.append(Float(phrase.pauseDurationFrames))
+            }
+            pIdx += 1
+        }
+
+        return rawDurations
     }
 
     /// 音素カテゴリに応じた標準継続フレーム数を算出する
@@ -234,7 +378,9 @@ public final class LengthRegulator: Sendable {
         speedFactor: Float = 1.0,
         baseF0: Float = 220.0,
         applyFluctuation: Bool = true,
-        addBoundarySilence: Bool = false
+        addBoundarySilence: Bool = false,
+        targetSpeechFrames: Int? = nil,
+        averageFramesPerMora: Float = 16.0
     ) -> LinguisticFeatures {
         if text.isEmpty {
             return LinguisticFeatures(phoneIds: [], durations: [], f0Contour: [], voicedFlags: [], energyContour: [], totalFrames: 0)
@@ -258,7 +404,7 @@ public final class LengthRegulator: Sendable {
         // 2. アクセント句・モーラ階層構築
         var phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
 
-        // 3. 各音素および休止の Duration 系列の確定（学習済み予測器を主経路とし、未指定時は規則表）
+        // 3. 各音素および休止の Duration 系列の確定（データ駆動型モーラ比率モデル）
         let quantizedDurations: [Int]
         switch prosodyPredictor {
         case .some(let predictor):
@@ -267,54 +413,19 @@ public final class LengthRegulator: Sendable {
                 vocabulary: vocabulary,
                 lengthRegulator: self,
                 speedFactor: safeSpeedFactor,
-                applyFluctuation: applyFluctuation
+                applyFluctuation: applyFluctuation,
+                targetSpeechFrames: targetSpeechFrames,
+                averageFramesPerMora: averageFramesPerMora
             )
         case .none:
-            var rawFloatDurations: [Float] = []
-            var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
-            var pIdx = 0
-            while pIdx < phrases.count {
-                let phrase = phrases[pIdx]
-                let isLastPhrase = (pIdx + 1) == phrases.count
-                var mIdx = 0
-                while mIdx < phrase.moras.count {
-                    let mora = phrase.moras[mIdx]
-                    let isLastMora = (mIdx + 1) == phrase.moras.count
-                    var shouldLengthen = false
-                    if isLastMora {
-                        if phrase.pauseAfter || isLastPhrase {
-                            shouldLengthen = true
-                        }
-                    }
-
-                    var phIdx = 0
-                    while phIdx < mora.phonemes.count {
-                        let token = mora.phonemes[phIdx]
-                        var scaled = floatDurationFrames(category: token.category, symbol: token.symbol, speed: safeSpeedFactor)
-
-                        if applyFluctuation {
-                            let tempoScale = bioFluctuation.computeTempoScale()
-                            scaled *= tempoScale
-                        }
-
-                        if shouldLengthen {
-                            switch token.category {
-                            case .vowel, .nasalSyllable, .prolonged:
-                                scaled *= 1.25
-                            default:
-                                break
-                            }
-                        }
-                        rawFloatDurations.append(scaled)
-                        phIdx += 1
-                    }
-                    mIdx += 1
-                }
-                if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                    rawFloatDurations.append(Float(phrase.pauseDurationFrames))
-                }
-                pIdx += 1
-            }
+            let rawFloatDurations = computeDataDrivenDurations(
+                phrases: phrases,
+                targetSpeechFrames: targetSpeechFrames,
+                averageFramesPerMora: averageFramesPerMora,
+                speedFactor: safeSpeedFactor,
+                applyFluctuation: applyFluctuation,
+                text: text
+            )
             quantizedDurations = quantizeDurations(durations: rawFloatDurations)
         }
 

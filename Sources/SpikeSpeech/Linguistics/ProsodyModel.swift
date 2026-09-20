@@ -143,10 +143,10 @@ public final class ProsodyModel: Sendable {
                     }
                     k += 1
                 }
-                // なぜ句境界で5フレーム (50ms) の自然な語間マイクロポーズを挿入するか:
-                // 自立語同士が間髪入れずに密着して文前半と後半のテンポ知覚が歪むのを防ぎ、
-                // 日本語の自然な呼吸律動と文節ごとの均等な会話速度（150〜160ms/モーラ）を確立するため。
-                phrases.append(AccentPhrase(moras: currentMoras, pauseAfter: true, pauseDurationFrames: 5, isQuestion: false))
+                // 自立語境界では句分割を行いつつ、ポーズ時間は 0 に設定する。
+                // 理由: 学習時データにおいて文中の自立語間ポーズは存在せず、
+                // ポーズを挿入すると SNN が未知のフレーム・Mel 遷移を出力して発音がブザー化するため。
+                phrases.append(AccentPhrase(moras: currentMoras, pauseAfter: false, pauseDurationFrames: 0, isQuestion: false))
                 currentMoras = []
                 currentKernel = 0
             }

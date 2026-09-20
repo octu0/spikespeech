@@ -255,117 +255,21 @@ public final class ProsodyPredictor: Sendable {
         vocabulary: PhonemeVocabulary,
         lengthRegulator: LengthRegulator,
         speedFactor: Float = 1.0,
-        applyFluctuation: Bool = true
+        applyFluctuation: Bool = true,
+        targetSpeechFrames: Int? = nil,
+        averageFramesPerMora: Float = 16.0
     ) -> [Int] {
-        var rawFloatDurations: [Float] = []
-        var bioFluctuation = BiologicalFluctuation(seed: 2026)
-
-        let dWeights = weights?.durationWeights
-
-        var pIdx = 0
-        while pIdx < phrases.count {
-            let phrase = phrases[pIdx]
-            let isLastPhrase = (pIdx + 1) == phrases.count
-            var mIdx = 0
-            while mIdx < phrase.moras.count {
-                let mora = phrase.moras[mIdx]
-                let isLastMora = (mIdx + 1) == phrase.moras.count
-                var shouldLengthen = false
-                if isLastMora {
-                    if phrase.pauseAfter || isLastPhrase {
-                        shouldLengthen = true
-                    }
-                }
-
-                var phIdx = 0
-                while phIdx < mora.phonemes.count {
-                    let token = mora.phonemes[phIdx]
-                    let isLastPhoneme = (phIdx + 1) == mora.phonemes.count
-                    let ruleDur = lengthRegulator.floatDurationFrames(category: token.category, symbol: token.symbol, speed: speedFactor)
-
-                    var predDur = ruleDur
-                    switch dWeights {
-                    case .some(let dw):
-                        let feat = ProsodyPredictor.extractDurationFeatures(
-                            token: token,
-                            mora: mora,
-                            phrase: phrase,
-                            isLastMoraInPhrase: isLastMora,
-                            isLastPhonemeInMora: isLastPhoneme,
-                            ruleDuration: ruleDur,
-                            inputDim: dw.inputDim
-                        )
-                        // 2層 MLP 推論
-                        let inD = dw.inputDim
-                        let hidD = dw.hiddenDim
-                        var offset: Float = dw.b2[0]
-                        var h = 0
-                        while h < hidD {
-                            var dot: Float = dw.b1[h]
-                            let wRowOffset = h * inD
-                            var j = 0
-                            while j < inD {
-                                dot += dw.w1[wRowOffset + j] * feat[j]
-                                j += 1
-                            }
-                            // LeakyReLU (negative slope = 0.1)
-                            var act = dot
-                            if dot < 0.0 {
-                                act = dot * 0.1
-                            }
-                            offset += dw.w2[h] * act
-                            h += 1
-                        }
-
-                        // offset のクリップ (-1.5 ... 1.5)
-                        var safeOffset = offset
-                        if safeOffset < -1.5 {
-                            safeOffset = -1.5
-                        }
-                        if 1.5 < safeOffset {
-                            safeOffset = 1.5
-                        }
-                        let rawPred = ruleDur * expf(safeOffset)
-                        // なぜ規則 duration を下回らないクランプを行うか:
-                        // 学習データ教師が規則の引き伸ばしに起因する循環バイアスを含んでいた場合でも、
-                        // 音素長が規則標準長より縮退してこんにちは等の発話が 1.0 秒未満に切断されるのを数学的に防止するため。
-                        if rawPred < ruleDur {
-                            predDur = ruleDur
-                        } else {
-                            predDur = rawPred
-                        }
-                    case .none:
-                        predDur = ruleDur
-                    }
-
-                    if applyFluctuation {
-                        let tempoScale = bioFluctuation.computeTempoScale()
-                        predDur *= tempoScale
-                    }
-
-                    if shouldLengthen {
-                        switch token.category {
-                        case .vowel, .nasalSyllable, .prolonged:
-                            predDur *= 1.25
-                        default:
-                            break
-                        }
-                    }
-
-                    if predDur < 1.0 {
-                        predDur = 1.0
-                    }
-                    rawFloatDurations.append(predDur)
-                    phIdx += 1
-                }
-                mIdx += 1
-            }
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                rawFloatDurations.append(Float(phrase.pauseDurationFrames))
-            }
-            pIdx += 1
-        }
-
+        // 設計書 (design_duration_from_data.md) の規定:
+        // 推論時は学習で集めた framesPerMora の平均 (16.0 = 160ms/モーラ) と同一比率モデルを使う。
+        // 旧規則表 (floatDurationFrames) に依存した durationWeights を介在させず、
+        // 学習と推論で完全に同一のモーラ等時性・音素比率関数を唯一の正本として共有する。
+        let rawFloatDurations = lengthRegulator.computeDataDrivenDurations(
+            phrases: phrases,
+            targetSpeechFrames: targetSpeechFrames,
+            averageFramesPerMora: averageFramesPerMora,
+            speedFactor: speedFactor,
+            applyFluctuation: applyFluctuation
+        )
         return lengthRegulator.quantizeDurations(durations: rawFloatDurations)
     }
 

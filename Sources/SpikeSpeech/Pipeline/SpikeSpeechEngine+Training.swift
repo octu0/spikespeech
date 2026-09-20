@@ -96,24 +96,6 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        // なぜ女性話者の baseF0 でアライメントし applyFluctuation: false にするか:
-        // 教師データは成人女性単一話者の実録音音声であり、実音声のピッチ帯域（~220Hz）と
-        // 一致させる必要がある。また学習時は実音声波形との決定論的な時間軸対応関係を確立する必要があり、
-        // 1/f ゆらぎを混入させるとアライメントが汚染されて音素境界が不正確になるため。
-        let baseLinguistic = lengthRegulator.processText(
-            text: text,
-            normalizer: normalizer,
-            prosodyModel: prosodyModel,
-            vocabulary: vocabulary,
-            speedFactor: 1.0,
-            baseF0: VoiceProfile.female.baseF0,
-            applyFluctuation: false,
-            addBoundarySilence: false
-        )
-
-        let origTotalFrames = baseLinguistic.totalFrames
-        let phoneCount = baseLinguistic.phoneIds.count
-
         let boundaries = detectSpeechBoundaries(
             pcm: pcm16k,
             hopSize: AudioConfig.hopSize,
@@ -122,6 +104,26 @@ extension SpikeSpeechEngine {
         let leadSilence = boundaries.leadSilence
         let speechFrames = boundaries.speechFrames
         let trailSilence = boundaries.trailSilence
+
+        // なぜ女性話者の baseF0 でアライメントし applyFluctuation: false にするか:
+        // 教師データは成人女性単一話者の実録音音声であり、実音声のピッチ帯域（~220Hz）と
+        // 一致させる必要がある。また targetSpeechFrames: speechFrames を渡すことで、
+        // 規則表の引き伸ばしではなく、その WAV の実際の発話長 ÷ モーラ数 M = framesPerMora から
+        // データ駆動型で厳密に音素フレーム数を算出する。
+        let baseLinguistic = lengthRegulator.processText(
+            text: text,
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.female.baseF0,
+            applyFluctuation: false,
+            addBoundarySilence: false,
+            targetSpeechFrames: speechFrames
+        )
+
+        let origTotalFrames = baseLinguistic.totalFrames
+        let phoneCount = baseLinguistic.phoneIds.count
 
         // なぜ音素数と発話フレーム数の境界検査を行うか:
         // 発話区間フレーム数がゼロまたは音素数未満の場合、各音素に最低 1 フレームを割り当てることが物理的に不可能となり
@@ -139,25 +141,17 @@ extension SpikeSpeechEngine {
             fullPhoneIds = [Int32(PhonemeVocabulary.silId)]
             fullDurations = [targetFrames]
         } else {
-            let stretchRatio = Float(speechFrames) / Float(max(1, origTotalFrames))
-            var scaledDurations = [Float](repeating: 0.0, count: phoneCount)
+            var speechDurations = [Int](repeating: 0, count: phoneCount)
+            var sumDurations = 0
             var p = 0
             while p < phoneCount {
-                let origD = Float(baseLinguistic.durations[p])
-                scaledDurations[p] = max(1.0, origD * stretchRatio)
+                let d = Int(baseLinguistic.durations[p])
+                speechDurations[p] = max(1, d)
+                sumDurations += speechDurations[p]
                 p += 1
             }
 
-            let quantizedDurations = lengthRegulator.quantizeDurations(durations: scaledDurations)
-            var sumQuantized = 0
-            var q = 0
-            while q < quantizedDurations.count {
-                sumQuantized += quantizedDurations[q]
-                q += 1
-            }
-
-            var speechDurations = quantizedDurations
-            let diff = speechFrames - sumQuantized
+            let diff = speechFrames - sumDurations
             if diff < 0 {
                 // 負の差分: 1 フレームを超えて短縮可能な音素に対して均等に巡回削減
                 var remaining = -diff
@@ -172,9 +166,6 @@ extension SpikeSpeechEngine {
                     } else {
                         consecutiveFailures += 1
                         if speechDurations.count <= consecutiveFailures {
-                            // なぜ全音素が 1 フレームに達した場合に break するか:
-                            // 全音素が下限値 1 フレームとなった場合は物理的にそれ以上削減不能であり、
-                            // ガード条件の有無にかかわらず無限ループを未然に確実に防止するため。
                             break
                         }
                     }

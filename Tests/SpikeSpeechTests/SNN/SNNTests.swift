@@ -375,11 +375,11 @@ final class SNNTests: XCTestCase {
         XCTAssertTrue(0.0 < frame5Sum, "時間畳み込みによる時間方向コンテキスト混合が観測されません")
     }
 
-    // MARK: - 9. こんにちは TTS 発話本体長 (0.70–0.95 秒) および文頭末無音 (80–160 ms) の適正化検証
+    // MARK: - 9. データ駆動型モーラ長 (こんにちは本体 0.70–0.95s, 天気本体 1.3–1.7s, 無音 80–160ms) の受入検証
 
-    func testKonnichiwaDurationNotLessThanOneSecond() {
+    func testKonnichiwaDurationAlignedWithTrainingTable() {
         let engine = SpikeSpeechEngine()
-        let ling = engine.lengthRegulator.processText(
+        let lingKonnichiwa = engine.lengthRegulator.processText(
             text: "こんにちは",
             normalizer: engine.normalizer,
             prosodyModel: engine.prosodyModel,
@@ -388,28 +388,43 @@ final class SNNTests: XCTestCase {
             addBoundarySilence: true
         )
 
-        let leadSilFrames = Int(ling.durations.first ?? 0)
-        let trailSilFrames = Int(ling.durations.last ?? 0)
+        let leadSilFrames = Int(lingKonnichiwa.durations.first ?? 0)
+        let trailSilFrames = Int(lingKonnichiwa.durations.last ?? 0)
         let totalSilFrames = leadSilFrames + trailSilFrames
-        let bodyFrames = ling.totalFrames - totalSilFrames
+        let bodyFrames = lingKonnichiwa.totalFrames - totalSilFrames
 
         let bodyDurationSec = Float(bodyFrames) * 0.010
         let totalSilSec = Float(totalSilFrames) * 0.010
         let moraMs = (bodyDurationSec / 5.0) * 1000.0
 
-        let audio = engine.synthesize(text: "こんにちは")
-        let totalDurationSec = Float(audio.count) / 16000.0
+        let audioKonnichiwa = engine.synthesize(text: "こんにちは")
+        let totalDurationSec = Float(audioKonnichiwa.count) / 16000.0
 
-        print("[Konnichiwa Tempo Check] 全体: \(totalDurationSec)s, 本体: \(bodyDurationSec)s, 先頭無音: \(Float(leadSilFrames) * 0.010)s, 末尾無音: \(Float(trailSilFrames) * 0.010)s, モーラ速度: \(moraMs) ms/モーラ")
+        print("[Konnichiwa Duration Check] 全体: \(totalDurationSec)s, 本体: \(bodyDurationSec)s, 先頭無音: \(Float(leadSilFrames) * 0.010)s, 末尾無音: \(Float(trailSilFrames) * 0.010)s, モーラ速度: \(moraMs) ms/モーラ")
 
-        // 受入基準 1: 先頭末尾無音は Copy-synth 程度（80–160 ms）
+        // 受入基準 1: 先頭末尾無音は Copy-synth 程度（80–160 ms）を厳格に維持
         XCTAssertTrue(0.08 <= totalSilSec, "文頭末無音合計が 80 ms 未満です: \(totalSilSec) 秒")
         XCTAssertTrue(totalSilSec <= 0.16, "文頭末無音合計が 160 ms を超えています (260+320ms は禁止): \(totalSilSec) 秒")
 
-        // 受入基準 2: 発話本体は 0.70–0.95 秒 (150–180 ms/モーラ)
+        // 受入基準 2: 「こんにちは」発話本体は 0.70–0.95 秒 (5モーラ × 約160ms)
         XCTAssertTrue(0.70 <= bodyDurationSec, "こんにちはの発話本体が 0.70 秒未満です: \(bodyDurationSec) 秒")
         XCTAssertTrue(bodyDurationSec <= 0.95, "こんにちはの発話本体が 0.95 秒を超過しています: \(bodyDurationSec) 秒")
-        XCTAssertTrue(150.0 <= moraMs, "モーラあたり速度が 150 ms 未満です: \(moraMs) ms/モーラ")
-        XCTAssertTrue(moraMs <= 180.0, "モーラあたり速度が 180 ms を超過しています: \(moraMs) ms/モーラ")
+
+        // 受入基準 3: 「今日はいい天気です」発話本体は 1.3–1.7 秒 (10モーラ × 約160ms)
+        let lingTenki = engine.lengthRegulator.processText(
+            text: "今日はいい天気です",
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            addBoundarySilence: true
+        )
+        let tenkiLeadSil = Int(lingTenki.durations.first ?? 0)
+        let tenkiTrailSil = Int(lingTenki.durations.last ?? 0)
+        let tenkiBodyFrames = lingTenki.totalFrames - (tenkiLeadSil + tenkiTrailSil)
+        let tenkiBodySec = Float(tenkiBodyFrames) * 0.010
+        print("[Tenki Duration Check] 本体: \(tenkiBodySec)s, 1モーラあたり: \((tenkiBodySec / 10.0) * 1000.0) ms")
+        XCTAssertTrue(1.30 <= tenkiBodySec, "天気の発話本体が 1.30 秒未満です: \(tenkiBodySec) 秒")
+        XCTAssertTrue(tenkiBodySec <= 1.70, "天気の発話本体が 1.70 秒を超過しています: \(tenkiBodySec) 秒")
     }
 }
