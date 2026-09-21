@@ -51,6 +51,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 推論時に主経路として自然な抑揚とテンポを生成可能にするため。
     public let prosodyWeights: ProsodyWeights?
 
+    /// 学習時に集計された音素 ID 別平均継続時間 (1フレーム=10ms)
+    /// なぜ重み構造体に記録するか:
+    /// 推論時にコーパスファイルや外部のアライメント JSON を一切参照することなく、
+    /// 学習データの統計に基づいた正確なテンポで完全自律推論可能にするため。
+    public let phonemeAverageDurations: [Int32: Float]?
+
     /// 総層数
     public var numLayers: Int {
         return 1 + wLayers.count
@@ -72,7 +78,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         wOut: [Float],
         bOut: [Float],
         lexicon: [LexiconEntry] = [],
-        prosodyWeights: ProsodyWeights? = nil
+        prosodyWeights: ProsodyWeights? = nil,
+        phonemeAverageDurations: [Int32: Float]? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -90,12 +97,13 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.bOut = bOut
         self.lexicon = lexicon
         self.prosodyWeights = prosodyWeights
+        self.phonemeAverageDurations = phonemeAverageDurations
     }
 
     private enum CodingKeys: String, CodingKey {
         case inputDim, maxHiddenDim, outputDim, timeSteps, lifConfig
         case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wConv, wOut, bOut
-        case lexicon, prosodyWeights
+        case lexicon, prosodyWeights, phonemeAverageDurations
     }
 
     public init(from decoder: Decoder) throws {
@@ -172,6 +180,20 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             self.lexicon = []
         }
         self.prosodyWeights = try container.decodeIfPresent(ProsodyWeights.self, forKey: .prosodyWeights)
+        // なぜ decodeIfPresent を用いて文字列キー辞書から復元するか:
+        // 旧バージョンの重みファイルとの後方互換性を保ちつつ、JSON 仕様に準拠した形式で安全に音素平均フレームを読み込むため。
+        switch try container.decodeIfPresent([String: Float].self, forKey: .phonemeAverageDurations) {
+        case .some(let dict):
+            var table: [Int32: Float] = [:]
+            for (k, v) in dict {
+                if let id = Int32(k) {
+                    table[id] = v
+                }
+            }
+            self.phonemeAverageDurations = table
+        case .none:
+            self.phonemeAverageDurations = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -192,6 +214,13 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         try container.encode(bOut, forKey: .bOut)
         try container.encode(lexicon, forKey: .lexicon)
         try container.encodeIfPresent(prosodyWeights, forKey: .prosodyWeights)
+        if let table = phonemeAverageDurations {
+            var dict: [String: Float] = [:]
+            for (k, v) in table {
+                dict[String(k)] = v
+            }
+            try container.encode(dict, forKey: .phonemeAverageDurations)
+        }
     }
 
     /// 語彙知識を付与した新しい重みインスタンスを生成する
@@ -214,7 +243,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wOut: self.wOut,
             bOut: self.bOut,
             lexicon: newLexicon,
-            prosodyWeights: self.prosodyWeights
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations
         )
     }
 
@@ -236,7 +266,33 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wOut: self.wOut,
             bOut: self.bOut,
             lexicon: self.lexicon,
-            prosodyWeights: newProsodyWeights
+            prosodyWeights: newProsodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations
+        )
+    }
+
+    /// 音素平均継続時間テーブルを付与した新しい重みインスタンスを生成する
+    /// なぜ不変構造体のコピーとして返すか:
+    /// 学習時に集計された実測音素継続時間をモデル重みと一体化して安全に永続化するため。
+    public func withPhonemeAverageDurations(_ newTable: [Int32: Float]?) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: newTable
         )
     }
 
@@ -260,7 +316,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wOut: self.wOut,
             bOut: newBOut,
             lexicon: self.lexicon,
-            prosodyWeights: self.prosodyWeights
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations
         )
     }
 
@@ -351,7 +408,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
         seed: UInt64 = 42,
         lexicon: [LexiconEntry] = [],
-        prosodyWeights: ProsodyWeights? = nil
+        prosodyWeights: ProsodyWeights? = nil,
+        phonemeAverageDurations: [Int32: Float]? = nil
     ) -> SpikingNetworkWeights {
         return standardInit(
             inputDim: inputDim,
@@ -362,7 +420,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lifConfig: lifConfig,
             seed: seed,
             lexicon: lexicon,
-            prosodyWeights: prosodyWeights
+            prosodyWeights: prosodyWeights,
+            phonemeAverageDurations: phonemeAverageDurations
         )
     }
 
@@ -376,7 +435,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         lifConfig: LIFConfig = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
         seed: UInt64 = 42,
         lexicon: [LexiconEntry] = [],
-        prosodyWeights: ProsodyWeights? = nil
+        prosodyWeights: ProsodyWeights? = nil,
+        phonemeAverageDurations: [Int32: Float]? = nil
     ) -> SpikingNetworkWeights {
         var rngState = seed
         let scaleIn = sqrt(2.0 / Float(inputDim))
@@ -473,7 +533,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             wOut: wOut,
             bOut: bOut,
             lexicon: lexicon,
-            prosodyWeights: prosodyWeights
+            prosodyWeights: prosodyWeights,
+            phonemeAverageDurations: phonemeAverageDurations
         )
     }
 

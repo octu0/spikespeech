@@ -7,7 +7,7 @@ extension SpikeSpeechEngine {
     /// なぜ固定フレーム切り出しではなく VAD 境界検出を行うか:
     /// 音声録音には発話前後に任意長の無音（環境ノイズ）が存在し、無音部を一律に言語特徴量へ割り当てると
     /// 先頭音素や末尾音素に無音区間のスペクトルが強制アライメントされ、音響モデルが重度のスペクトル歪みを学習してしまうため。
-    public func detectSpeechBoundaries(
+    public static func detectSpeechBoundaries(
         pcm: [Float],
         hopSize: Int = AudioConfig.hopSize,
         totalFrames: Int
@@ -85,7 +85,8 @@ extension SpikeSpeechEngine {
         text: String,
         pcm16k: [Float],
         melExtractor: MelSpectrogramExtractor,
-        pitchTracker: PitchTracker
+        pitchTracker: PitchTracker,
+        alignment: UtteranceAlignment? = nil
     ) -> (features: [[Float]], targets: [[Float]])? {
         if pcm16k.isEmpty {
             return nil
@@ -96,7 +97,7 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        let boundaries = detectSpeechBoundaries(
+        let boundaries = Self.detectSpeechBoundaries(
             pcm: pcm16k,
             hopSize: AudioConfig.hopSize,
             totalFrames: targetFrames
@@ -105,50 +106,75 @@ extension SpikeSpeechEngine {
         let speechFrames = boundaries.speechFrames
         let trailSilence = boundaries.trailSilence
 
-        let morphemes = normalizer.normalize(text: text)
-        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
-        if phrases.isEmpty {
-            return nil
-        }
-
         var phoneIds: [Int32] = []
-        var pIdx = 0
-        while pIdx < phrases.count {
-            var mIdx = 0
-            while mIdx < phrases[pIdx].moras.count {
-                var phIdx = 0
-                while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
-                    phoneIds.append(Int32(phrases[pIdx].moras[mIdx].phonemes[phIdx].id))
-                    phIdx += 1
-                }
-                mIdx += 1
+        var speechDurations: [Int] = []
+
+        switch alignment {
+        case .some(let uttAlign):
+            // なぜアライメント記録の音素 duration を唯一の正本とするか:
+            // エネルギー谷やモーラ等分などのヒューリスティックを排し、
+            // 事前アライメントされた正確な音素物理境界で教師 Mel と 1 対 1 完全同期させるため。
+            var p = 0
+            while p < uttAlign.phonemes.count {
+                let ph = uttAlign.phonemes[p]
+                phoneIds.append(ph.phoneId)
+                speechDurations.append(ph.durationFrames)
+                p += 1
             }
-            pIdx += 1
+        case .none:
+            // アライメント記録未指定時（テスト等）: 音響特徴 DP Forced Aligner による動的アライメント
+            let morphemes = normalizer.normalize(text: text)
+            let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+            if phrases.isEmpty {
+                return nil
+            }
+
+            var tokens: [PhonemeToken] = []
+            var p = 0
+            while p < phrases.count {
+                var m = 0
+                while m < phrases[p].moras.count {
+                    var ph = 0
+                    while ph < phrases[p].moras[m].phonemes.count {
+                        tokens.append(phrases[p].moras[m].phonemes[ph])
+                        ph += 1
+                    }
+                    m += 1
+                }
+                p += 1
+            }
+
+            if tokens.isEmpty || speechFrames <= 0 || speechFrames < tokens.count {
+                return nil
+            }
+
+            let forcedAligner = AcousticForcedAligner()
+            let features = forcedAligner.extractFeatures(
+                pcm: pcm16k,
+                hopSize: AudioConfig.hopSize,
+                startFrame: leadSilence,
+                frameCount: speechFrames,
+                pitchTracker: pitchTracker,
+                melExtractor: melExtractor
+            )
+
+            guard let durs = forcedAligner.align(features: features, phonemes: tokens) else {
+                return nil
+            }
+
+            var tIdx = 0
+            while tIdx < tokens.count {
+                phoneIds.append(Int32(tokens[tIdx].id))
+                speechDurations.append(durs[tIdx])
+                tIdx += 1
+            }
         }
 
         let phoneCount = phoneIds.count
-        if speechFrames <= 0 || speechFrames < phoneCount {
+        if speechFrames <= 0 || phoneCount <= 0 {
             return nil
         }
 
-        // なぜ音響エネルギー同期アライメント器（AcousticEnergyAligner）を唯一の正本とするか:
-        // 発話区間をモーラ数で等時間割り（speechFrames / M）すると、実音声波形で子音・母音が鳴る時刻と
-        // 音素ラベルの時刻が物理的に乖離し、SNN が誤ったスペクトルを学習して声質だけ残り言葉が消滅するため。
-        // 短時間平滑化エネルギーの累積等分および局所エネルギー谷スナップにより、WAV の実音声エネルギー境界で
-        // 音素フレーム数を物理的に決定し、教師 Mel と厳密に完全同期させる。
-        let energyAligner = AcousticEnergyAligner()
-        guard let speechDurations = energyAligner.alignPhonemes(
-            pcm: pcm16k,
-            hopSize: AudioConfig.hopSize,
-            leadSilence: leadSilence,
-            speechFrames: speechFrames,
-            phrases: phrases,
-            lengthRegulator: lengthRegulator
-        ) else {
-            return nil
-        }
-
-        var alignedFeatures: [[Float]]
         var fullPhoneIds: [Int32] = []
         var fullDurations: [Int] = []
 
@@ -222,7 +248,7 @@ extension SpikeSpeechEngine {
             totalFrames: targetFrames
         )
 
-        alignedFeatures = encodeLinguisticFeatures(
+        let alignedFeatures = encodeLinguisticFeatures(
             features: alignedLinguistic
         )
 
@@ -273,7 +299,7 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        let boundaries = detectSpeechBoundaries(
+        let boundaries = Self.detectSpeechBoundaries(
             pcm: pcm16k,
             hopSize: AudioConfig.hopSize,
             totalFrames: targetFrames
@@ -388,7 +414,7 @@ extension SpikeSpeechEngine {
                 while phIdx < mora.phonemes.count {
                     let token = mora.phonemes[phIdx]
                     let isLastPhoneme = (phIdx + 1) == mora.phonemes.count
-                    let ruleDur = lengthRegulator.floatDurationFrames(category: token.category, symbol: token.symbol, speed: 1.0)
+                    let ruleDur = lengthRegulator.phonemeDuration(phoneId: Int32(token.id), speedFactor: 1.0)
 
                     let feat = ProsodyPredictor.extractDurationFeatures(
                         token: token,

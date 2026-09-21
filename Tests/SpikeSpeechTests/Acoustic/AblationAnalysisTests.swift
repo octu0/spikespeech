@@ -841,39 +841,413 @@ final class AblationAnalysisTests: XCTestCase {
         print("  fastInputSeq frames: \(fastInputSeq.count)")
         print("=======================================================")
 
-        // 各音素の出現タイミングを比較
-        // どのフレームでどの音素 (ch 0..63) が 3.0 になっているか
-        var t = 0
-        let minT = min(pair.features.count, fastInputSeq.count)
-        while t < min(minT, 100) {
-            var pPhone = -1
-            var fPhone = -1
+        // 各音素の最初のフレームにおける特徴量ベクトル (ch 0..127) を比較
+        var pIdx = 0
+        var curPPhone = -1
+        while pIdx < pair.features.count {
+            var ph = -1
             var c = 0
             while c < 64 {
-                if 1.0 < pair.features[t][c] { pPhone = c }
-                if 1.0 < fastInputSeq[t][c] { fPhone = c }
+                if 1.0 < pair.features[pIdx][c] { ph = c }
                 c += 1
             }
-            if pPhone != fPhone || t % 10 == 0 {
-                let pSym: String
-                switch 0 <= pPhone {
-                case true:
-                    pSym = engine.vocabulary.token(for: pPhone)
-                case false:
-                    pSym = "none"
-                }
-                let fSym: String
-                switch 0 <= fPhone {
-                case true:
-                    fSym = engine.vocabulary.token(for: fPhone)
-                case false:
-                    fSym = "none"
-                }
-                print("  t=\(t): pair=\(pSym)(\(pPhone)), fast=\(fSym)(\(fPhone)) | F0: pair=\(String(format: "%.1f", pair.features[t][66]*500)), fast=\(String(format: "%.1f", fastInputSeq[t][66]*500)) | voiced: pair=\(pair.features[t][64]), fast=\(fastInputSeq[t][64])")
-            }
+            if ph != curPPhone && 0 <= ph {
+                curPPhone = ph
+                let pSym = engine.vocabulary.token(for: ph)
 
+                // fastInputSeq で同じ音素のフレームを探す
+                var fIdx = 0
+                var foundF = -1
+                while fIdx < fastInputSeq.count {
+                    if 1.0 < fastInputSeq[fIdx][ph] {
+                        foundF = fIdx
+                        break
+                    }
+                    fIdx += 1
+                }
+
+                if 0 <= foundF {
+                    print("\n[Phone \(pSym) (id=\(ph))] pair frame \(pIdx) vs fast frame \(foundF)")
+                    var diffChannels: [String] = []
+                    var ch = 0
+                    while ch < 128 {
+                        let pVal = pair.features[pIdx][ch]
+                        let fVal = fastInputSeq[foundF][ch]
+                        let diff = abs(pVal - fVal)
+                        if 0.05 < diff {
+                            diffChannels.append("ch\(ch): pair=\(String(format: "%.3f", pVal)) vs fast=\(String(format: "%.3f", fVal))")
+                        }
+                        ch += 1
+                    }
+                    print("  差分チャンネル数: \(diffChannels.count) / 128")
+                    for d in diffChannels.prefix(15) {
+                        print("    \(d)")
+                    }
+                }
+            }
+            pIdx += 1
+        }
+    }
+
+    /// ブザー音の真因を特定する 3 条件ピンポイント比較実験
+    func testPinpointCauseOfBuzzer() throws {
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        guard FileManager.default.fileExists(atPath: wavPath) else { return }
+
+        let wavReader = WavAudioReader()
+        let rawPCM = try wavReader.loadWav16k(from: wavPath)
+        let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
+        let pitchTracker = PitchTracker()
+        let pitchResult = pitchTracker.track(pcm: rawPCM)
+
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: "Models/weights.json"))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        var vocWeights: NeuralVocoderWeights? = nil
+        if let vData = try? Data(contentsOf: URL(fileURLWithPath: "Models/vocoder_weights.json")) {
+            vocWeights = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: vData)
+        }
+        let vocoder = NeuralVocoder(weights: vocWeights)
+        let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+        let text = "水をマレーシアから買わなくてはならないのです。"
+        guard let pair = engine.prepareTrainingPair(
+            text: text,
+            pcm16k: rawPCM,
+            melExtractor: melExtractor,
+            pitchTracker: pitchTracker
+        ) else { return }
+
+        // 条件 1: pair.features の ch64..70（韻律・エネルギー）を、音素定義に基づく推論時ルール値に差し替えた特徴量
+        var featCond1 = pair.features
+        var t = 0
+        while t < featCond1.count {
+            var pid = -1
+            var c = 0
+            while c < 64 {
+                if 1.0 < featCond1[t][c] { pid = c }
+                c += 1
+            }
+            let isVowel = engine.vocabulary.isVoiced(symbol: engine.vocabulary.token(for: pid))
+            if isVowel {
+                featCond1[t][64] = 1.0 // voiced
+                featCond1[t][65] = 0.0 // unvoiced
+                featCond1[t][70] = 0.70 // energy
+            } else {
+                featCond1[t][64] = 0.0
+                featCond1[t][65] = 1.0
+                featCond1[t][70] = 0.10
+            }
             t += 1
         }
+
+        engine.workspace.reset()
+        vocoder.reset()
+        let mel1 = engine.decoder.decodeSequence(featuresSeq: featCond1, workspace: engine.workspace)
+        let wav1 = vocoder.synthesize(mel: mel1, f0Contour: pitchResult.f0, voicedFlags: pitchResult.voiced)
+        try WavEncoder.encode(samples: wav1).write(to: URL(fileURLWithPath: ".tmp/wave15/test_pinpoint_cond1_ruleProsody.wav"))
+        print("[Pinpoint Cond 1] ruleProsody 出力完了")
+
+        // 条件 2: 音素 duration は推論時の Duration だが、エネルギーは実測の平均に合わせたもの
+        let ttsLinguistic = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.female.baseF0,
+            addBoundarySilence: true
+        )
+        let ttsFeatures = engine.encodeLinguisticFeatures(features: ttsLinguistic)
+
+        engine.workspace.reset()
+        vocoder.reset()
+        let mel2 = engine.decoder.decodeSequence(featuresSeq: ttsFeatures, workspace: engine.workspace)
+        let wav2 = vocoder.synthesize(mel: mel2, f0Contour: ttsLinguistic.f0Contour, voicedFlags: ttsLinguistic.voicedFlags)
+        try WavEncoder.encode(samples: wav2).write(to: URL(fileURLWithPath: ".tmp/wave15/test_pinpoint_cond2_ttsStandard.wav"))
+        print("[Pinpoint Cond 2] ttsStandard 出力完了")
+
+        // 条件 3: 実音声の音素 duration 列をそのまま推論エンジンに与え、推論 F0/voiced/energy で合成
+        let alignedDurs: [Int32] = [27, 3, 3, 2, 3, 3, 11, 13, 2, 12, 4, 2, 9, 3, 13, 10, 16, 5, 14, 3, 2, 10, 7, 4, 14, 3, 14, 3, 3, 4, 7, 3, 3, 3, 2, 3, 3, 6, 3, 13, 3, 2, 3, 43]
+        var cond3PhoneIds: [Int32] = [Int32(PhonemeVocabulary.silId)]
+        var p = 0
+        while p < ttsLinguistic.phoneIds.count {
+            let pid = ttsLinguistic.phoneIds[p]
+            if pid != PhonemeVocabulary.silId && pid != PhonemeVocabulary.pauId {
+                cond3PhoneIds.append(pid)
+            }
+            p += 1
+        }
+        cond3PhoneIds.append(Int32(PhonemeVocabulary.silId))
+
+        if cond3PhoneIds.count == alignedDurs.count {
+            var cond3TotalFrames = 0
+            var dIdx = 0
+            while dIdx < alignedDurs.count {
+                cond3TotalFrames += Int(alignedDurs[dIdx])
+                dIdx += 1
+            }
+
+            // 推論 F0 を cond3TotalFrames にリサンプル
+            var cond3F0 = [Float](repeating: 0.0, count: cond3TotalFrames)
+            var cond3Voiced = [Float](repeating: 0.0, count: cond3TotalFrames)
+            var cond3Energy = [Float](repeating: 0.0, count: cond3TotalFrames)
+
+            var curF = 0
+            var ph = 0
+            while ph < cond3PhoneIds.count {
+                let pid = Int(cond3PhoneIds[ph])
+                let dur = Int(alignedDurs[ph])
+                let isVowel = engine.vocabulary.isVoiced(symbol: engine.vocabulary.token(for: pid))
+                let peakE: Float
+                let vFlag: Float
+                switch isVowel {
+                case true:
+                    peakE = 0.70
+                    vFlag = 1.0
+                case false:
+                    peakE = 0.10
+                    vFlag = 0.0
+                }
+
+                var f = 0
+                while f < dur {
+                    let frameIdx = curF + f
+                    if frameIdx < cond3TotalFrames {
+                        cond3Voiced[frameIdx] = vFlag
+                        cond3Energy[frameIdx] = peakE
+                        // F0 はピッチ予測器から
+                        let ratio = Float(frameIdx) / Float(max(1, cond3TotalFrames))
+                        let srcF = Int(ratio * Float(ttsLinguistic.f0Contour.count))
+                        if srcF < ttsLinguistic.f0Contour.count {
+                            cond3F0[frameIdx] = ttsLinguistic.f0Contour[srcF]
+                        }
+                    }
+                    f += 1
+                }
+                curF += dur
+                ph += 1
+            }
+
+            let cond3Linguistic = LinguisticFeatures(
+                phoneIds: cond3PhoneIds,
+                durations: alignedDurs,
+                f0Contour: cond3F0,
+                voicedFlags: cond3Voiced,
+                energyContour: cond3Energy,
+                totalFrames: cond3TotalFrames
+            )
+            let cond3Features = engine.encodeLinguisticFeatures(features: cond3Linguistic)
+
+            engine.workspace.reset()
+            vocoder.reset()
+            let mel3 = engine.decoder.decodeSequence(featuresSeq: cond3Features, workspace: engine.workspace)
+            let wav3 = vocoder.synthesize(mel: mel3, f0Contour: cond3F0, voicedFlags: cond3Voiced)
+            try WavEncoder.encode(samples: wav3).write(to: URL(fileURLWithPath: ".tmp/wave15/test_pinpoint_cond3_alignedDurs_predProsody.wav"))
+            print("[Pinpoint Cond 3] alignedDurs + predProsody 出力完了 (\(wav3.count) samples)")
+        }
+
+        // 自然なモーラ比率での「こんにちは」合成実験
+        let konDurs: [Int32] = [6, 4, 12, 12, 4, 11, 5, 11, 4, 14, 8]
+        let konPhones: [Int32] = [
+            Int32(PhonemeVocabulary.silId),
+            10, // k
+            9,  // o
+            24, // N
+            13, // n
+            6,  // i
+            28, // ch
+            6,  // i
+            18, // w
+            5,  // a
+            Int32(PhonemeVocabulary.silId)
+        ]
+        let konTotal = konDurs.reduce(0, +)
+        var konF0 = [Float](repeating: 0.0, count: Int(konTotal))
+        var konVoiced = [Float](repeating: 0.0, count: Int(konTotal))
+        var konEnergy = [Float](repeating: 0.0, count: Int(konTotal))
+
+        // F0 は藤崎モデルまたは基本ピッチ 220Hz
+        var kCurF = 0
+        var kP = 0
+        while kP < konPhones.count {
+            let pid = Int(konPhones[kP])
+            let dur = Int(konDurs[kP])
+            let isV = engine.vocabulary.isVoiced(symbol: engine.vocabulary.token(for: pid))
+            let pE: Float
+            let vF: Float
+            switch isV {
+            case true:
+                pE = 0.70
+                vF = 1.0
+            case false:
+                pE = 0.10
+                vF = 0.0
+            }
+            var f = 0
+            while f < dur {
+                let fIdx = kCurF + f
+                if fIdx < Int(konTotal) {
+                    konVoiced[fIdx] = vF
+                    konEnergy[fIdx] = pE
+                    if 0.5 <= vF {
+                        // 自然な「こ(低)ん(高)に(高)ち(低)は(低)」アクセント
+                        let prog = Float(fIdx) / Float(konTotal)
+                        if prog < 0.25 {
+                            konF0[fIdx] = 210.0
+                        } else {
+                            switch prog < 0.65 {
+                            case true:
+                                konF0[fIdx] = 245.0
+                            case false:
+                                konF0[fIdx] = 205.0
+                            }
+                        }
+                    }
+                }
+                f += 1
+            }
+            kCurF += dur
+            kP += 1
+        }
+
+        let konLing = LinguisticFeatures(
+            phoneIds: konPhones,
+            durations: konDurs,
+            f0Contour: konF0,
+            voicedFlags: konVoiced,
+            energyContour: konEnergy,
+            totalFrames: Int(konTotal)
+        )
+        let konFeat = engine.encodeLinguisticFeatures(features: konLing)
+        engine.workspace.reset()
+        vocoder.reset()
+        let konMel = engine.decoder.decodeSequence(featuresSeq: konFeat, workspace: engine.workspace)
+        let konWav = vocoder.synthesize(mel: konMel, f0Contour: konF0, voicedFlags: konVoiced)
+        try WavEncoder.encode(samples: konWav).write(to: URL(fileURLWithPath: ".tmp/wave15/test_natural_ratio_konnichiwa.wav"))
+        print("[Natural Ratio Konnichiwa] 出力完了 (\(konWav.count) samples, \(Float(konWav.count)/16000.0)s)")
+
+        // 自然なモーラ比率での「今日はいい天気です」合成実験
+        // きょう(ky,o,_) は(w,a) いい(i,_) てんき(t,e,N,k,i) です(d,e,s,u)
+        let tenkiDurs: [Int32] = [
+            6,  // sil
+            4, 8, 10, // ky, o, _
+            4, 11,    // w, a
+            9, 10,    // i, _
+            4, 10, 11, 4, 11, // t, e, N, k, i
+            4, 11, 4, 9,      // d, e, s, u
+            8   // sil
+        ]
+        let tenkiPhones: [Int32] = [
+            Int32(PhonemeVocabulary.silId),
+            30, 9, 26,  // ky, o, _
+            18, 5,      // w, a
+            6, 26,      // i, _
+            12, 8, 24, 10, 6, // t, e, N, k, i
+            21, 8, 11, 7,     // d, e, s, u
+            Int32(PhonemeVocabulary.silId)
+        ]
+        let tenkiTotal = tenkiDurs.reduce(0, +)
+        var tenkiF0 = [Float](repeating: 0.0, count: Int(tenkiTotal))
+        var tenkiVoiced = [Float](repeating: 0.0, count: Int(tenkiTotal))
+        var tenkiEnergy = [Float](repeating: 0.0, count: Int(tenkiTotal))
+
+        var tCurF = 0
+        var tP = 0
+        while tP < tenkiPhones.count {
+            let pid = Int(tenkiPhones[tP])
+            let dur = Int(tenkiDurs[tP])
+            let isV = engine.vocabulary.isVoiced(symbol: engine.vocabulary.token(for: pid))
+            let pE: Float
+            let vF: Float
+            switch isV {
+            case true:
+                pE = 0.70
+                vF = 1.0
+            case false:
+                pE = 0.10
+                vF = 0.0
+            }
+            var f = 0
+            while f < dur {
+                let fIdx = tCurF + f
+                if fIdx < Int(tenkiTotal) {
+                    tenkiVoiced[fIdx] = vF
+                    tenkiEnergy[fIdx] = pE
+                    if 0.5 <= vF {
+                        let prog = Float(fIdx) / Float(tenkiTotal)
+                        if prog < 0.20 {
+                            tenkiF0[fIdx] = 230.0 // きょう
+                        } else {
+                            switch prog < 0.35 {
+                            case true:
+                                tenkiF0[fIdx] = 210.0 // は
+                            case false:
+                                switch prog < 0.60 {
+                                case true:
+                                    tenkiF0[fIdx] = 245.0 // いい
+                                case false:
+                                    switch prog < 0.85 {
+                                    case true:
+                                        tenkiF0[fIdx] = 235.0 // てんき
+                                    case false:
+                                        tenkiF0[fIdx] = 200.0 // です
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                f += 1
+            }
+            tCurF += dur
+            tP += 1
+        }
+
+        let tenkiLing = LinguisticFeatures(
+            phoneIds: tenkiPhones,
+            durations: tenkiDurs,
+            f0Contour: tenkiF0,
+            voicedFlags: tenkiVoiced,
+            energyContour: tenkiEnergy,
+            totalFrames: Int(tenkiTotal)
+        )
+        let tenkiFeat = engine.encodeLinguisticFeatures(features: tenkiLing)
+        engine.workspace.reset()
+        vocoder.reset()
+        let tenkiMel = engine.decoder.decodeSequence(featuresSeq: tenkiFeat, workspace: engine.workspace)
+        let tenkiWav = vocoder.synthesize(mel: tenkiMel, f0Contour: tenkiF0, voicedFlags: tenkiVoiced)
+        try WavEncoder.encode(samples: tenkiWav).write(to: URL(fileURLWithPath: ".tmp/wave15/test_natural_ratio_tenki.wav"))
+        print("[Natural Ratio Tenki] 出力完了 (\(tenkiWav.count) samples, \(Float(tenkiWav.count)/16000.0)s)")
+    }
+
+    /// Models/weights.json 内の音素平均フレームテーブルを自然な音素比率プロファイルに更新して永続化する
+    func testUpdateWeightsWithHealthyDurations() throws {
+        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
+        guard FileManager.default.fileExists(atPath: weightsURL.path) else { return }
+
+        let data = try Data(contentsOf: weightsURL)
+        let loaded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+
+        // 健全な実測音素プロファイル
+        let updated = loaded.withPhonemeAverageDurations(LengthRegulator.defaultPhonemeAverageDurations)
+        try WeightCheckpoint.atomicWritePretty(updated, to: weightsURL)
+        print("[Weights Updated] Models/weights.json に自然な音素平均フレームテーブルを永続化しました。")
+
+        // エンジン経由で標準 synthesize を実行し、.tmp/wave15/ に診断音声を出力
+        let engine = SpikeSpeechEngine(weights: updated)
+
+        let konWavData = engine.synthesizeWav(text: "こんにちは")
+        try konWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_konnichiwa.wav"))
+        print("[TTS Output] tts_konnichiwa.wav 保存完了 (\(konWavData.count) bytes)")
+
+        let tenkiWavData = engine.synthesizeWav(text: "今日はいい天気です")
+        try tenkiWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_tenki.wav"))
+        print("[TTS Output] tts_tenki.wav 保存完了 (\(tenkiWavData.count) bytes)")
+
+        let mizuWavData = engine.synthesizeWav(text: "水をマレーシアから買わなくてはならないのです。")
+        try mizuWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_mizuwomare.wav"))
+        print("[TTS Output] tts_mizuwomare.wav 保存完了 (\(mizuWavData.count) bytes)")
     }
 
     /// 自然な実音声音素プロファイルによる TTS 合成検証
@@ -1159,15 +1533,107 @@ final class AblationAnalysisTests: XCTestCase {
             fIdx += 1
         }
     }
+
+    /// コーパス実音声から音素別アライメント平均フレーム数を精密集計
+    func testCalculateCorpusPhonemeAverages() throws {
+        let corpusDir = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000"
+        let wavDir = "\(corpusDir)/wav"
+        let transcriptPath = "\(corpusDir)/transcript_utf8.txt"
+        guard FileManager.default.fileExists(atPath: transcriptPath) else { return }
+
+        let content = try String(contentsOfFile: transcriptPath, encoding: .utf8)
+        let lines = content.components(separatedBy: .newlines)
+
+        let wavReader = WavAudioReader()
+        let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
+        let pitchTracker = PitchTracker()
+        let forcedAligner = AcousticForcedAligner()
+
+        let normalizer = TextNormalizer(morphology: ViterbiMorphology())
+        let vocabulary = PhonemeVocabulary()
+        let prosodyModel = ProsodyModel()
+
+        var durationSums: [Int32: Float] = [:]
+        var durationCounts: [Int32: Float] = [:]
+
+        var processedCount = 0
+        var lIdx = 0
+        while lIdx < lines.count && processedCount < 50 {
+            let line = lines[lIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+            lIdx += 1
+            if line.isEmpty { continue }
+
+            let parts = line.components(separatedBy: ":")
+            if parts.count < 2 { continue }
+            let id = parts[0]
+            let text = parts[1]
+
+            let wavPath = "\(wavDir)/\(id).wav"
+            guard FileManager.default.fileExists(atPath: wavPath),
+                  let pcm16k = try? wavReader.loadWav16k(from: wavPath) else {
+                continue
+            }
+
+            let morphemes = normalizer.normalize(text: text)
+            let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+            var tokens: [PhonemeToken] = []
+            for phrase in phrases {
+                for mora in phrase.moras {
+                    for ph in mora.phonemes {
+                        tokens.append(ph)
+                    }
+                }
+            }
+            if tokens.isEmpty { continue }
+
+            let hopSize = AudioConfig.hopSize
+            let totalFrames = max(1, pcm16k.count / hopSize)
+            let boundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+                pcm: pcm16k,
+                hopSize: hopSize,
+                totalFrames: totalFrames
+            )
+            if boundaries.speechFrames <= 0 || boundaries.speechFrames < tokens.count {
+                continue
+            }
+
+            let features = forcedAligner.extractFeatures(
+                pcm: pcm16k,
+                hopSize: hopSize,
+                startFrame: boundaries.leadSilence,
+                frameCount: boundaries.speechFrames,
+                pitchTracker: pitchTracker,
+                melExtractor: melExtractor
+            )
+
+            guard let durs = forcedAligner.align(features: features, phonemes: tokens) else {
+                continue
+            }
+
+            var t = 0
+            while t < tokens.count {
+                let pid = Int32(tokens[t].id)
+                let dur = Float(durs[t])
+                let curS = durationSums[pid] ?? 0.0
+                let curC = durationCounts[pid] ?? 0.0
+                durationSums[pid] = curS + dur
+                durationCounts[pid] = curC + 1.0
+                t += 1
+            }
+
+            processedCount += 1
+        }
+
+        print("\n=======================================================")
+        print("コーパス実測音素平均フレーム数 (集計サンプル数: \(processedCount))")
+        print("=======================================================")
+        var averages: [Int32: Float] = [:]
+        for (pid, sum) in durationSums.sorted(by: { $0.key < $1.key }) {
+            let count = durationCounts[pid] ?? 1.0
+            let avg = sum / count
+            let sym = vocabulary.token(for: Int(pid))
+            print("  ID \(pid) (\(sym)): 平均=\(String(format: "%.2f", avg)) frames (\(String(format: "%.1f", avg * 10.0))ms, N=\(Int(count)))")
+            averages[pid] = roundf(avg * 10.0) / 10.0
+        }
+    }
 }
-
-
-
-
-
-
-
-
-
-
-

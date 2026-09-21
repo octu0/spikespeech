@@ -69,7 +69,10 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         self.prosodyModel = ProsodyModel()
         self.prosodyPredictor = ProsodyPredictor(weights: effectiveWeights.prosodyWeights)
         self.vocabulary = PhonemeVocabulary()
-        self.lengthRegulator = LengthRegulator(hiddenDimension: effectiveWeights.inputDim)
+        self.lengthRegulator = LengthRegulator(
+            hiddenDimension: effectiveWeights.inputDim,
+            phonemeAverageDurations: effectiveWeights.phonemeAverageDurations
+        )
         self.decoder = SpikingAcousticDecoder(weights: effectiveWeights)
         self.neuralVocoder = NeuralVocoder(weights: vocoderWeights)
         self.workspace = AcousticWorkspace(

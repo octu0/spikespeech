@@ -120,13 +120,10 @@ final class PipelineTests: XCTestCase {
         while idx < testSpeeds.count {
             let spd = testSpeeds[idx]
 
-            let floatDur = regulator.floatDurationFrames(category: .vowel, symbol: "a", speed: spd)
-            XCTAssertFalse(floatDur.isNaN, "speed=\(spd) で floatDurationFrames が NaN を返しました")
-            XCTAssertFalse(floatDur.isInfinite, "speed=\(spd) で floatDurationFrames が Inf を返しました")
-            XCTAssertTrue(1.0 <= floatDur, "speed=\(spd) で floatDurationFrames が 1.0 未満です")
-
-            let intDur = regulator.defaultDurationFrames(category: .vowel, symbol: "a", speed: spd)
-            XCTAssertTrue(1 <= intDur, "speed=\(spd) で defaultDurationFrames が 1 未満です")
+            let floatDur = regulator.phonemeDuration(phoneId: 5, speedFactor: spd)
+            XCTAssertFalse(floatDur.isNaN, "speed=\(spd) で phonemeDuration が NaN を返しました")
+            XCTAssertFalse(floatDur.isInfinite, "speed=\(spd) で phonemeDuration が Inf を返しました")
+            XCTAssertTrue(1.0 <= floatDur, "speed=\(spd) で phonemeDuration が 1.0 未満です")
 
             idx += 1
         }

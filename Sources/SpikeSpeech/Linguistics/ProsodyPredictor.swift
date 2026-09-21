@@ -256,19 +256,13 @@ public final class ProsodyPredictor: Sendable {
         lengthRegulator: LengthRegulator,
         speedFactor: Float = 1.0,
         applyFluctuation: Bool = true,
-        targetSpeechFrames: Int? = nil,
-        averageFramesPerMora: Float = 16.0
+        text: String = ""
     ) -> [Int] {
-        // 設計書 (design_duration_from_data.md) の規定:
-        // 推論時は学習で集めた framesPerMora の平均 (16.0 = 160ms/モーラ) と同一比率モデルを使う。
-        // 旧規則表 (floatDurationFrames) に依存した durationWeights を介在させず、
-        // 学習と推論で完全に同一のモーラ等時性・音素比率関数を唯一の正本として共有する。
         let rawFloatDurations = lengthRegulator.computeDataDrivenDurations(
             phrases: phrases,
-            targetSpeechFrames: targetSpeechFrames,
-            averageFramesPerMora: averageFramesPerMora,
             speedFactor: speedFactor,
-            applyFluctuation: applyFluctuation
+            applyFluctuation: applyFluctuation,
+            text: text
         )
         return lengthRegulator.quantizeDurations(durations: rawFloatDurations)
     }

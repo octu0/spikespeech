@@ -17,13 +17,13 @@ func runTier2Tests() {
     e2eAssertTrue(44 <= spaceWav.count, "Tier2: spaces produce valid header")
 
     // 2. 極端な話速指定クランプ
-    let fastDur = regulator.floatDurationFrames(category: .vowel, symbol: "a", speed: 100.0)
+    let fastDur = regulator.phonemeDuration(phoneId: 5, speedFactor: 100.0)
     e2eAssertTrue(1.0 <= fastDur, "Tier2: extreme fast speed clamped to 1.0 frame min")
 
-    let slowDur = regulator.floatDurationFrames(category: .vowel, symbol: "a", speed: -5.0)
+    let slowDur = regulator.phonemeDuration(phoneId: 5, speedFactor: -5.0)
     e2eAssertTrue(1.0 <= slowDur, "Tier2: negative speed clamped safely")
 
-    let nanDur = regulator.floatDurationFrames(category: .vowel, symbol: "a", speed: Float.nan)
+    let nanDur = regulator.phonemeDuration(phoneId: 5, speedFactor: Float.nan)
     e2eAssertFalse(nanDur.isNaN, "Tier2: NaN speed does not return NaN")
 
     // 3. ボコーダー NaN / Inf 入力耐性
