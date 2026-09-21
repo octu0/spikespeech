@@ -70,25 +70,41 @@ final class ForcedAlignmentTests: XCTestCase {
         XCTAssertEqual(averages[10], 5.0)
     }
 
-    /// AcousticForcedAligner の DP による大局的アライメントで総フレーム数が厳密保存されることを検証
-    func testAcousticForcedAlignerDPConvergence() {
-        let aligner = AcousticForcedAligner()
+    /// 教師 Mel 実測プロトタイプ集計と MAS 単調動的計画法による境界推定で総フレーム数が厳密保存されることを検証
+    func testMonotonicAlignmentSearchPrototypeConvergence() {
         let frameCount = 60
-        var features: [AcousticForcedAligner.FrameAcousticFeatures] = []
+        var testMel = [[Float]](repeating: [Float](repeating: -7.0, count: AudioConfig.melChannels), count: frameCount)
+        var testVoiced = [Float](repeating: 0.0, count: frameCount)
 
-        // 前半 20F: 母音特徴 (有声高, パワー高), 中盤 15F: 子音特徴 (摩擦高), 後半 25F: 母音特徴
+        // 前半 20F: 母音 /a/ (有声高, 低中域エネルギー高)
         var f = 0
-        while f < frameCount {
-            let feat: AcousticForcedAligner.FrameAcousticFeatures
-            switch f {
-            case 0..<20:
-                feat = AcousticForcedAligner.FrameAcousticFeatures(power: 0.05, voiced: 0.95, spectralFlux: 0.1, highFreqRatio: 0.1, lowFreqRatio: 0.6)
-            case 20..<35:
-                feat = AcousticForcedAligner.FrameAcousticFeatures(power: 0.01, voiced: 0.1, spectralFlux: 0.3, highFreqRatio: 0.5, lowFreqRatio: 0.1)
-            default:
-                feat = AcousticForcedAligner.FrameAcousticFeatures(power: 0.04, voiced: 0.9, spectralFlux: 0.1, highFreqRatio: 0.1, lowFreqRatio: 0.6)
+        while f < 20 {
+            var c = 4
+            while c < 32 {
+                testMel[f][c] = 2.0
+                c += 1
             }
-            features.append(feat)
+            testVoiced[f] = 1.0
+            f += 1
+        }
+        // 中盤 15F: 子音 /s/ (無声, 高域エネルギー高)
+        while f < 35 {
+            var c = 48
+            while c < AudioConfig.melChannels {
+                testMel[f][c] = 1.5
+                c += 1
+            }
+            testVoiced[f] = 0.0
+            f += 1
+        }
+        // 後半 25F: 母音 /i/ (有声高, 高域フォルマントあり)
+        while f < frameCount {
+            var c = 8
+            while c < 40 {
+                testMel[f][c] = 1.8
+                c += 1
+            }
+            testVoiced[f] = 0.95
             f += 1
         }
 
@@ -98,8 +114,31 @@ final class ForcedAlignmentTests: XCTestCase {
             PhonemeToken(id: 6, symbol: "i", category: .vowel)
         ]
 
-        guard let durations = aligner.align(features: features, phonemes: tokens) else {
-            XCTFail("DP alignment failed")
+        // 1. 初期仮割り
+        let bootstrapDurs = MonotonicAlignmentSearch.initialBootstrapDurations(
+            totalFrames: frameCount,
+            phonemes: tokens
+        )
+        XCTAssertEqual(bootstrapDurs.count, tokens.count)
+        var bootstrapSum = 0
+        var bIdx = 0
+        while bIdx < bootstrapDurs.count {
+            XCTAssertTrue(1 <= bootstrapDurs[bIdx])
+            bootstrapSum += bootstrapDurs[bIdx]
+            bIdx += 1
+        }
+        XCTAssertEqual(bootstrapSum, frameCount)
+
+        // 2. プロトタイプ集計
+        let prototypes = MonotonicAlignmentSearch.accumulatePrototypes(
+            utterances: [(mel: testMel, voiced: testVoiced, phonemes: tokens, durations: bootstrapDurs)]
+        )
+        XCTAssertEqual(prototypes.count, 3)
+
+        // 3. MAS 単調アライメント
+        let mas = MonotonicAlignmentSearch(prototypes: prototypes)
+        guard let durations = mas.align(mel: testMel, voiced: testVoiced, phonemes: tokens, meanFramesPerMora: 16.0) else {
+            XCTFail("MAS alignment failed")
             return
         }
 
@@ -107,7 +146,7 @@ final class ForcedAlignmentTests: XCTestCase {
         var totalSum = 0
         var i = 0
         while i < durations.count {
-            XCTAssertLessThanOrEqual(1, durations[i])
+            XCTAssertTrue(1 <= durations[i])
             totalSum += durations[i]
             i += 1
         }
@@ -136,14 +175,14 @@ final class ForcedAlignmentTests: XCTestCase {
             addBoundarySilence: false
         )
 
-        // "か" は [k, a] の2音素。文末母音のため 1.15倍の句末伸長 (14 * 1.15 = 16.1 -> 16) が適用される
+        // "か" は [k, a] の 1 モーラ。目標モーラ長 16.0 フレームに対し、重み比率 (k: 3.0, a: 14.0 * 1.15 = 16.1) で比例配分される
         XCTAssertEqual(features.phoneIds.count, 2)
         XCTAssertEqual(features.durations[0], 3)  // k: 3 frames
-        XCTAssertEqual(features.durations[1], 16) // a: 14 * 1.15 = 16 frames
-        XCTAssertEqual(features.totalFrames, 19)
+        XCTAssertEqual(features.durations[1], 13) // a: 13 frames
+        XCTAssertEqual(features.totalFrames, 16)  // 1 モーラ = 正確に 16 frames
     }
 
-    /// SpikingNetworkWeights における音素平均フレームの JSON 永続化と復元を検証
+    /// SpikingNetworkWeights における音素平均フレームおよびモーラ平均長の JSON 永続化と復元を検証
     func testSpikingNetworkWeightsPhonemeAverageDurationsSerialization() throws {
         let originalTable: [Int32: Float] = [
             1: 8.0,
@@ -156,7 +195,8 @@ final class ForcedAlignmentTests: XCTestCase {
             outputDim: 80,
             timeSteps: 2,
             numLayers: 2,
-            phonemeAverageDurations: originalTable
+            phonemeAverageDurations: originalTable,
+            meanFramesPerMora: 16.0
         )
 
         let encoder = JSONEncoder()
@@ -173,9 +213,10 @@ final class ForcedAlignmentTests: XCTestCase {
         case .none:
             XCTFail("phonemeAverageDurations がデコードされませんでした")
         }
+        XCTAssertEqual(decoded.meanFramesPerMora, 16.0)
     }
 
-    /// SpikeSpeechEngine が重みに含まれる音素平均テーブルを自動的に推論正本として引き継ぐことを検証
+    /// SpikeSpeechEngine が重みに含まれる音素平均テーブルおよび meanFramesPerMora を自動的に推論正本として引き継ぐことを検証
     func testSpikeSpeechEngineUsesWeightsPhonemeAverages() {
         let customTable: [Int32: Float] = [
             5: 12.0,
@@ -188,10 +229,69 @@ final class ForcedAlignmentTests: XCTestCase {
             timeSteps: 2,
             numLayers: 2
         )
-        let weightsWithTable = baseWeights.withPhonemeAverageDurations(customTable)
+        let weightsWithTable = baseWeights
+            .withPhonemeAverageDurations(customTable)
+            .withMeanFramesPerMora(16.5)
         let engine = SpikeSpeechEngine(weights: weightsWithTable)
 
         XCTAssertEqual(engine.lengthRegulator.phonemeAverageDurations[5], 12.0)
         XCTAssertEqual(engine.lengthRegulator.phonemeAverageDurations[10], 4.0)
+        XCTAssertEqual(engine.lengthRegulator.meanFramesPerMora, 16.5)
+    }
+
+    /// 教師 Mel 単調動的計画法 (MAS) による音素アライメントで総フレーム数が厳密保存され、物理境界が正しく分離されることを検証
+    func testMonotonicAlignmentSearchExactConvergence() {
+        let tTotal = 40
+        var testMel = [[Float]](repeating: [Float](repeating: -7.0, count: AudioConfig.melChannels), count: tTotal)
+        var testVoiced = [Float](repeating: 0.0, count: tTotal)
+
+        // 0..<15F: /s/ (無声、高周波帯域 ch 48-63 に強エネルギー)
+        var t = 0
+        while t < 15 {
+            var c = 48
+            while c < AudioConfig.melChannels {
+                testMel[t][c] = 2.0
+                c += 1
+            }
+            testVoiced[t] = 0.0
+            t += 1
+        }
+
+        // 15..<40F: /a/ (有声、低中域 ch 4-32 にフォルマント)
+        while t < tTotal {
+            var c = 4
+            while c < 32 {
+                testMel[t][c] = 2.5
+                c += 1
+            }
+            testVoiced[t] = 1.0
+            t += 1
+        }
+
+        let tokens = [
+            PhonemeToken(id: 11, symbol: "s", category: .consonant),
+            PhonemeToken(id: 5, symbol: "a", category: .vowel)
+        ]
+
+        // 初期仮割りから音素プロトタイプを自律集計
+        let bootstrapDurs = MonotonicAlignmentSearch.initialBootstrapDurations(totalFrames: tTotal, phonemes: tokens)
+        let prototypes = MonotonicAlignmentSearch.accumulatePrototypes(
+            utterances: [(mel: testMel, voiced: testVoiced, phonemes: tokens, durations: bootstrapDurs)]
+        )
+        let mas = MonotonicAlignmentSearch(prototypes: prototypes)
+
+        guard let durs = mas.align(mel: testMel, voiced: testVoiced, phonemes: tokens, meanFramesPerMora: 16.0) else {
+            XCTFail("MAS 単調アライメントに失敗しました")
+            return
+        }
+
+        XCTAssertEqual(durs.count, 2)
+        XCTAssertTrue(1 <= durs[0])
+        XCTAssertTrue(1 <= durs[1])
+        XCTAssertEqual(durs[0] + durs[1], tTotal)
+        // /s/ が 15F 付近、/a/ が 25F 付近に境界決定されていること（許容差 ±3F）
+        XCTAssertTrue(12 <= durs[0], "/s/ のフレーム長が短すぎます: \(durs[0])")
+        XCTAssertTrue(durs[0] <= 18, "/s/ のフレーム長が長すぎます: \(durs[0])")
     }
 }
+

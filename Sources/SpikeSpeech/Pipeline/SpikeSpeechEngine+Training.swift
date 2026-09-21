@@ -96,6 +96,7 @@ extension SpikeSpeechEngine {
         if targetFrames <= 0 {
             return nil
         }
+        let pitchResult = pitchTracker.track(pcm: pcm16k)
 
         let boundaries = Self.detectSpeechBoundaries(
             pcm: pcm16k,
@@ -148,17 +149,28 @@ extension SpikeSpeechEngine {
                 return nil
             }
 
-            let forcedAligner = AcousticForcedAligner()
-            let features = forcedAligner.extractFeatures(
-                pcm: pcm16k,
-                hopSize: AudioConfig.hopSize,
-                startFrame: leadSilence,
-                frameCount: speechFrames,
-                pitchTracker: pitchTracker,
-                melExtractor: melExtractor
-            )
+            let masAligner = MonotonicAlignmentSearch()
+            let speechEnd = min(targetMel.count, leadSilence + speechFrames)
+            var speechMel: [[Float]] = []
+            var speechVoiced: [Float] = []
+            var f = leadSilence
+            while f < speechEnd {
+                speechMel.append(targetMel[f])
+                var v: Float = 0.0
+                if f < pitchResult.frameCount {
+                    v = pitchResult.voiced[f]
+                }
+                speechVoiced.append(v)
+                f += 1
+            }
 
-            guard let durs = forcedAligner.align(features: features, phonemes: tokens) else {
+            let moraRate = lengthRegulator.meanFramesPerMora
+            guard let durs = masAligner.align(
+                mel: speechMel,
+                voiced: speechVoiced,
+                phonemes: tokens,
+                meanFramesPerMora: moraRate
+            ) else {
                 return nil
             }
 
@@ -195,8 +207,7 @@ extension SpikeSpeechEngine {
             fullDurations.append(trailSilence)
         }
 
-        // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間 RMS 抽出
-        let pitchResult = pitchTracker.track(pcm: pcm16k)
+        // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間 RMS 抽出（冒頭で取得済み）
 
         // なぜ学習データ構築時に発話ピーク正規化を行うか:
         // 実録音のゲインばらつきを吸収し、発話内ピーク（有声母音）を正確に 0.80（推論側の母音エネルギー 0.80）

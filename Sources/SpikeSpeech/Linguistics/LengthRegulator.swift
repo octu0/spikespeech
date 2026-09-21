@@ -7,6 +7,8 @@ import Foundation
 public final class LengthRegulator: Sendable {
     public let hiddenDimension: Int
     public let phonemeAverageDurations: [Int32: Float]
+    public let meanFramesPerMora: Float
+    public static let defaultMeanFramesPerMora: Float = 16.0 // 実測 ~160ms/モーラ
 
     /// JSUT 5000発話アライメント実測統計に基づく音素 ID 別デフォルト平均継続時間 (1フレーム=10ms)
     /// なぜ実測統計をデフォルトとして保持するか:
@@ -53,7 +55,8 @@ public final class LengthRegulator: Sendable {
 
     public init(
         hiddenDimension: Int = 64,
-        phonemeAverageDurations: [Int32: Float]? = nil
+        phonemeAverageDurations: [Int32: Float]? = nil,
+        meanFramesPerMora: Float? = nil
     ) {
         self.hiddenDimension = hiddenDimension
         switch phonemeAverageDurations {
@@ -61,6 +64,12 @@ public final class LengthRegulator: Sendable {
             self.phonemeAverageDurations = table
         case .none:
             self.phonemeAverageDurations = Self.defaultPhonemeAverageDurations
+        }
+        switch meanFramesPerMora {
+        case .some(let m):
+            self.meanFramesPerMora = m
+        case .none:
+            self.meanFramesPerMora = Self.defaultMeanFramesPerMora
         }
     }
 
@@ -101,9 +110,9 @@ public final class LengthRegulator: Sendable {
     /// アクセント句列からデータ駆動型の自然なモーラ C/V 比率音素継続フレーム系列を算出する（推論正本）
     ///
     /// なぜモーラ C/V 比率モデルとするか:
-    /// 音素ごとに孤立した平均値を単純に割り振ると破裂音や撥音が 15〜30 フレームに肥大化して
-    /// SNN の膜電位が直流飽和・ブザー発振に陥るため、
-    /// 日本語の音韻構造（1モーラ約 155ms、子音 25% / 母音 75%）に基づき適正な過渡変化長を配分する。
+    /// 音素ごとに孤立した平均値を単純加算すると発話速度が 126〜143ms/モーラに短縮して早口化するため、
+    /// 学習データ実測のモーラ長（meanFramesPerMora = 約 160ms/モーラ）を目標モーラ長として固定し、
+    /// モーラ内の音素平均テーブルを比率の重みとしてのみ使用して厳密に比例配分する。
     public func computeDataDrivenDurations(
         phrases: [AccentPhrase],
         speedFactor: Float = 1.0,
@@ -134,8 +143,8 @@ public final class LengthRegulator: Sendable {
         var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
         var rawDurations: [Float] = []
 
-        // 1 モーラ基本長 (15.5 フレーム = 155ms / モーラ、基準 150〜180ms に合致)
-        let baseMoraFrames: Float = 15.5 / safeSpeed
+        // 1 モーラ目標フレーム数 (教師会話速度: meanFramesPerMora / safeSpeed、実測 約 16.0 フレーム = 160ms)
+        let targetMoraFrames = meanFramesPerMora / safeSpeed
 
         pIdx = 0
         while pIdx < phrases.count {
@@ -152,28 +161,56 @@ public final class LengthRegulator: Sendable {
                     }
                 }
 
+                // モーラ内各音素の重みを算出（音素平均テーブルの値を相対重みとして使用）
+                var weights: [Float] = []
                 var rIdx = 0
                 while rIdx < mora.phonemes.count {
                     let token = mora.phonemes[rIdx]
-                    var d = phonemeDuration(phoneId: Int32(token.id), speedFactor: safeSpeed)
-
-                    if applyFluctuation {
-                        let tempoScale = bioFluctuation.computeTempoScale()
-                        d *= tempoScale
-                    }
-
+                    var w = phonemeDuration(phoneId: Int32(token.id), speedFactor: 1.0)
                     if shouldLengthen {
                         switch token.category {
                         case .vowel, .nasalSyllable, .prolonged:
-                            d *= 1.15
+                            w *= 1.15
                         default:
                             break
                         }
                     }
-
-                    rawDurations.append(d)
+                    weights.append(w)
                     rIdx += 1
                 }
+
+                var moraWeightSum: Float = 0.0
+                var wSumIdx = 0
+                while wSumIdx < weights.count {
+                    moraWeightSum += weights[wSumIdx]
+                    wSumIdx += 1
+                }
+                let safeWeightSum: Float
+                if moraWeightSum <= 0.001 {
+                    safeWeightSum = 1.0
+                } else {
+                    safeWeightSum = moraWeightSum
+                }
+
+                var tempoScale: Float = 1.0
+                if applyFluctuation {
+                    tempoScale = bioFluctuation.computeTempoScale()
+                }
+
+                let effectiveMoraFrames = targetMoraFrames * tempoScale
+
+                var wIdx = 0
+                while wIdx < weights.count {
+                    // モーラ内の音素重み比率に応じて目標モーラ長を厳密に比例配分
+                    let ratio = weights[wIdx] / safeWeightSum
+                    var d = effectiveMoraFrames * ratio
+                    if d < 1.0 {
+                        d = 1.0
+                    }
+                    rawDurations.append(d)
+                    wIdx += 1
+                }
+
                 mIdx += 1
             }
             if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {

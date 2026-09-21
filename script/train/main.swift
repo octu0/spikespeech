@@ -372,6 +372,14 @@ func main() {
         print("新規の決定論的ランダム重みで初期化しました。")
     }
 
+    let engine = SpikeSpeechEngine(weights: weights)
+    let melExtractor = MelSpectrogramExtractor(
+        sampleRate: Float(AudioConfig.sampleRate),
+        melChannels: outDim
+    )
+    let wavReader = WavAudioReader()
+    let pitchTracker = PitchTracker()
+
     var alignmentMap: [String: UtteranceAlignment] = [:]
     switch alignmentsPath {
     case .some(let aPath):
@@ -384,38 +392,148 @@ func main() {
             print("警告: 指定されたアライメントファイルが存在しません: \(aPath)。オンライン抽出を実施します。")
         }
     case .none:
-        // コーパスディレクトリ直下に alignments.json があればキャッシュとして自動探索
-        let corpusAlignPath = cleanDatasetPath + "/alignments.json"
+        // コーパスディレクトリ直下に mas_alignments.json があればキャッシュとして自動探索
+        let corpusAlignPath = cleanDatasetPath + "/mas_alignments.json"
         if fileManager.fileExists(atPath: corpusAlignPath) {
             if let loadedMap = try? AlignmentStore.load(from: corpusAlignPath) {
                 alignmentMap = loadedMap
-                print("コーパス内キャッシュから音素 Forced Alignment 記録を読み込みました: \(corpusAlignPath) (\(alignmentMap.count) 発話)")
+                print("コーパス内キャッシュから教師 Mel 単調アライメント (MAS) 記録を読み込みました: \(corpusAlignPath) (\(alignmentMap.count) 発話)")
             }
-        } else {
-            print("アライメントキャッシュは見つかりませんでした。教師 WAV からその場で音素アライメントを抽出します。")
+        }
+        if alignmentMap.count < maxSamples {
+            print("キャッシュされたアライメント数 (\(alignmentMap.count)) が要求発話数 (\(maxSamples)) 未満です。教師 Mel 実測平均と 3 周 MAS 反復集計を実行して \(maxSamples) 発話のアライメントを自己生成します...")
+            let wavDir = cleanDatasetPath + "/wav"
+            let transcriptPath = cleanDatasetPath + "/transcript_utf8.txt"
+            if let tContent = try? String(contentsOfFile: transcriptPath, encoding: .utf8) {
+                let lines = tContent.components(separatedBy: .newlines)
+                var inputItems: [MonotonicAlignmentSearch.AlignmentInputItem] = []
+                var lIdx = 0
+                while lIdx < lines.count && inputItems.count < maxSamples {
+                    let line = lines[lIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+                    lIdx += 1
+                    if line.isEmpty { continue }
+
+                    var parts = line.split(separator: ":", maxSplits: 1).map { String($0) }
+                    if parts.count != 2 {
+                        parts = line.split(separator: "\t", maxSplits: 1).map { String($0) }
+                    }
+                    if parts.count != 2 { continue }
+
+                    let id = parts[0].trimmingCharacters(in: .whitespaces)
+                    let text = parts[1].trimmingCharacters(in: .whitespaces)
+
+                    var wavFile = wavDir + "/" + id + ".wav"
+                    if fileManager.fileExists(atPath: wavFile) != true {
+                        let uppercaseWav = wavDir + "/" + id + ".WAV"
+                        if fileManager.fileExists(atPath: uppercaseWav) {
+                            wavFile = uppercaseWav
+                        }
+                    }
+                    guard fileManager.fileExists(atPath: wavFile),
+                          let rawPCM = try? wavReader.loadWav16k(from: wavFile) else {
+                        continue
+                    }
+
+                    // ピーク正規化
+                    var peak: Float = 0.0
+                    var pIdx = 0
+                    while pIdx < rawPCM.count {
+                        let a = abs(rawPCM[pIdx])
+                        if peak < a { peak = a }
+                        pIdx += 1
+                    }
+                    var pcm16k = rawPCM
+                    if 0.01 < peak {
+                        let normFactor = 0.85 / peak
+                        var s = 0
+                        while s < pcm16k.count {
+                            pcm16k[s] = pcm16k[s] * normFactor
+                            s += 1
+                        }
+                    }
+
+                    let morphemes = engine.normalizer.normalize(text: text)
+                    let phrases = engine.prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: engine.vocabulary)
+                    var tokens: [PhonemeToken] = []
+                    var p = 0
+                    while p < phrases.count {
+                        var m = 0
+                        while m < phrases[p].moras.count {
+                            var ph = 0
+                            while ph < phrases[p].moras[m].phonemes.count {
+                                tokens.append(phrases[p].moras[m].phonemes[ph])
+                                ph += 1
+                            }
+                            m += 1
+                        }
+                        p += 1
+                    }
+                    if tokens.isEmpty { continue }
+
+                    let hopSize = AudioConfig.hopSize
+                    let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
+                    let totalFrames = max(1, targetMel.count)
+                    let boundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+                        pcm: pcm16k,
+                        hopSize: hopSize,
+                        totalFrames: totalFrames
+                    )
+                    let speechFrames = boundaries.speechFrames
+                    let leadSilence = boundaries.leadSilence
+                    let trailSilence = boundaries.trailSilence
+
+                    if speechFrames < tokens.count || speechFrames <= 0 { continue }
+
+                    let pitchRes = pitchTracker.track(pcm: pcm16k)
+                    let speechEnd = min(targetMel.count, leadSilence + speechFrames)
+                    var speechMel: [[Float]] = []
+                    var speechVoiced: [Float] = []
+                    var sf = leadSilence
+                    while sf < speechEnd {
+                        speechMel.append(targetMel[sf])
+                        var v: Float = 0.0
+                        if sf < pitchRes.frameCount {
+                            v = pitchRes.voiced[sf]
+                        }
+                        speechVoiced.append(v)
+                        sf += 1
+                    }
+
+                    inputItems.append(MonotonicAlignmentSearch.AlignmentInputItem(
+                        utteranceId: id,
+                        leadSilence: leadSilence,
+                        trailSilence: trailSilence,
+                        totalSpeechFrames: speechFrames,
+                        mel: speechMel,
+                        voiced: speechVoiced,
+                        phonemes: tokens
+                    ))
+                }
+
+                let newAlignments = MonotonicAlignmentSearch.iterativelyAlign(
+                    items: inputItems,
+                    iterations: 3,
+                    meanFramesPerMora: 16.0
+                )
+                for al in newAlignments {
+                    alignmentMap[al.utteranceId] = al
+                }
+                try? AlignmentStore.save(newAlignments, to: corpusAlignPath)
+                print("生成された MAS アライメント (\(newAlignments.count) 発話) を \(corpusAlignPath) に保存しました")
+            }
         }
     }
 
     var durationSums: [Int32: Float] = [:]
     var durationCounts: [Int32: Float] = [:]
-
-    let engine = SpikeSpeechEngine(weights: weights)
-    let melExtractor = MelSpectrogramExtractor(
-        sampleRate: Float(AudioConfig.sampleRate),
-        melChannels: outDim
-    )
-    let wavReader = WavAudioReader()
+    var totalSpeechFramesAcrossCorpus = 0
+    var totalMorasAcrossCorpus = 0
 
     // コーパス読み込み
     let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]])] = []
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
     var prosodySamples: [ProsodyTrainingSample] = []
-
-    // なぜローカル関数を廃止し SpikeSpeechEngine.prepareTrainingPair を正本として呼ぶか:
-    // 同一ロジックの二重実装を根絶し、単体テスト・学習 CLI・データセット生成で全く同一の
-    // アライメント・Blended Prior 目標残差生成器を唯一の正本として共有するため。
-    let pitchTracker = PitchTracker()
 
     print("コーパスパス: \(corpusDir)")
     let transcriptPath = corpusDir + "/transcript_utf8.txt"
@@ -471,10 +589,10 @@ func main() {
                                 s += 1
                             }
                         }
+                        let morphemes = engine.normalizer.normalize(text: text)
+                        let phrases = engine.prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: engine.vocabulary)
                         var effectiveAlign = alignmentMap[id]
                         if effectiveAlign == nil {
-                            let morphemes = engine.normalizer.normalize(text: text)
-                            let phrases = engine.prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: engine.vocabulary)
                             var tokens: [PhonemeToken] = []
                             var pIdx = 0
                             while pIdx < phrases.count {
@@ -491,44 +609,71 @@ func main() {
                             }
                             if tokens.isEmpty != true {
                                 let hopSize = AudioConfig.hopSize
-                                let totalFrames = max(1, pcm16k.count / hopSize)
+                                let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
+                                let totalFrames = max(1, targetMel.count)
                                 let boundaries = SpikeSpeechEngine.detectSpeechBoundaries(
                                     pcm: pcm16k,
                                     hopSize: hopSize,
                                     totalFrames: totalFrames
                                 )
-                                let forcedAligner = AcousticForcedAligner()
-                                let features = forcedAligner.extractFeatures(
-                                    pcm: pcm16k,
-                                    hopSize: hopSize,
-                                    startFrame: boundaries.leadSilence,
-                                    frameCount: boundaries.speechFrames,
-                                    pitchTracker: pitchTracker,
-                                    melExtractor: melExtractor
-                                )
-                                if let durs = forcedAligner.align(features: features, phonemes: tokens) {
-                                    var phList: [PhonemeAlignment] = []
-                                    var tIdx = 0
-                                    while tIdx < tokens.count {
-                                        phList.append(PhonemeAlignment(
-                                            symbol: tokens[tIdx].symbol,
-                                            phoneId: Int32(tokens[tIdx].id),
-                                            durationFrames: durs[tIdx]
-                                        ))
-                                        tIdx += 1
+                                let speechFrames = boundaries.speechFrames
+                                let leadSilence = boundaries.leadSilence
+                                let trailSilence = boundaries.trailSilence
+
+                                if tokens.count <= speechFrames {
+                                    let pitchRes = pitchTracker.track(pcm: pcm16k)
+                                    let speechEnd = min(targetMel.count, leadSilence + speechFrames)
+                                    var speechMel: [[Float]] = []
+                                    var speechVoiced: [Float] = []
+                                    var sf = leadSilence
+                                    while sf < speechEnd {
+                                        speechMel.append(targetMel[sf])
+                                        var v: Float = 0.0
+                                        if sf < pitchRes.frameCount {
+                                            v = pitchRes.voiced[sf]
+                                        }
+                                        speechVoiced.append(v)
+                                        sf += 1
                                     }
-                                    effectiveAlign = UtteranceAlignment(
-                                        utteranceId: id,
-                                        leadSilenceFrames: boundaries.leadSilence,
-                                        trailSilenceFrames: boundaries.trailSilence,
-                                        totalSpeechFrames: boundaries.speechFrames,
-                                        phonemes: phList
-                                    )
+
+                                    let masAligner = MonotonicAlignmentSearch()
+                                    if let durs = masAligner.align(
+                                        mel: speechMel,
+                                        voiced: speechVoiced,
+                                        phonemes: tokens,
+                                        meanFramesPerMora: 16.0
+                                    ) {
+                                        var phList: [PhonemeAlignment] = []
+                                        var tIdx = 0
+                                        while tIdx < tokens.count {
+                                            phList.append(PhonemeAlignment(
+                                                symbol: tokens[tIdx].symbol,
+                                                phoneId: Int32(tokens[tIdx].id),
+                                                durationFrames: durs[tIdx]
+                                            ))
+                                            tIdx += 1
+                                        }
+                                        effectiveAlign = UtteranceAlignment(
+                                            utteranceId: id,
+                                            leadSilenceFrames: leadSilence,
+                                            trailSilenceFrames: trailSilence,
+                                            totalSpeechFrames: speechFrames,
+                                            phonemes: phList
+                                        )
+                                        alignmentMap[id] = effectiveAlign
+                                    }
                                 }
                             }
                         }
 
                         if let al = effectiveAlign {
+                            totalSpeechFramesAcrossCorpus += al.totalSpeechFrames
+                            var phraseMoraCount = 0
+                            for phrase in phrases {
+                                phraseMoraCount += phrase.moras.count
+                            }
+                            totalMorasAcrossCorpus += phraseMoraCount
+
                             var p = 0
                             while p < al.phonemes.count {
                                 let ph = al.phonemes[p]
@@ -574,6 +719,18 @@ func main() {
                 }
             }
             lineIdx += 1
+        }
+    }
+
+    // コーパス側キャッシュに教師 Mel MAS アライメントを永続化（Models には書かない）
+    let corpusMasCachePath = cleanDatasetPath + "/mas_alignments.json"
+    if fileManager.fileExists(atPath: corpusMasCachePath) != true && alignmentMap.isEmpty != true {
+        let alignList = Array(alignmentMap.values).sorted(by: { $0.utteranceId < $1.utteranceId })
+        do {
+            try AlignmentStore.save(alignList, to: corpusMasCachePath)
+            print("コーパスディレクトリに教師 Mel MAS アライメント記録をキャッシュ保存しました: \(corpusMasCachePath) (\(alignList.count) 発話)")
+        } catch {
+            print("警告: MAS アライメントキャッシュ保存に失敗しました: \(error)")
         }
     }
 
@@ -910,9 +1067,19 @@ func main() {
         phonemeAverages = LengthRegulator.defaultPhonemeAverageDurations
     }
 
+    var corpusMeanFramesPerMora: Float = 16.0
+    if 0 < totalMorasAcrossCorpus {
+        corpusMeanFramesPerMora = Float(totalSpeechFramesAcrossCorpus) / Float(totalMorasAcrossCorpus)
+    }
+    // 教師 WAV 実測会話速度（約 160ms/モーラ）の健全な基準範囲に制限
+    if corpusMeanFramesPerMora < 14.0 { corpusMeanFramesPerMora = 16.0 }
+    if 18.0 < corpusMeanFramesPerMora { corpusMeanFramesPerMora = 16.0 }
+    print("コーパス平均モーラ長: \(String(format: "%.2f", corpusMeanFramesPerMora)) frames (\(String(format: "%.1f", corpusMeanFramesPerMora * 10.0)) ms/モーラ)")
+
     let exportedWeights = bestSNNWeights
         .withProsodyWeights(finalProsodyWeights)
         .withPhonemeAverageDurations(phonemeAverages)
+        .withMeanFramesPerMora(corpusMeanFramesPerMora)
     do {
         try WeightCheckpoint.atomicWritePretty(exportedWeights, to: outputURL)
         let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0

@@ -646,7 +646,6 @@ final class AblationAnalysisTests: XCTestCase {
         let rawPCM = try wavReader.loadWav16k(from: wavPath)
         let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
         let pitchTracker = PitchTracker()
-        let pitchResult = pitchTracker.track(pcm: rawPCM)
 
         let weightsData = try Data(contentsOf: URL(fileURLWithPath: "Models/weights.json"))
         let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
@@ -749,7 +748,6 @@ final class AblationAnalysisTests: XCTestCase {
 
         let wavReader = WavAudioReader()
         let rawPCM = try wavReader.loadWav16k(from: wavPath)
-        let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
         let pitchTracker = PitchTracker()
         let pitchResult = pitchTracker.track(pcm: rawPCM)
 
@@ -1547,7 +1545,7 @@ final class AblationAnalysisTests: XCTestCase {
         let wavReader = WavAudioReader()
         let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
         let pitchTracker = PitchTracker()
-        let forcedAligner = AcousticForcedAligner()
+        let masAligner = MonotonicAlignmentSearch()
 
         let normalizer = TextNormalizer(morphology: ViterbiMorphology())
         let vocabulary = PhonemeVocabulary()
@@ -1555,6 +1553,8 @@ final class AblationAnalysisTests: XCTestCase {
 
         var durationSums: [Int32: Float] = [:]
         var durationCounts: [Int32: Float] = [:]
+        var totalSpeechFrames = 0
+        var totalMoras = 0
 
         var processedCount = 0
         var lIdx = 0
@@ -1597,18 +1597,37 @@ final class AblationAnalysisTests: XCTestCase {
                 continue
             }
 
-            let features = forcedAligner.extractFeatures(
-                pcm: pcm16k,
-                hopSize: hopSize,
-                startFrame: boundaries.leadSilence,
-                frameCount: boundaries.speechFrames,
-                pitchTracker: pitchTracker,
-                melExtractor: melExtractor
-            )
+            let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
+            let pitchRes = pitchTracker.track(pcm: pcm16k)
+            let speechEnd = min(targetMel.count, boundaries.leadSilence + boundaries.speechFrames)
+            var speechMel: [[Float]] = []
+            var speechVoiced: [Float] = []
+            var sf = boundaries.leadSilence
+            while sf < speechEnd {
+                speechMel.append(targetMel[sf])
+                var v: Float = 0.0
+                if sf < pitchRes.frameCount {
+                    v = pitchRes.voiced[sf]
+                }
+                speechVoiced.append(v)
+                sf += 1
+            }
 
-            guard let durs = forcedAligner.align(features: features, phonemes: tokens) else {
+            guard let durs = masAligner.align(
+                mel: speechMel,
+                voiced: speechVoiced,
+                phonemes: tokens,
+                meanFramesPerMora: 16.0
+            ) else {
                 continue
             }
+
+            totalSpeechFrames += boundaries.speechFrames
+            var phraseMoras = 0
+            for phrase in phrases {
+                phraseMoras += phrase.moras.count
+            }
+            totalMoras += phraseMoras
 
             var t = 0
             while t < tokens.count {
@@ -1624,8 +1643,11 @@ final class AblationAnalysisTests: XCTestCase {
             processedCount += 1
         }
 
+        let meanFramesPerMora = Float(totalSpeechFrames) / Float(max(1, totalMoras))
         print("\n=======================================================")
         print("コーパス実測音素平均フレーム数 (集計サンプル数: \(processedCount))")
+        print("  合計発話フレーム: \(totalSpeechFrames), 合計モーラ数: \(totalMoras)")
+        print("  meanFramesPerMora 実測平均: \(String(format: "%.2f", meanFramesPerMora)) frames (\(String(format: "%.1f", meanFramesPerMora * 10.0)) ms/モーラ)")
         print("=======================================================")
         var averages: [Int32: Float] = [:]
         for (pid, sum) in durationSums.sorted(by: { $0.key < $1.key }) {

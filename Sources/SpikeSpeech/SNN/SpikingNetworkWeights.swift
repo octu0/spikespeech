@@ -57,6 +57,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 学習データの統計に基づいた正確なテンポで完全自律推論可能にするため。
     public let phonemeAverageDurations: [Int32: Float]?
 
+    /// 学習時にコーパス実音声から集計された 1 モーラあたりの平均発話フレーム数 (1フレーム=10ms)
+    /// なぜ重み構造体に記録するか:
+    /// 音素平均の単純加算による早口化を防ぎ、教師 WAV の自然な会話速度（実測 約 160ms/モーラ）を
+    /// 推論時の正本として確実に保持・再現するため。
+    public let meanFramesPerMora: Float?
+
     /// 総層数
     public var numLayers: Int {
         return 1 + wLayers.count
@@ -79,7 +85,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         bOut: [Float],
         lexicon: [LexiconEntry] = [],
         prosodyWeights: ProsodyWeights? = nil,
-        phonemeAverageDurations: [Int32: Float]? = nil
+        phonemeAverageDurations: [Int32: Float]? = nil,
+        meanFramesPerMora: Float? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -98,12 +105,13 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.lexicon = lexicon
         self.prosodyWeights = prosodyWeights
         self.phonemeAverageDurations = phonemeAverageDurations
+        self.meanFramesPerMora = meanFramesPerMora
     }
 
     private enum CodingKeys: String, CodingKey {
         case inputDim, maxHiddenDim, outputDim, timeSteps, lifConfig
         case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wConv, wOut, bOut
-        case lexicon, prosodyWeights, phonemeAverageDurations
+        case lexicon, prosodyWeights, phonemeAverageDurations, meanFramesPerMora
     }
 
     public init(from decoder: Decoder) throws {
@@ -194,6 +202,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         case .none:
             self.phonemeAverageDurations = nil
         }
+        self.meanFramesPerMora = try container.decodeIfPresent(Float.self, forKey: .meanFramesPerMora)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -221,6 +230,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             }
             try container.encode(dict, forKey: .phonemeAverageDurations)
         }
+        try container.encodeIfPresent(meanFramesPerMora, forKey: .meanFramesPerMora)
     }
 
     /// 語彙知識を付与した新しい重みインスタンスを生成する
@@ -244,7 +254,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bOut: self.bOut,
             lexicon: newLexicon,
             prosodyWeights: self.prosodyWeights,
-            phonemeAverageDurations: self.phonemeAverageDurations
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
         )
     }
 
@@ -267,7 +278,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bOut: self.bOut,
             lexicon: self.lexicon,
             prosodyWeights: newProsodyWeights,
-            phonemeAverageDurations: self.phonemeAverageDurations
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
         )
     }
 
@@ -292,7 +304,34 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bOut: self.bOut,
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
-            phonemeAverageDurations: newTable
+            phonemeAverageDurations: newTable,
+            meanFramesPerMora: self.meanFramesPerMora
+        )
+    }
+
+    /// モーラ平均発話フレーム数を付与した新しい重みインスタンスを生成する
+    /// なぜ不変構造体のコピーとして返すか:
+    /// 教師 WAV の自然な会話速度（約 160ms/モーラ）をモデル重みと一体化して安全に永続化するため。
+    public func withMeanFramesPerMora(_ newRate: Float?) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: newRate
         )
     }
 
@@ -317,7 +356,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bOut: newBOut,
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
-            phonemeAverageDurations: self.phonemeAverageDurations
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
         )
     }
 
@@ -409,7 +449,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         seed: UInt64 = 42,
         lexicon: [LexiconEntry] = [],
         prosodyWeights: ProsodyWeights? = nil,
-        phonemeAverageDurations: [Int32: Float]? = nil
+        phonemeAverageDurations: [Int32: Float]? = nil,
+        meanFramesPerMora: Float? = nil
     ) -> SpikingNetworkWeights {
         return standardInit(
             inputDim: inputDim,
@@ -421,7 +462,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             seed: seed,
             lexicon: lexicon,
             prosodyWeights: prosodyWeights,
-            phonemeAverageDurations: phonemeAverageDurations
+            phonemeAverageDurations: phonemeAverageDurations,
+            meanFramesPerMora: meanFramesPerMora
         )
     }
 
@@ -436,7 +478,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         seed: UInt64 = 42,
         lexicon: [LexiconEntry] = [],
         prosodyWeights: ProsodyWeights? = nil,
-        phonemeAverageDurations: [Int32: Float]? = nil
+        phonemeAverageDurations: [Int32: Float]? = nil,
+        meanFramesPerMora: Float? = nil
     ) -> SpikingNetworkWeights {
         var rngState = seed
         let scaleIn = sqrt(2.0 / Float(inputDim))
@@ -534,7 +577,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             bOut: bOut,
             lexicon: lexicon,
             prosodyWeights: prosodyWeights,
-            phonemeAverageDurations: phonemeAverageDurations
+            phonemeAverageDurations: phonemeAverageDurations,
+            meanFramesPerMora: meanFramesPerMora
         )
     }
 

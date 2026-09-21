@@ -410,7 +410,7 @@ final class SNNTests: XCTestCase {
         XCTAssertTrue(0.70 <= bodyDurationSec, "こんにちはの発話本体が 0.70 秒未満です: \(bodyDurationSec) 秒")
         XCTAssertTrue(bodyDurationSec <= 0.95, "こんにちはの発話本体が 0.95 秒を超過しています: \(bodyDurationSec) 秒")
 
-        // 受入基準 3: 「今日はいい天気です」発話本体は 1.3–1.7 秒 (10モーラ × 約160ms)
+        // 受入基準 3: 「今日はいい天気です」発話本体は 1.45–1.75 秒 (10モーラ目安 × 約160ms)
         let lingTenki = engine.lengthRegulator.processText(
             text: "今日はいい天気です",
             normalizer: engine.normalizer,
@@ -424,7 +424,25 @@ final class SNNTests: XCTestCase {
         let tenkiBodyFrames = lingTenki.totalFrames - (tenkiLeadSil + tenkiTrailSil)
         let tenkiBodySec = Float(tenkiBodyFrames) * 0.010
         print("[Tenki Duration Check] 本体: \(tenkiBodySec)s, 1モーラあたり: \((tenkiBodySec / 10.0) * 1000.0) ms")
-        XCTAssertTrue(1.30 <= tenkiBodySec, "天気の発話本体が 1.30 秒未満です: \(tenkiBodySec) 秒")
-        XCTAssertTrue(tenkiBodySec <= 1.70, "天気の発話本体が 1.70 秒を超過しています: \(tenkiBodySec) 秒")
+        XCTAssertTrue(1.45 <= tenkiBodySec, "天気の発話本体が 1.45 秒未満です: \(tenkiBodySec) 秒")
+        XCTAssertTrue(tenkiBodySec <= 1.75, "天気の発話本体が 1.75 秒を超過しています: \(tenkiBodySec) 秒")
+
+        // 受入基準 4: 「水をマレーシアから買わなくてはならないのです」（23モーラ）発話本体は教師モーラ長（145–175 ms/モーラ、本体 3.30–4.00 秒）
+        let lingMizu = engine.lengthRegulator.processText(
+            text: "水をマレーシアから買わなくてはならないのです",
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            addBoundarySilence: true
+        )
+        let mizuLeadSil = Int(lingMizu.durations.first ?? 0)
+        let mizuTrailSil = Int(lingMizu.durations.last ?? 0)
+        let mizuBodyFrames = lingMizu.totalFrames - (mizuLeadSil + mizuTrailSil)
+        let mizuBodySec = Float(mizuBodyFrames) * 0.010
+        let mizuMoraRate = (mizuBodySec / 23.0) * 1000.0
+        print("[Mizuwomare Duration Check] 本体: \(mizuBodySec)s (23モーラ, 1モーラあたり: \(mizuMoraRate) ms), Copy(3.04s, 132ms/モーラ)との差: \(mizuBodySec - 3.04)s")
+        XCTAssertTrue(3.30 <= mizuBodySec, "水をマレーシアの発話本体が 3.30 秒未満です: \(mizuBodySec) 秒")
+        XCTAssertTrue(mizuBodySec <= 4.00, "水をマレーシアの発話本体が 4.00 秒を超過しています: \(mizuBodySec) 秒")
     }
 }

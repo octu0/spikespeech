@@ -71,7 +71,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         self.vocabulary = PhonemeVocabulary()
         self.lengthRegulator = LengthRegulator(
             hiddenDimension: effectiveWeights.inputDim,
-            phonemeAverageDurations: effectiveWeights.phonemeAverageDurations
+            phonemeAverageDurations: effectiveWeights.phonemeAverageDurations,
+            meanFramesPerMora: effectiveWeights.meanFramesPerMora
         )
         self.decoder = SpikingAcousticDecoder(weights: effectiveWeights)
         self.neuralVocoder = NeuralVocoder(weights: vocoderWeights)
