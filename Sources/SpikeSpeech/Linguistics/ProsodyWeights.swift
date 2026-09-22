@@ -206,7 +206,7 @@ public struct F0PredictorWeights: Sendable, Codable, Equatable {
             i += 1
         }
         // なぜ b2 初期値を log(220) ≈ 5.3936 にするか:
-        // 日本語女性話者（JSUT）の実音声平均基本周波数（~220Hz）に対数空間で初期アンカーし、
+        // 実音声平均基本周波数（~220Hz）に対数空間で初期アンカーし、
         // 学習開始直後から有声 F0 MAE が 20〜30Hz 近傍からスタートして速やかに < 20Hz へ収束できるようにするため。
         let b2 = [Float]([logf(220.0)])
 

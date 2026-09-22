@@ -10,7 +10,7 @@ public final class LengthRegulator: Sendable {
     public let meanFramesPerMora: Float
     public static let defaultMeanFramesPerMora: Float = 16.0 // 実測 ~160ms/モーラ
 
-    /// JSUT 5000発話アライメント実測統計に基づく音素 ID 別デフォルト平均継続時間 (1フレーム=10ms)
+    /// アライメント実測統計に基づく音素 ID 別デフォルト平均継続時間 (1フレーム=10ms)
     /// なぜ実測統計をデフォルトとして保持するか:
     /// 16.0 モーラ固定や等時間割りを完全撤廃し、アライメントファイル未ロード時であっても
     /// 実音声データに裏打ちされた自然な物理時間比率（各音素平均）を推論正本とするため。

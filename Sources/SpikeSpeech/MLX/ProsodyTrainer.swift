@@ -82,7 +82,7 @@ public final class MLXF0PredictorModel: Module {
         }
         self._wConv.wrappedValue = MLXArray(defaultConv, [5, hiddenDim])
 
-        // 出力層: 対数周波数を予測するため、バイアス初期値を JSUT 女性実測平均 log(235) ≈ 5.4596 に設定
+        // 出力層: 対数周波数を予測するため、バイアス初期値を 女性実測平均 log(235) ≈ 5.4596 に設定
         // なぜ w2 を全要素 0 ではなく微小な決定論的値で初期化するか:
         // w2 が全要素 0 だと初段 fc1 および wConv への誤差逆伝播勾配 (dLoss/dh = dLoss/dout * w2) が
         // 完全にゼロ消失し、初段特徴量表現が学習されない問題を根本解決するため。

@@ -89,6 +89,15 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
 
                     var t = 0
                     while t < totalFrames {
+                        // 音素先頭フレーム（AudioConfig.pulseChannel = 199 のパルス）で層 0 の膜電位・スパイク・適応変数をリセット
+                        // なぜ音素境界でリセットを行うか:
+                        // 前の音素の再帰結合による約 300ms 周期の自励振動を次の音素へ持ち越すのを物理的に遮断するため。
+                        if AudioConfig.pulseChannel < inDim {
+                            if 0.5 < featuresSeq[t][AudioConfig.pulseChannel] {
+                                layer0.reset()
+                            }
+                        }
+
                         // 1. 直流入力電流の事前計算
                         featuresSeq[t].withUnsafeBufferPointer { fBuf in
                             workspace.inputCurrents.withUnsafeMutableBufferPointer { curBuf in

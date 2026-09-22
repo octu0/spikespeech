@@ -16,14 +16,15 @@ func main() {
     var noShuffle: Bool = false
     var hiddenDim: Int = 256
     var numLayers: Int = 4
-    var inDim: Int = 128
+    var inDim: Int = AudioConfig.acousticInputDim // 256 (Triphone context 64*3 + acoustic features)
     var outDim: Int = AudioConfig.melChannels // 64
     var timeSteps: Int = 4
-    var maxSamples: Int = 50
+    var maxSamples: Int? = nil
     var datasetPath: String? = nil
     var outputPath: String = "Models/weights.json"
     var loadWeightsPath: String? = "Models/weights.json"
     var forceFresh: Bool = false
+    var forceFreshSNN: Bool = false
     var forceInitBOut: Bool = false
     var vocoderEpochs: Int = 5
     var vocoderLearningRate: Float = 0.0003
@@ -35,7 +36,7 @@ func main() {
     var alignmentsPath: String? = nil
 
     func printUsage() {
-        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [-o <output.json>]")
+        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [--fresh-snn] [-o <output.json>]")
     }
 
     var i = 1
@@ -236,6 +237,8 @@ func main() {
             }
         case "--fresh":
             forceFresh = true
+        case "--fresh-snn":
+            forceFreshSNN = true
         case "--init-bout":
             forceInitBOut = true
         case "-h", "--help":
@@ -319,47 +322,71 @@ func main() {
     // なぜ全次元（input, output, hidden, layers）の厳密検査を行うか:
     // CLI 引数で隠れ層次元や層数が変更された場合に、異なるシェイプの重みを誤ロードして
     // 行列積のクラッシュや意図しない旧構造のまま学習が継続される不整合を完全に防止するため。
-    var initialWeights: SpikingNetworkWeights? = nil
-    if forceFresh != true {
-        if let path = loadWeightsPath {
-            if fileManager.fileExists(atPath: path) {
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
-                    if let loaded = try? JSONDecoder().decode(SpikingNetworkWeights.self, from: data) {
-                        // なぜ全アーキテクチャパラメータ（input, output, hidden, layers, timeSteps）を厳密に検証するか:
-                        // SNN BPTT 学習では層数や隠れ層次元だけでなく、時間ステップ数（timeSteps）が異なると
-                        // 膜電位蓄積やスパイク時間統合のダイナミクスが破綻して学習が不能となるため。
-                        let isMatch = (loaded.inputDim == inDim) &&
-                                      (loaded.outputDim == outDim) &&
-                                      (loaded.maxHiddenDim == hiddenDim) &&
-                                      (loaded.numLayers == numLayers) &&
-                                      (loaded.timeSteps == timeSteps)
-                        switch isMatch {
-                        case true:
-                            initialWeights = loaded
-                            print("既存の学習済み重みをロードしました: \(path)")
-                        default:
-                            print("警告: 既存の重みと指定されたアーキテクチャパラメータが一致しません (input: \(loaded.inputDim)vs\(inDim), output: \(loaded.outputDim)vs\(outDim), hidden: \(loaded.maxHiddenDim)vs\(hiddenDim), layers: \(loaded.numLayers)vs\(numLayers), timeSteps: \(loaded.timeSteps)vs\(timeSteps))。新規初期化します。")
-                        }
-                    }
+    // 既存の学習済み重みが存在する場合はロードし、アーキテクチャやウォームスタートの可否を判定する
+    // なぜ SNN 新規初期化時にも既存の重みファイルから韻律・語彙・テンポを読み出すか:
+    // SNN 音響重みの入力次元変更・再学習時に、学習済みの F0 予測器や自然なモーラ速度テーブル、語彙辞書を
+    // 不必要に破棄して音質・抑揚を低下させる事態を防止するため。
+    var loadedExisting: SpikingNetworkWeights? = nil
+    if let path = loadWeightsPath {
+        if fileManager.fileExists(atPath: path) {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+                if let loaded = try? JSONDecoder().decode(SpikingNetworkWeights.self, from: data) {
+                    loadedExisting = loaded
                 }
             }
         }
     }
 
     let weights: SpikingNetworkWeights
-    switch initialWeights {
-    case .some(let w):
-        // なぜ語彙が空の場合にデフォルト語彙を補完するか:
-        // 旧バージョンの重みファイルをロードした際にも語彙を補完し、学習エクスポート時に語彙が消失するのを防ぐため。
-        if w.lexicon.isEmpty != true {
-            weights = w
-        } else {
-            let defaultLex = ViterbiMorphology.loadDefaultLexicon()
-            weights = w.withLexicon(defaultLex)
+    switch loadedExisting {
+    case .some(let loaded):
+        var lex = loaded.lexicon
+        if lex.isEmpty {
+            lex = ViterbiMorphology.loadDefaultLexicon()
+        }
+        let shouldFreshSNN = forceFresh || forceFreshSNN
+        switch shouldFreshSNN {
+        case true:
+            print("既存の韻律 (F0/Duration)・語彙・テンポ重みを保持しつつ、SNN 音響モデル重みのみを新規乱数で初期化しました。")
+            weights = SpikingNetworkWeights.randomWeights(
+                inputDim: inDim,
+                maxHiddenDim: hiddenDim,
+                outputDim: outDim,
+                timeSteps: timeSteps,
+                numLayers: numLayers,
+                seed: 2026,
+                lexicon: lex,
+                prosodyWeights: loaded.prosodyWeights,
+                phonemeAverageDurations: loaded.phonemeAverageDurations,
+                meanFramesPerMora: loaded.meanFramesPerMora
+            )
+        case false:
+            let isMatch = (loaded.inputDim == inDim) &&
+                          (loaded.outputDim == outDim) &&
+                          (loaded.maxHiddenDim == hiddenDim) &&
+                          (loaded.numLayers == numLayers) &&
+                          (loaded.timeSteps == timeSteps)
+            switch isMatch {
+            case true:
+                weights = loaded.withLexicon(lex)
+                print("既存の学習済み重みをロードしました: \(loadWeightsPath ?? "")")
+            case false:
+                print("警告: 既存の重みと指定されたアーキテクチャパラメータが一致しません (input: \(loaded.inputDim)vs\(inDim), output: \(loaded.outputDim)vs\(outDim), hidden: \(loaded.maxHiddenDim)vs\(hiddenDim), layers: \(loaded.numLayers)vs\(numLayers), timeSteps: \(loaded.timeSteps)vs\(timeSteps))。SNN 重みを新規初期化します。")
+                weights = SpikingNetworkWeights.randomWeights(
+                    inputDim: inDim,
+                    maxHiddenDim: hiddenDim,
+                    outputDim: outDim,
+                    timeSteps: timeSteps,
+                    numLayers: numLayers,
+                    seed: 2026,
+                    lexicon: lex,
+                    prosodyWeights: loaded.prosodyWeights,
+                    phonemeAverageDurations: loaded.phonemeAverageDurations,
+                    meanFramesPerMora: loaded.meanFramesPerMora
+                )
+            }
         }
     case .none:
-        // なぜ新規乱数重みにもデフォルト語彙を注入するか:
-        // 新規学習から開始した場合でも、モデル重みに語彙知識を保持・永続化させるため。
         let defaultLex = ViterbiMorphology.loadDefaultLexicon()
         weights = SpikingNetworkWeights.randomWeights(
             inputDim: inDim,
@@ -367,6 +394,7 @@ func main() {
             outputDim: outDim,
             timeSteps: timeSteps,
             numLayers: numLayers,
+            seed: 2026,
             lexicon: defaultLex
         )
         print("新規の決定論的ランダム重みで初期化しました。")
@@ -400,15 +428,33 @@ func main() {
                 print("コーパス内キャッシュから教師 Mel 単調アライメント (MAS) 記録を読み込みました: \(corpusAlignPath) (\(alignmentMap.count) 発話)")
             }
         }
-        if alignmentMap.count < maxSamples {
-            print("キャッシュされたアライメント数 (\(alignmentMap.count)) が要求発話数 (\(maxSamples)) 未満です。教師 Mel 実測平均と 3 周 MAS 反復集計を実行して \(maxSamples) 発話のアライメントを自己生成します...")
+        var needMASGen = alignmentMap.isEmpty
+        if let limit = maxSamples {
+            if alignmentMap.count < limit {
+                needMASGen = true
+            }
+        }
+        if needMASGen {
+            let targetCountStr: String
+            switch maxSamples {
+            case .some(let limit):
+                targetCountStr = "\(limit)"
+            case .none:
+                targetCountStr = "全"
+            }
+            print("キャッシュされたアライメント数 (\(alignmentMap.count)) では不足しているため、教師 Mel 実測平均と 3 周 MAS 反復集計を実行して \(targetCountStr) 発話のアライメントを自己生成します...")
             let wavDir = cleanDatasetPath + "/wav"
             let transcriptPath = cleanDatasetPath + "/transcript_utf8.txt"
             if let tContent = try? String(contentsOfFile: transcriptPath, encoding: .utf8) {
                 let lines = tContent.components(separatedBy: .newlines)
                 var inputItems: [MonotonicAlignmentSearch.AlignmentInputItem] = []
                 var lIdx = 0
-                while lIdx < lines.count && inputItems.count < maxSamples {
+                while lIdx < lines.count {
+                    if let limit = maxSamples {
+                        if limit <= inputItems.count {
+                            break
+                        }
+                    }
                     let line = lines[lIdx].trimmingCharacters(in: .whitespacesAndNewlines)
                     lIdx += 1
                     if line.isEmpty { continue }
@@ -542,8 +588,10 @@ func main() {
         let lines = content.components(separatedBy: .newlines)
         var lineIdx = 0
         while lineIdx < lines.count {
-            if maxSamples <= trainingData.count {
-                break
+            if let limit = maxSamples {
+                if limit <= trainingData.count {
+                    break
+                }
             }
             let line = lines[lineIdx].trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty {
@@ -918,11 +966,77 @@ func main() {
 
         print("  [Epoch \(epoch + 1)/\(epochs)] 平均損失: \(String(format: "%.6f", avgLoss))  lr=\(String(format: "%.6g", lr))  ||wRec||=\(String(format: "%.4f", norms.wRec))  ||wOut||=\(String(format: "%.4f", norms.wOut))")
 
+        // なぜ音素 ID ごとの Mel 誤差を集計・出力するか:
+        // 全体の平均損失 1.24 の減少だけでなく、主要音素（母音・子音・無音）に
+        // 対する音響特徴量が正しく学習されているかを音素単位で客観検証するため。
+        let intermediateWeights = network.exportWeights()
+        let evalDecoder = SpikingAcousticDecoder(weights: intermediateWeights)
+        let evalWorkspace = AcousticWorkspace(
+            maxHiddenDim: intermediateWeights.maxHiddenDim,
+            outputDim: intermediateWeights.outputDim,
+            numLayers: intermediateWeights.numLayers
+        )
+        var phoneLossSums = [Int: Float]()
+        var phoneCounts = [Int: Int]()
+        let evalCount = min(15, trainingData.count)
+        var eIdx = 0
+        while eIdx < evalCount {
+            let p = trainingData[eIdx]
+            let predMel = evalDecoder.decodeSequence(featuresSeq: p.features, workspace: evalWorkspace)
+            let fCount = min(predMel.count, p.targets.count)
+            var f = 0
+            while f < fCount {
+                var pid = 0
+                var ch = 0
+                while ch < 64 {
+                    if 1.5 < p.features[f][ch] {
+                        pid = ch
+                        break
+                    }
+                    ch += 1
+                }
+                var frameL1: Float = 0.0
+                let cMax = min(predMel[f].count, p.targets[f].count)
+                var c = 0
+                while c < cMax {
+                    frameL1 += abs(predMel[f][c] - p.targets[f][c])
+                    c += 1
+                }
+                if 0 < cMax {
+                    frameL1 = frameL1 / Float(cMax)
+                }
+                let curSum = phoneLossSums[pid] ?? 0.0
+                phoneLossSums[pid] = curSum + frameL1
+                let curCnt = phoneCounts[pid] ?? 0
+                phoneCounts[pid] = curCnt + 1
+                f += 1
+            }
+            eIdx += 1
+        }
+        let keyPids: [(Int, String)] = [(1, "sil"), (5, "a"), (6, "i"), (7, "u"), (8, "e"), (9, "o"), (10, "k"), (11, "s"), (12, "t"), (13, "n"), (15, "m"), (17, "r")]
+        var reportParts: [String] = []
+        var kIdx = 0
+        while kIdx < keyPids.count {
+            let item = keyPids[kIdx]
+            let kPid = item.0
+            let kSym = item.1
+            let cnt = phoneCounts[kPid] ?? 0
+            if 0 < cnt {
+                let sumVal = phoneLossSums[kPid] ?? 0.0
+                let avgE = sumVal / Float(cnt)
+                reportParts.append("\(kSym):\(String(format: "%.3f", avgE))")
+            }
+            kIdx += 1
+        }
+        if reportParts.isEmpty != true {
+            print("    [音素別 Mel L1 誤差] " + reportParts.joined(separator: "  "))
+        }
+
         // なぜ最良エポックを記録するか: ログ上でどのエポックが最良だったか即座に判別できるようにするため
         if avgLoss < bestLoss {
             bestLoss = avgLoss
             bestEpoch = epoch + 1
-            bestSNNWeights = network.exportWeights()
+            bestSNNWeights = intermediateWeights
         }
 
         // なぜ毎エポックスナップショットを保存するか:
@@ -931,7 +1045,6 @@ func main() {
             directory: outputDir,
             fileName: WeightCheckpoint.epochFileName(epochOneIndexed: epoch + 1)
         )
-        let intermediateWeights = network.exportWeights()
         do {
             try WeightCheckpoint.atomicWritePretty(intermediateWeights, to: epURL)
         } catch {
@@ -1087,6 +1200,61 @@ func main() {
     } catch {
         print("エラー: 最終重みの書き出しに失敗しました: \(error)")
         return
+    }
+
+    // ------------------------------------------------------------
+    // 受入検証ゲート: 学習発話のアライメント長 SNN Mel 再構成 WAV の生成
+    // ------------------------------------------------------------
+    if trainingData.isEmpty != true {
+        let reconDir = ".tmp/wave15"
+        try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
+        let reconURL = URL(fileURLWithPath: reconDir + "/recon_BASIC5000_0001.wav")
+
+        let reconEngine = SpikeSpeechEngine(weights: exportedWeights)
+        let sample0 = trainingData[0]
+        let snnMel = reconEngine.decoder.decodeSequence(featuresSeq: sample0.features, workspace: reconEngine.workspace)
+
+        let totalF = sample0.features.count
+        var melSeq = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: totalF)
+        var f = 0
+        while f < totalF {
+            if f < snnMel.count {
+                let copyCount = min(AudioConfig.melChannels, snnMel[f].count)
+                melSeq[f].withUnsafeMutableBufferPointer { dst in
+                    snnMel[f].withUnsafeBufferPointer { src in
+                        dst.baseAddress!.update(from: src.baseAddress!, count: copyCount)
+                    }
+                }
+            }
+            f += 1
+        }
+
+        var f0Contour = [Float](repeating: 0.0, count: totalF)
+        var voicedFlags = [Float](repeating: 0.0, count: totalF)
+        f = 0
+        while f < totalF {
+            if 194 < sample0.features[f].count {
+                f0Contour[f] = sample0.features[f][194] * 500.0
+            }
+            if 192 < sample0.features[f].count {
+                voicedFlags[f] = sample0.features[f][192]
+            }
+            f += 1
+        }
+
+        let rawSamples = reconEngine.neuralVocoder.synthesize(
+            mel: melSeq,
+            f0Contour: f0Contour,
+            voicedFlags: voicedFlags,
+            speaker: .zero
+        )
+        let wavData = WavEncoder.encode(samples: rawSamples, sampleRate: AudioConfig.sampleRate)
+        do {
+            try wavData.write(to: reconURL)
+            print("再構成 WAV を出力しました: \(reconURL.path) (\(rawSamples.count) サンプル, \(wavData.count) バイト)")
+        } catch {
+            print("警告: 再構成 WAV 出力失敗: \(error)")
+        }
     }
 
     // 保存ファイルから再ロードして推論 F0 MAE を実測検証（受入基準 3）
@@ -1406,12 +1574,13 @@ func main() {
         } catch {
             print("警告: ニューラルボコーダー重みの保存に失敗しました: \(error)")
         }
-    } else {
-        // なぜ forceFresh 時または破損時にニューラルボコーダー初期重みを再書き出しするか:
-        // 旧アーキテクチャで 100Hz 周期共鳴に過学習したボコーダー重みをクリーンな
-        // He 初期化＋Fant/Rosenberg 音源励起適合重みへ明示的にリセット可能にするため。
-        var needVocoderWrite = forceFresh
-        if needVocoderWrite != true && fileManager.fileExists(atPath: vocoderURL.path) {
+        // なぜボコーダー学習エポックが 0 の場合に既存重みを保持するか:
+        // SNN 再学習時に獲得済みのニューラルボコーダー音響合成重みを破壊せず、
+        // 単一話者（女性）の自然な声質を 100% 確実に維持するため。
+        var needVocoderWrite = false
+        if fileManager.fileExists(atPath: vocoderURL.path) != true {
+            needVocoderWrite = true
+        } else {
             if let existingData = try? Data(contentsOf: vocoderURL) {
                 switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
                 case .some(let savedWeights):
@@ -1423,6 +1592,8 @@ func main() {
                 case .none:
                     needVocoderWrite = true
                 }
+            } else {
+                needVocoderWrite = true
             }
         }
         if needVocoderWrite {

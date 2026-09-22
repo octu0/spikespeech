@@ -437,13 +437,80 @@ final class PipelineTests: XCTestCase {
 
         let encoded = engine.encodeLinguisticFeatures(features: ling)
 
-        XCTAssertEqual(encoded[0][67], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
-        XCTAssertEqual(encoded[1][67], 0.0, accuracy: 1e-4, "有声開始フレームでの deltaF0 は 0.0 であること")
-        XCTAssertEqual(encoded[2][67], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
-        XCTAssertEqual(encoded[3][67], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
-        XCTAssertEqual(encoded[4][67], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[0][195], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[1][195], 0.0, accuracy: 1e-4, "有声開始フレームでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[2][195], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[3][195], 0.0, accuracy: 1e-4, "有声継続一定ピッチでの deltaF0 は 0.0 であること")
+        XCTAssertEqual(encoded[4][195], 0.0, accuracy: 1e-4, "無声フレームでの deltaF0 は 0.0 であること")
 
-        XCTAssertEqual(encoded[0][65], 1.0, accuracy: 1e-4, "無声フレームの ch65 は 1.0 であること")
-        XCTAssertEqual(encoded[2][65], 0.0, accuracy: 1e-4, "有声フレームの ch65 は 0.0 であること")
+        XCTAssertEqual(encoded[0][193], 1.0, accuracy: 1e-4, "無声フレームの ch193 は 1.0 であること")
+        XCTAssertEqual(encoded[2][193], 0.0, accuracy: 1e-4, "有声フレームの ch193 は 0.0 であること")
+    }
+
+    /// 受入基準テスト: 同一の音素 N であっても後続音素 (n vs p) によって直後 one-hot が異なることを検証
+    /// なぜこのテストが必要か:
+    /// 「銀杏」の「んな」と「甲板」の「んぱ」のように、後続子音に応じた調音結合フォルマントの
+    /// 差異を SNN 音響モデルが捉えるための入力文脈分離を数学的に保証するため。
+    func testPhonemeContextTriphoneOneHotDifferences() {
+        let engine = SpikeSpeechEngine()
+
+        // 1. 「かんな」: k (10), a (5), N (24), n (13), a (5)
+        let phoneIdsKanna: [Int32] = [10, 5, 24, 13, 5]
+        let durationsKanna: [Int32] = [2, 4, 3, 2, 4]
+        let totalFKanna = 15
+        let lingKanna = LinguisticFeatures(
+            phoneIds: phoneIdsKanna,
+            durations: durationsKanna,
+            f0Contour: [Float](repeating: 220.0, count: totalFKanna),
+            voicedFlags: [Float](repeating: 1.0, count: totalFKanna),
+            energyContour: [Float](repeating: 0.7, count: totalFKanna),
+            totalFrames: totalFKanna
+        )
+        let encodedKanna = engine.encodeLinguisticFeatures(features: lingKanna)
+
+        // 2. 「かんぱ」: k (10), a (5), N (24), p (23), a (5)
+        let phoneIdsKanpa: [Int32] = [10, 5, 24, 23, 5]
+        let durationsKanpa: [Int32] = [2, 4, 3, 2, 4]
+        let totalFKanpa = 15
+        let lingKanpa = LinguisticFeatures(
+            phoneIds: phoneIdsKanpa,
+            durations: durationsKanpa,
+            f0Contour: [Float](repeating: 220.0, count: totalFKanpa),
+            voicedFlags: [Float](repeating: 1.0, count: totalFKanpa),
+            energyContour: [Float](repeating: 0.7, count: totalFKanpa),
+            totalFrames: totalFKanpa
+        )
+        let encodedKanpa = engine.encodeLinguisticFeatures(features: lingKanpa)
+
+        // N の区間は両発話ともオフセット 2 + 4 = 6 フレーム目から 3 フレーム (f = 6, 7, 8)
+        let frameN = 6
+
+        // 現在の音素 one-hot (ch 0 ..< 64): 両者とも N (id=24) で一致
+        XCTAssertEqual(encodedKanna[frameN][24], 3.0)
+        XCTAssertEqual(encodedKanpa[frameN][24], 3.0)
+
+        // 直前の音素 one-hot (ch 64 ..< 128): 両者とも a (id=5, ch 64+5=69) で一致
+        XCTAssertEqual(encodedKanna[frameN][69], 3.0)
+        XCTAssertEqual(encodedKanpa[frameN][69], 3.0)
+
+        // 直後の音素 one-hot (ch 128 ..< 192):
+        // かんな は n (id=13, ch 128+13=141) が 3.0
+        XCTAssertEqual(encodedKanna[frameN][141], 3.0, accuracy: 1e-4)
+        XCTAssertEqual(encodedKanna[frameN][151], 0.0, accuracy: 1e-4)
+
+        // かんぱ は p (id=23, ch 128+23=151) が 3.0
+        XCTAssertEqual(encodedKanpa[frameN][151], 3.0, accuracy: 1e-4)
+        XCTAssertEqual(encodedKanpa[frameN][141], 0.0, accuracy: 1e-4)
+
+        // 直後音素ベクトル全体の不一致を厳密に検証
+        let nextSliceKanna = Array(encodedKanna[frameN][128..<192])
+        let nextSliceKanpa = Array(encodedKanpa[frameN][128..<192])
+        XCTAssertNotEqual(nextSliceKanna, nextSliceKanpa, "同一音素 N に対する直後音素 one-hot ベクトルが同一です（分離失敗）")
+
+        // 文頭 (frame 0: k) の直前音素が <sil> (id=1, ch 64+1=65) であること
+        XCTAssertEqual(encodedKanna[0][65], 3.0, accuracy: 1e-4, "文頭音素の直前は <sil> であること")
+
+        // 文末 (frame 14: a) の直後音素が <sil> (id=1, ch 128+1=129) であること
+        XCTAssertEqual(encodedKanna[14][129], 3.0, accuracy: 1e-4, "文末音素の直後は <sil> であること")
     }
 }

@@ -9,6 +9,8 @@ public struct AudioConfig: Sendable {
     public static let hopSize: Int = 160      // 10ミリ秒周期、16kHzで160サンプル
     public static let frameSize: Int = 320    // 20ミリ秒長、16kHzで320サンプル
     public static let melChannels: Int = 64
+    public static let acousticInputDim: Int = 256
+    public static let pulseChannel: Int = 199
 }
 
 

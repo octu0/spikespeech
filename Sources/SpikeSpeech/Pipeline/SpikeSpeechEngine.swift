@@ -40,7 +40,28 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             }
             switch loaded {
             case .some(let w):
-                baseWeights = w
+                let isInputDimMatch = (w.inputDim == AudioConfig.acousticInputDim)
+                switch isInputDimMatch {
+                case true:
+                    baseWeights = w
+                case false:
+                    var lex = w.lexicon
+                    if lex.isEmpty {
+                        lex = ViterbiMorphology.loadDefaultLexicon()
+                    }
+                    baseWeights = SpikingNetworkWeights.randomWeights(
+                        inputDim: AudioConfig.acousticInputDim,
+                        maxHiddenDim: w.maxHiddenDim,
+                        outputDim: w.outputDim,
+                        timeSteps: w.timeSteps,
+                        numLayers: w.numLayers,
+                        seed: 2026,
+                        lexicon: lex,
+                        prosodyWeights: w.prosodyWeights,
+                        phonemeAverageDurations: w.phonemeAverageDurations,
+                        meanFramesPerMora: w.meanFramesPerMora
+                    )
+                }
             case .none:
                 baseWeights = SpikingNetworkWeights.randomWeights()
             }
@@ -114,6 +135,19 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 continue
             }
 
+            // 直前・直後の音素 ID を取得（文頭・文末は境界無音 <sil> id=1 とする）
+            // なぜ前後の音素文脈を注入するか:
+            // 同一の音素（例: 撥音 N）であっても後続する子音（n, p 等）により調音結合（Coarticulation）の
+            // 物理的スペクトルフォルマントが大きく異なるため、前後の音素コンテキストを明示的に与えて音響モデルに識別させるため。
+            var prevPid: Int = PhonemeVocabulary.silId
+            if 0 < p {
+                prevPid = Int(features.phoneIds[p - 1])
+            }
+            var nextPid: Int = PhonemeVocabulary.silId
+            if (p + 1) < phoneCount {
+                nextPid = Int(features.phoneIds[p + 1])
+            }
+
             var f = 0
             while f < duration {
                 let frameIdx = currentFrameOffset + f
@@ -134,8 +168,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     f0 = 0.0
                 }
 
-                // 1. 音素 ID の One-Hot 符号化
-                // 背景電流に埋もれず膜電位の閾値を確実に突破できるよう、音素発火電流を注入する
+                // 1. 現在の音素 ID の One-Hot 符号化 (ch 0 ..< 64)
                 if 0 <= pid {
                     if pid < 64 {
                         if pid < inDim {
@@ -144,16 +177,36 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     }
                 }
 
-                // 2. 韻律および音響生理学的特徴の付加
-                if 64 < inDim {
-                    seq[frameIdx][64] = voiced * 1.0
+                // 2. 直前の音素 ID の One-Hot 符号化 (ch 64 ..< 128)
+                if 0 <= prevPid {
+                    if prevPid < 64 {
+                        let prevCh = 64 + prevPid
+                        if prevCh < inDim {
+                            seq[frameIdx][prevCh] = 3.0
+                        }
+                    }
                 }
-                if 65 < inDim {
-                    // ch64 の有声度に対する直交抑制電流として機能させる無声度 (1.0 - voiced)
+
+                // 3. 直後の音素 ID の One-Hot 符号化 (ch 128 ..< 192)
+                if 0 <= nextPid {
+                    if nextPid < 64 {
+                        let nextCh = 128 + nextPid
+                        if nextCh < inDim {
+                            seq[frameIdx][nextCh] = 3.0
+                        }
+                    }
+                }
+
+                // 4. 韻律および音響生理学的特徴の付加 (ch 192 ..< 199)
+                if 192 < inDim {
+                    seq[frameIdx][192] = voiced * 1.0
+                }
+                if 193 < inDim {
+                    // 有声度に対する直交抑制電流として機能させる無声度 (1.0 - voiced)
                     let unvoiced = 1.0 - voiced
-                    seq[frameIdx][65] = unvoiced * 1.0
+                    seq[frameIdx][193] = unvoiced * 1.0
                 }
-                if 66 < inDim {
+                if 194 < inDim {
                     var normF0 = f0 / 500.0
                     if normF0 < 0.0 {
                         normF0 = 0.0
@@ -161,12 +214,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1.0 < normF0 {
                         normF0 = 1.0
                     }
-                    // F0 ピッチ周波数を 500Hz 基準で [0.0, 1.0] に安全正規化して供給
-                    seq[frameIdx][66] = normF0 * 1.0
+                    seq[frameIdx][194] = normF0 * 1.0
                 }
-                if 67 < inDim {
-                    // なぜ前フレーム F0 との差分を 50Hz スケールでクリップするか:
-                    // 急峻なピッチ変動（抑揚アクセント境界）を SNN に直接知らせるため。
+                if 195 < inDim {
                     var deltaF0: Float = 0.0
                     if 0.5 <= voiced && 0 < frameIdx {
                         let prevIdx = frameIdx - 1
@@ -190,17 +240,20 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1.0 < clampedDelta {
                         clampedDelta = 1.0
                     }
-                    seq[frameIdx][67] = clampedDelta * 1.0
+                    seq[frameIdx][195] = clampedDelta * 1.0
                 }
-                if 68 < inDim {
-                    let progress = Float(f) / Float(max(1, duration))
-                    seq[frameIdx][68] = progress * 1.0
+                if 196 < inDim {
+                    var phonePos: Float = 0.0
+                    if 1 < duration {
+                        phonePos = Float(f) / Float(duration - 1)
+                    }
+                    seq[frameIdx][196] = phonePos * 1.0
                 }
-                if 69 < inDim {
+                if 197 < inDim {
                     let rate = 10.0 / Float(max(1, duration))
-                    seq[frameIdx][69] = min(1.0, rate) * 1.0
+                    seq[frameIdx][197] = min(1.0, rate) * 1.0
                 }
-                if 70 < inDim {
+                if 198 < inDim {
                     var engVal: Float = 0.50
                     if frameIdx < features.energyContour.count {
                         engVal = features.energyContour[frameIdx]
@@ -208,7 +261,14 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1.0 < engVal {
                         engVal = 1.0
                     }
-                    seq[frameIdx][70] = engVal * 1.0
+                    seq[frameIdx][198] = engVal * 1.0
+                }
+                if 199 < inDim {
+                    var pulse: Float = 0.0
+                    if f == 0 {
+                        pulse = 1.0
+                    }
+                    seq[frameIdx][199] = pulse * 1.0
                 }
 
                 f += 1

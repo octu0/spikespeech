@@ -50,7 +50,7 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
 
     public init(
         numLayers: Int = 4,
-        inputDim: Int = 128,
+        inputDim: Int = AudioConfig.acousticInputDim,
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
@@ -255,6 +255,18 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         while t < seqLen {
             let current0_t = currentSeq0[0..., t, 0...]
             var readoutSum = MLXArray.zeros([batchSize, hSize])
+
+            // 音素境界での層 0 膜電位・スパイク・適応変数リセット
+            // なぜ音素境界でリセットを行うか:
+            // 前の音素の再帰結合による約 300ms 周期の自励振動を次の音素へ持ち越すのを物理的に遮断するため。
+            if AudioConfig.pulseChannel < inputDim {
+                let pulseCh = AudioConfig.pulseChannel
+                let pulse = features[0..., t, pulseCh..<(pulseCh + 1)]
+                let resetFactor = 1.0 - pulse
+                v0 = v0 * resetFactor
+                s0 = s0 * resetFactor
+                a0 = a0 * resetFactor
+            }
 
             if (t % bpttWindow) == 0 {
                 v0 = stopGradient(v0)

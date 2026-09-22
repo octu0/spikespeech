@@ -440,7 +440,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     /// 外部事前学習重みファイルが存在しない環境でも、スケーリング則に準拠した安定した多層重みを決定論的に初期化し、再現性のある推論および学習を可能にする。
     public static func randomWeights(
-        inputDim: Int = 128,
+        inputDim: Int = AudioConfig.acousticInputDim,
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
@@ -469,7 +469,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     /// 標準多層初期化メソッド
     public static func standardInit(
-        inputDim: Int = 128,
+        inputDim: Int = AudioConfig.acousticInputDim,
         maxHiddenDim: Int = 1024,
         outputDim: Int = 80,
         timeSteps: Int = 4,
