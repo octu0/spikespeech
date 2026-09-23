@@ -513,4 +513,97 @@ final class PipelineTests: XCTestCase {
         // 文末 (frame 14: a) の直後音素が <sil> (id=1, ch 128+1=129) であること
         XCTAssertEqual(encodedKanna[14][129], 3.0, accuracy: 1e-4, "文末音素の直後は <sil> であること")
     }
+
+    /// 受入基準検証: 長音符「ー」が 2文字拗音判定に誤爆せず独立したモーラとして維持されること
+    func testKanaToMorasDoesNotMergeProlongedSound() {
+        let vocab = PhonemeVocabulary()
+
+        // 「いい」のモーラ分割（長音化後「いー」となっても 2 モーラであること）
+        let morasIi = vocab.kanaToMoras("いい")
+        XCTAssertEqual(morasIi.count, 2, "「いい」が 2 モーラとして分割されていません: count=\(morasIi.count)")
+
+        // 「いー」のモーラ分割
+        let morasI_ = vocab.kanaToMoras("いー")
+        XCTAssertEqual(morasI_.count, 2, "「いー」が 2 モーラとして分割されていません: count=\(morasI_.count)")
+
+        // 「きょう」のモーラ分割（「きょ」と「ー」の 2 モーラ）
+        let morasKyo = vocab.kanaToMoras("きょう")
+        XCTAssertEqual(morasKyo.count, 2, "「きょう」が 2 モーラとして分割されていません: count=\(morasKyo.count)")
+        XCTAssertEqual(morasKyo[0].text, "きょ")
+
+        // 「きょうはいい天気です」（10 モーラ）
+        let normalizer = TextNormalizer(morphology: ViterbiMorphology())
+        let morphemes = normalizer.normalize(text: "今日はいい天気です")
+        let prosodyModel = ProsodyModel()
+        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocab)
+        let totalMoras = phrases.reduce(0) { $0 + $1.moras.count }
+        XCTAssertEqual(totalMoras, 10, "「今日はいい天気です」の総モーラ数が 10 ではありません: \(totalMoras)")
+    }
+
+    /// 受入基準検証: 推論本体フレーム合計が round(meanFramesPerMora × モーラ数) に厳格一致すること
+    func testSpeechBodyDurationExactMatchAcceptanceCriteria() throws {
+        var weights = SpikingNetworkWeights.standardInit(inputDim: 256, maxHiddenDim: 256, numLayers: 4)
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: "Models/weights.json")),
+           let loaded = try? JSONDecoder().decode(SpikingNetworkWeights.self, from: data) {
+            weights = loaded
+        }
+        let engine = SpikeSpeechEngine(weights: weights)
+
+        // 1. 「今日はいい天気です」: 10 モーラ × 16 フレーム = 160 フレーム (1.60 秒)
+        // 受入基準: 発話本体 1.45–1.75 秒
+        let textTenki = "今日はいい天気です"
+        let featuresTenki = engine.lengthRegulator.processText(
+            text: textTenki,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            applyFluctuation: true,
+            addBoundarySilence: true
+        )
+        // 先頭・末尾の境界無音（<sil>: ID=1）を除いた発話本体フレーム数を算出
+        var bodyFramesTenki = 0
+        var fIdx = 0
+        while fIdx < featuresTenki.phoneIds.count {
+            let pid = featuresTenki.phoneIds[fIdx]
+            if pid != Int32(PhonemeVocabulary.silId) {
+                bodyFramesTenki += Int(featuresTenki.durations[fIdx])
+            }
+            fIdx += 1
+        }
+        let bodySecTenki = Float(bodyFramesTenki) / 100.0
+        print("[受入基準検証] 「今日はいい天気です」 発話本体: \(bodyFramesTenki) frames (\(bodySecTenki)s), 全体: \(featuresTenki.totalFrames) frames (\(Float(featuresTenki.totalFrames)/100.0)s)")
+        XCTAssertTrue(145 <= bodyFramesTenki, "天気の本体フレーム数 \(bodyFramesTenki) が 145 未満です")
+        XCTAssertTrue(bodyFramesTenki <= 175, "天気の本体フレーム数 \(bodyFramesTenki) が 175 超です")
+        XCTAssertEqual(bodyFramesTenki, 160, "天気の本体フレーム数が目標 160 (10モーラ×16) と完全一致していません")
+
+        // 2. 「こんにちは」: 5 モーラ × 16 フレーム = 80 フレーム (0.80 秒)
+        // 受入基準: 発話本体 0.70–0.95 秒
+        let textKonnichiwa = "こんにちは"
+        let featuresKonnichiwa = engine.lengthRegulator.processText(
+            text: textKonnichiwa,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            applyFluctuation: true,
+            addBoundarySilence: true
+        )
+        var bodyFramesKonnichiwa = 0
+        fIdx = 0
+        while fIdx < featuresKonnichiwa.phoneIds.count {
+            let pid = featuresKonnichiwa.phoneIds[fIdx]
+            if pid != Int32(PhonemeVocabulary.silId) {
+                bodyFramesKonnichiwa += Int(featuresKonnichiwa.durations[fIdx])
+            }
+            fIdx += 1
+        }
+        let bodySecKonnichiwa = Float(bodyFramesKonnichiwa) / 100.0
+        print("[受入基準検証] 「こんにちは」 発話本体: \(bodyFramesKonnichiwa) frames (\(bodySecKonnichiwa)s), 全体: \(featuresKonnichiwa.totalFrames) frames (\(Float(featuresKonnichiwa.totalFrames)/100.0)s)")
+        XCTAssertTrue(70 <= bodyFramesKonnichiwa, "こんにちは本体フレーム数 \(bodyFramesKonnichiwa) が 70 未満です")
+        XCTAssertTrue(bodyFramesKonnichiwa <= 95, "こんにちは本体フレーム数 \(bodyFramesKonnichiwa) が 95 超です")
+        XCTAssertEqual(bodyFramesKonnichiwa, 80, "こんにちは本体フレーム数が目標 80 (5モーラ×16) と完全一致していません")
+    }
 }

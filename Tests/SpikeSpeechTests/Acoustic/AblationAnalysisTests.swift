@@ -349,7 +349,9 @@ final class AblationAnalysisTests: XCTestCase {
         let wavData = WavEncoder.encode(samples: samples)
         let outPath = ".tmp/wave15/test_aligned_snn.wav"
         try wavData.write(to: URL(fileURLWithPath: outPath))
-        print("[Aligned SNN WAV] 出力完了: \(outPath) (\(samples.count) samples, \(Float(samples.count)/16000.0)s)")
+        let reconPath = ".tmp/wave15/recon_BASIC5000_0001.wav"
+        try wavData.write(to: URL(fileURLWithPath: reconPath))
+        print("[Aligned SNN WAV] 出力完了: \(outPath) および \(reconPath) (\(samples.count) samples, \(Float(samples.count)/16000.0)s)")
     }
 
     /// こんにちはの音素・Duration・無音マスク・F0の詳細調査

@@ -578,6 +578,7 @@ func main() {
     // コーパス読み込み
     let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]])] = []
+    var reconTargetSample: (features: [[Float]], targets: [[Float]])? = nil
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
     var prosodySamples: [ProsodyTrainingSample] = []
 
@@ -741,6 +742,9 @@ func main() {
                             alignment: effectiveAlign
                         ) {
                             trainingData.append(pair)
+                            if id == "BASIC5000_0001" {
+                                reconTargetSample = pair
+                            }
                             let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
                             let pitchResult = pitchTracker.track(pcm: pcm16k)
                             vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
@@ -1211,7 +1215,7 @@ func main() {
         let reconURL = URL(fileURLWithPath: reconDir + "/recon_BASIC5000_0001.wav")
 
         let reconEngine = SpikeSpeechEngine(weights: exportedWeights)
-        let sample0 = trainingData[0]
+        let sample0 = reconTargetSample ?? trainingData[0]
         let snnMel = reconEngine.decoder.decodeSequence(featuresSeq: sample0.features, workspace: reconEngine.workspace)
 
         let totalF = sample0.features.count

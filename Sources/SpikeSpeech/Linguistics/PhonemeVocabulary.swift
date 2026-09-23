@@ -460,17 +460,29 @@ public struct PhonemeVocabulary: Sendable {
                 break
             }
 
-            // 2文字拗音
+            // 2文字拗音（2文字目が小書き文字の場合のみ判定し、長音符「ー」や母音の誤合体を防止する）
             if (i + 1) < count {
-                let pair = String([c, chars[i + 1]])
-                let phonemeStrs = kanaToPhonemes(pair)
-                if phonemeStrs.count == 2 {
-                    let pTokens = phonemeStrs.map { sym in
-                        PhonemeToken(id: id(for: sym), symbol: sym, category: category(for: sym))
+                let nextC = chars[i + 1]
+                var isSmallChar = false
+                switch nextC {
+                case "ぁ", "ぃ", "ぅ", "ぇ", "ぉ", "ゃ", "ゅ", "ょ", "ゎ",
+                     "ァ", "ィ", "ゥ", "ェ", "ォ", "ャ", "ュ", "ョ", "ヮ":
+                    isSmallChar = true
+                default:
+                    break
+                }
+
+                if isSmallChar {
+                    let pair = String([c, nextC])
+                    let phonemeStrs = kanaToPhonemes(pair)
+                    if phonemeStrs.count == 2 {
+                        let pTokens = phonemeStrs.map { sym in
+                            PhonemeToken(id: id(for: sym), symbol: sym, category: category(for: sym))
+                        }
+                        moras.append(MoraToken(text: pair, phonemes: pTokens))
+                        i += 2
+                        continue
                     }
-                    moras.append(MoraToken(text: pair, phonemes: pTokens))
-                    i += 2
-                    continue
                 }
             }
 
