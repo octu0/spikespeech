@@ -893,6 +893,8 @@ func main() {
     var bestLoss = Float.greatestFiniteMagnitude
     var bestEpoch = -1
     var bestSNNWeights: SpikingNetworkWeights = effectiveWeights
+    var plateauAnchorLoss: Float = Float.greatestFiniteMagnitude
+    var stagnantEpochs: Int = 0
 
     let outputURL = URL(fileURLWithPath: outputPath)
     let outputDir = outputURL.deletingLastPathComponent().path
@@ -1053,6 +1055,20 @@ func main() {
             try WeightCheckpoint.atomicWritePretty(intermediateWeights, to: epURL)
         } catch {
             print("警告: エポックスナップショット保存失敗 (\(epURL.path)): \(error)")
+        }
+
+        // 早期停止判定（設計者指示: 10 エポック連続で損失が 0.01 以上減少しない、かつ 1.15 超なら停止して ASK）
+        if plateauAnchorLoss - avgLoss < 0.01 {
+            stagnantEpochs += 1
+        } else {
+            plateauAnchorLoss = avgLoss
+            stagnantEpochs = 0
+        }
+
+        if 10 <= stagnantEpochs && 1.15 < avgLoss {
+            print("【早期停止】10 エポック連続で損失改善が 0.01 未満でした（現在損失: \(String(format: "%.6f", avgLoss)), 基準損失: \(String(format: "%.6f", plateauAnchorLoss))）。学習を安全に停止します。")
+            epoch += 1
+            break
         }
 
         epoch += 1
