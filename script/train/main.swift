@@ -739,10 +739,20 @@ func main() {
                             pcm16k: pcm16k,
                             melExtractor: melExtractor,
                             pitchTracker: pitchTracker,
-                            alignment: effectiveAlign
+                            alignment: effectiveAlign,
+                            useScaledDuration: true
                         ) {
                             trainingData.append(pair)
-                            if id == "BASIC5000_0001" {
+                            if let reconPair = engine.prepareTrainingPair(
+                                text: text,
+                                pcm16k: pcm16k,
+                                melExtractor: melExtractor,
+                                pitchTracker: pitchTracker,
+                                alignment: effectiveAlign,
+                                useScaledDuration: false
+                            ) {
+                                reconTargetSample = reconPair
+                            } else {
                                 reconTargetSample = pair
                             }
                             let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
@@ -1190,7 +1200,7 @@ func main() {
             var rawAvg = sum / cnt
             if rawAvg < 1.0 { rawAvg = 1.0 }
             // なぜ実測平均フレーム数そのままを推論正本とするか:
-            // 実音声コーパス（JSUT basic5000）の音素アライメントと 100% 同一のフレーム持続時間で推論させることで、
+            // 実音声コーパスの音素アライメントと 100% 同一のフレーム持続時間で推論させることで、
             // SNN の膜電位飽和やフォルマント歪みを根絶し、会話速度基準（こんにちは本体 0.70〜0.95s、天気 1.3〜1.6s）を達成するため。
             let scaledAvg = roundf(rawAvg * 10.0) / 10.0
             phonemeAverages[pid] = max(1.0, scaledAvg)
@@ -1228,7 +1238,7 @@ func main() {
     if trainingData.isEmpty != true {
         let reconDir = ".tmp/wave15"
         try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
-        let reconURL = URL(fileURLWithPath: reconDir + "/recon_BASIC5000_0001.wav")
+        let reconURL = URL(fileURLWithPath: reconDir + "/recon_5000_0001.wav")
 
         let reconEngine = SpikeSpeechEngine(weights: exportedWeights)
         let sample0 = reconTargetSample ?? trainingData[0]

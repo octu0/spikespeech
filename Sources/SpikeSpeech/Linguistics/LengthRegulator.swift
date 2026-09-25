@@ -16,32 +16,32 @@ public final class LengthRegulator: Sendable {
     /// 実音声データに裏打ちされた自然な物理時間比率（各音素平均）を推論正本とするため。
     public static let defaultPhonemeAverageDurations: [Int32: Float] = [
         1: 10.0,  // <sil>
-        5: 6.4,   // a
-        6: 5.1,   // i
-        7: 5.4,   // u
-        8: 6.1,   // e
-        9: 6.4,   // o
-        10: 13.2, // k
-        11: 4.4,  // s
-        12: 12.9, // t
+        5: 8.5,   // a
+        6: 5.4,   // i
+        7: 4.3,   // u
+        8: 5.8,   // e
+        9: 7.5,   // o
+        10: 8.1,  // k
+        11: 8.1,  // s
+        12: 7.1,  // t
         13: 5.7,  // n
         14: 4.5,  // h
         15: 7.3,  // m
         16: 5.6,  // y
         17: 6.8,  // r
-        18: 5.1,  // w
-        19: 12.5, // g
+        18: 8.9,  // w
+        19: 7.0,  // g
         20: 4.0,  // z
-        21: 13.4, // d
-        22: 12.8, // b
-        23: 12.3, // p
-        24: 25.7, // N (撥音: ん)
-        25: 9.6,  // Q (促音: っ)
-        26: 5.4,  // _ (長音: ー)
+        21: 5.8,  // d
+        22: 6.5,  // b
+        23: 6.0,  // p
+        24: 7.7,  // N (撥音: ん)
+        25: 10.7, // Q (促音: っ)
+        26: 9.3,  // _ (長音: ー)
         27: 3.1,  // sh
         28: 2.5,  // ch
         29: 2.4,  // ts
-        30: 2.5,  // ky
+        30: 8.9,  // ky
         31: 2.2,  // ny
         32: 2.4,  // hy
         33: 2.4,  // my
@@ -107,28 +107,20 @@ public final class LengthRegulator: Sendable {
         return scaled
     }
 
-    /// アクセント句列からデータ駆動型の自然なモーラ C/V 比率音素継続フレーム系列を算出する（推論正本）
+    /// アクセント句列から実測音素平均の比率を維持したまま、文全体を会話速度（meanFramesPerMora × モーラ数）へスケーリングした継続フレーム系列を算出する（推論正本）
     ///
-    /// なぜモーラ C/V 比率モデルとするか:
-    /// 音素ごとに孤立した平均値を単純加算すると発話速度が 126〜143ms/モーラに短縮して早口化するため、
-    /// 学習データ実測のモーラ長（meanFramesPerMora = 約 160ms/モーラ）を目標モーラ長として固定し、
-    /// モーラ内の音素平均テーブルを比率の重みとしてのみ使用して厳密に比例配分する。
+    /// なぜ文全体線形スケーリングとするか:
+    /// モーラごとの均等割り（16フレーム箱）は音素間の自然な比率を破壊し、一方単純加算は母音短縮により早口化を招くため、
+    /// MAS 反復自己収束で計測された各音素の精密な比率（子音閉鎖、母音、撥音、促音、長音）を 100% 保持したまま、
+    /// 文全体に単一の共通係数を乗じて発話本体を目標会話速度（meanFramesPerMora × モーラ数）に合致させる。
     public func computeDataDrivenDurations(
         phrases: [AccentPhrase],
         speedFactor: Float = 1.0,
         applyFluctuation: Bool = true,
         text: String = ""
     ) -> [Float] {
+        var rawDurations: [Float] = []
         var totalMoras = 0
-        var pIdx = 0
-        while pIdx < phrases.count {
-            totalMoras += phrases[pIdx].moras.count
-            pIdx += 1
-        }
-        if totalMoras <= 0 {
-            return []
-        }
-
         var safeSpeed = speedFactor
         if safeSpeed.isFinite != true {
             safeSpeed = 1.0
@@ -140,107 +132,55 @@ public final class LengthRegulator: Sendable {
             safeSpeed = 10.0
         }
 
-        var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
-        var rawDurations: [Float] = []
-
-        // 1 モーラ目標フレーム数 (教師会話速度: meanFramesPerMora / safeSpeed、実測 約 16.0 フレーム = 160ms)
-        let targetMoraFrames = meanFramesPerMora / safeSpeed
-
-        // 全モーラの tempoScale を事前に収集し、総和が目標フレーム総量と厳密に一致するよう正規化
-        var moraScales: [Float] = []
-        var sumScales: Float = 0.0
-        var moraCountScan = 0
-        while moraCountScan < totalMoras {
-            var scale: Float = 1.0
-            if applyFluctuation {
-                scale = bioFluctuation.computeTempoScale()
-            }
-            moraScales.append(scale)
-            sumScales += scale
-            moraCountScan += 1
-        }
-        var scaleNormFactor: Float = 1.0
-        if 0.001 < sumScales {
-            scaleNormFactor = Float(totalMoras) / sumScales
-        }
-
-        var globalMoraIdx = 0
-        pIdx = 0
+        var pIdx = 0
         while pIdx < phrases.count {
             let phrase = phrases[pIdx]
-            let isLastPhrase = (pIdx + 1) == phrases.count
+            totalMoras += phrase.moras.count
             var mIdx = 0
             while mIdx < phrase.moras.count {
                 let mora = phrase.moras[mIdx]
-                let isLastMora = (mIdx + 1) == phrase.moras.count
-                var shouldLengthen = false
-                if isLastMora {
-                    if phrase.pauseAfter || isLastPhrase {
-                        shouldLengthen = true
-                    }
+                var phIdx = 0
+                while phIdx < mora.phonemes.count {
+                    let token = mora.phonemes[phIdx]
+                    let avgDur = phonemeDuration(phoneId: Int32(token.id), speedFactor: safeSpeed)
+                    rawDurations.append(avgDur)
+                    phIdx += 1
                 }
-
-                // モーラ内各音素の重みを算出（音素平均テーブルの値を相対重みとして使用）
-                var weights: [Float] = []
-                var rIdx = 0
-                while rIdx < mora.phonemes.count {
-                    let token = mora.phonemes[rIdx]
-                    var w = phonemeDuration(phoneId: Int32(token.id), speedFactor: 1.0)
-                    if shouldLengthen {
-                        switch token.category {
-                        case .vowel, .nasalSyllable, .prolonged:
-                            w *= 1.15
-                        default:
-                            break
-                        }
-                    }
-                    weights.append(w)
-                    rIdx += 1
-                }
-
-                var moraWeightSum: Float = 0.0
-                var wSumIdx = 0
-                while wSumIdx < weights.count {
-                    moraWeightSum += weights[wSumIdx]
-                    wSumIdx += 1
-                }
-                let safeWeightSum: Float
-                if moraWeightSum <= 0.001 {
-                    safeWeightSum = 1.0
-                } else {
-                    safeWeightSum = moraWeightSum
-                }
-
-                var normalizedTempoScale: Float = 1.0
-                if globalMoraIdx < moraScales.count {
-                    normalizedTempoScale = moraScales[globalMoraIdx] * scaleNormFactor
-                }
-                globalMoraIdx += 1
-
-                let effectiveMoraFrames = targetMoraFrames * normalizedTempoScale
-
-                var wIdx = 0
-                while wIdx < weights.count {
-                    // モーラ内の音素重み比率に応じて目標モーラ長を厳密に比例配分
-                    let ratio = weights[wIdx] / safeWeightSum
-                    var d = effectiveMoraFrames * ratio
-                    if d < 1.0 {
-                        d = 1.0
-                    }
-                    rawDurations.append(d)
-                    wIdx += 1
-                }
-
                 mIdx += 1
-            }
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                let safePause = min(10.0, Float(phrase.pauseDurationFrames)) / safeSpeed
-                rawDurations.append(safePause)
             }
             pIdx += 1
         }
 
-        return rawDurations
+        if rawDurations.isEmpty || totalMoras <= 0 {
+            return rawDurations
+        }
+
+        var rawSum: Float = 0.0
+        var rI = 0
+        while rI < rawDurations.count {
+            rawSum += rawDurations[rI]
+            rI += 1
+        }
+
+        // 目標本体フレーム数 (meanFramesPerMora / safeSpeed * totalMoras)
+        let targetBodyFrames = (meanFramesPerMora / safeSpeed) * Float(totalMoras)
+        var scaleFactor: Float = 1.0
+        if 0.001 < rawSum {
+            scaleFactor = targetBodyFrames / rawSum
+        }
+
+        var scaledDurations: [Float] = []
+        var sI = 0
+        while sI < rawDurations.count {
+            var d = rawDurations[sI] * scaleFactor
+            if d < 1.0 {
+                d = 1.0
+            }
+            scaledDurations.append(d)
+            sI += 1
+        }
+
+        return scaledDurations
     }
 
     /// 実数予測継続時間列から累積丸め誤差ゼロの整数フレーム系列を算出する
@@ -434,129 +374,10 @@ public final class LengthRegulator: Sendable {
                 }
                 mIdx += 1
             }
-            if phrases[pIdx].pauseAfter && 0 < phrases[pIdx].pauseDurationFrames {
-                if qIdx < quantizedDurations.count {
-                    phrases[pIdx].pauseDurationFrames = quantizedDurations[qIdx]
-                    qIdx += 1
-                }
-            }
             pIdx += 1
         }
 
-        // 4.5. 発話本体フレーム数の厳格一致と端数の母音配分（設計者指示: round(meanFramesPerMora × モーラ数) に厳密一致）
-        var totalMorasInPhrases = 0
-        var actualBodyFrames = 0
-        pIdx = 0
-        while pIdx < phrases.count {
-            totalMorasInPhrases += phrases[pIdx].moras.count
-            var mIdx = 0
-            while mIdx < phrases[pIdx].moras.count {
-                var phIdx = 0
-                while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
-                    actualBodyFrames += phrases[pIdx].moras[mIdx].phonemes[phIdx].durationFrames
-                    phIdx += 1
-                }
-                mIdx += 1
-            }
-            pIdx += 1
-        }
-
-        if 0 < totalMorasInPhrases {
-            let targetBodyFrames = Int(roundf((meanFramesPerMora / safeSpeedFactor) * Float(totalMorasInPhrases)))
-            var frameDiff = targetBodyFrames - actualBodyFrames
-
-            // 不足しているフレーム数を母音・撥音・長音に先頭から 1 ずつ加算
-            if 0 < frameDiff {
-                while 0 < frameDiff {
-                    var addedInPass = false
-                    pIdx = 0
-                    while pIdx < phrases.count {
-                        var mIdx = 0
-                        while mIdx < phrases[pIdx].moras.count {
-                            var phIdx = 0
-                            while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
-                                if 0 < frameDiff {
-                                    let cat = phrases[pIdx].moras[mIdx].phonemes[phIdx].category
-                                    var isVowelLike = false
-                                    switch cat {
-                                    case .vowel, .nasalSyllable, .prolonged:
-                                        isVowelLike = true
-                                    default:
-                                        break
-                                    }
-                                    if isVowelLike {
-                                        phrases[pIdx].moras[mIdx].phonemes[phIdx].durationFrames += 1
-                                        frameDiff -= 1
-                                        addedInPass = true
-                                    }
-                                }
-                                phIdx += 1
-                            }
-                            mIdx += 1
-                        }
-                        pIdx += 1
-                    }
-                    if addedInPass != true {
-                        // 母音が見当たらない場合は最後の音素に加算
-                        if 0 < phrases.count {
-                            let lastP = phrases.count - 1
-                            if 0 < phrases[lastP].moras.count {
-                                let lastM = phrases[lastP].moras.count - 1
-                                if 0 < phrases[lastP].moras[lastM].phonemes.count {
-                                    let lastPh = phrases[lastP].moras[lastM].phonemes.count - 1
-                                    phrases[lastP].moras[lastM].phonemes[lastPh].durationFrames += frameDiff
-                                    frameDiff = 0
-                                }
-                            }
-                        }
-                        break
-                    }
-                }
-            }
-
-            // 超過しているフレーム数を 2 フレーム以上の母音から減算
-            if frameDiff < 0 {
-                var excess = -frameDiff
-                while 0 < excess {
-                    var reducedInPass = false
-                    pIdx = 0
-                    while pIdx < phrases.count {
-                        var mIdx = 0
-                        while mIdx < phrases[pIdx].moras.count {
-                            var phIdx = 0
-                            while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
-                                if 0 < excess {
-                                    let cat = phrases[pIdx].moras[mIdx].phonemes[phIdx].category
-                                    var isVowelLike = false
-                                    switch cat {
-                                    case .vowel, .nasalSyllable, .prolonged:
-                                        isVowelLike = true
-                                    default:
-                                        break
-                                    }
-                                    if isVowelLike {
-                                        let curDur = phrases[pIdx].moras[mIdx].phonemes[phIdx].durationFrames
-                                        if 1 < curDur {
-                                            phrases[pIdx].moras[mIdx].phonemes[phIdx].durationFrames -= 1
-                                            excess -= 1
-                                            reducedInPass = true
-                                        }
-                                    }
-                                }
-                                phIdx += 1
-                            }
-                            mIdx += 1
-                        }
-                        pIdx += 1
-                    }
-                    if reducedInPass != true {
-                        break
-                    }
-                }
-            }
-        }
-
-        // 5. フラットな音素列と Duration 列の抽出
+        // 5. フラットな音素列と Duration 列の抽出（各音素平均の絶対長をそのまま反映）
         var phoneIds: [Int32] = []
         var durations: [Int32] = []
 
@@ -568,10 +389,6 @@ public final class LengthRegulator: Sendable {
                     phoneIds.append(Int32(phoneme.id))
                     durations.append(Int32(phoneme.durationFrames))
                 }
-            }
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                phoneIds.append(Int32(PhonemeVocabulary.pauId))
-                durations.append(Int32(phrase.pauseDurationFrames))
             }
             pListIdx += 1
         }

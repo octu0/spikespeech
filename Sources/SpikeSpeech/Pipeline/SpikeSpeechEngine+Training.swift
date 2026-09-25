@@ -86,14 +86,15 @@ extension SpikeSpeechEngine {
         pcm16k: [Float],
         melExtractor: MelSpectrogramExtractor,
         pitchTracker: PitchTracker,
-        alignment: UtteranceAlignment? = nil
+        alignment: UtteranceAlignment? = nil,
+        useScaledDuration: Bool = true
     ) -> (features: [[Float]], targets: [[Float]])? {
         if pcm16k.isEmpty {
             return nil
         }
         let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
-        let targetFrames = targetMel.count
-        if targetFrames <= 0 {
+        let origFrames = targetMel.count
+        if origFrames <= 0 {
             return nil
         }
         let pitchResult = pitchTracker.track(pcm: pcm16k)
@@ -101,117 +102,87 @@ extension SpikeSpeechEngine {
         let boundaries = Self.detectSpeechBoundaries(
             pcm: pcm16k,
             hopSize: AudioConfig.hopSize,
-            totalFrames: targetFrames
+            totalFrames: origFrames
         )
         let leadSilence = boundaries.leadSilence
-        let speechFrames = boundaries.speechFrames
+        let actualSpeechFrames = boundaries.speechFrames
         let trailSilence = boundaries.trailSilence
-
-        var phoneIds: [Int32] = []
-        var speechDurations: [Int] = []
-
-        switch alignment {
-        case .some(let uttAlign):
-            // なぜアライメント記録の音素 duration を唯一の正本とするか:
-            // エネルギー谷やモーラ等分などのヒューリスティックを排し、
-            // 事前アライメントされた正確な音素物理境界で教師 Mel と 1 対 1 完全同期させるため。
-            var p = 0
-            while p < uttAlign.phonemes.count {
-                let ph = uttAlign.phonemes[p]
-                phoneIds.append(ph.phoneId)
-                speechDurations.append(ph.durationFrames)
-                p += 1
-            }
-        case .none:
-            // アライメント記録未指定時（テスト等）: 音響特徴 DP Forced Aligner による動的アライメント
-            let morphemes = normalizer.normalize(text: text)
-            let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
-            if phrases.isEmpty {
-                return nil
-            }
-
-            var tokens: [PhonemeToken] = []
-            var p = 0
-            while p < phrases.count {
-                var m = 0
-                while m < phrases[p].moras.count {
-                    var ph = 0
-                    while ph < phrases[p].moras[m].phonemes.count {
-                        tokens.append(phrases[p].moras[m].phonemes[ph])
-                        ph += 1
-                    }
-                    m += 1
-                }
-                p += 1
-            }
-
-            if tokens.isEmpty || speechFrames <= 0 || speechFrames < tokens.count {
-                return nil
-            }
-
-            let masAligner = MonotonicAlignmentSearch()
-            let speechEnd = min(targetMel.count, leadSilence + speechFrames)
-            var speechMel: [[Float]] = []
-            var speechVoiced: [Float] = []
-            var f = leadSilence
-            while f < speechEnd {
-                speechMel.append(targetMel[f])
-                var v: Float = 0.0
-                if f < pitchResult.frameCount {
-                    v = pitchResult.voiced[f]
-                }
-                speechVoiced.append(v)
-                f += 1
-            }
-
-            let moraRate = lengthRegulator.meanFramesPerMora
-            guard let durs = masAligner.align(
-                mel: speechMel,
-                voiced: speechVoiced,
-                phonemes: tokens,
-                meanFramesPerMora: moraRate
-            ) else {
-                return nil
-            }
-
-            var tIdx = 0
-            while tIdx < tokens.count {
-                phoneIds.append(Int32(tokens[tIdx].id))
-                speechDurations.append(durs[tIdx])
-                tIdx += 1
-            }
-        }
-
-        let phoneCount = phoneIds.count
-        if speechFrames <= 0 || phoneCount <= 0 {
+        if actualSpeechFrames <= 0 {
             return nil
         }
 
-        var fullPhoneIds: [Int32] = []
-        var fullDurations: [Int] = []
-
-        if 0 < leadSilence {
-            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-            fullDurations.append(leadSilence)
+        let morphemes = normalizer.normalize(text: text)
+        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+        if phrases.isEmpty {
+            return nil
         }
 
-        var bIdx = 0
-        while bIdx < phoneCount {
-            fullPhoneIds.append(phoneIds[bIdx])
-            fullDurations.append(speechDurations[bIdx])
-            bIdx += 1
+        var phoneIds: [Int32] = []
+        var pIdx = 0
+        while pIdx < phrases.count {
+            var mIdx = 0
+            while mIdx < phrases[pIdx].moras.count {
+                var phIdx = 0
+                while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
+                    phoneIds.append(Int32(phrases[pIdx].moras[mIdx].phonemes[phIdx].id))
+                    phIdx += 1
+                }
+                mIdx += 1
+            }
+            pIdx += 1
+        }
+        if phoneIds.isEmpty {
+            return nil
         }
 
-        if 0 < trailSilence {
-            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-            fullDurations.append(trailSilence)
+        let speechDurations: [Int]
+        let targetSpeechFrames: Int
+
+        switch useScaledDuration {
+        case true:
+            // 推論と全く同一の関数（音素平均 × 文全体スケール）で各音素のフレーム数を決定
+            let scaledDurs = lengthRegulator.computeDataDrivenDurations(
+                phrases: phrases,
+                speedFactor: 1.0,
+                applyFluctuation: false,
+                text: text
+            )
+            let quantizedDurs = lengthRegulator.quantizeDurations(durations: scaledDurs)
+            if quantizedDurs.count != phoneIds.count {
+                return nil
+            }
+            speechDurations = quantizedDurs
+            targetSpeechFrames = speechDurations.reduce(0, +)
+
+        case false:
+            // 生アライメント長（または動的アライメント）を使用
+            switch alignment {
+            case .some(let uttAlign):
+                var rawDurs: [Int] = []
+                var p = 0
+                while p < uttAlign.phonemes.count {
+                    rawDurs.append(uttAlign.phonemes[p].durationFrames)
+                    p += 1
+                }
+                speechDurations = rawDurs
+                targetSpeechFrames = speechDurations.reduce(0, +)
+            case .none:
+                speechDurations = [Int](repeating: max(1, actualSpeechFrames / phoneIds.count), count: phoneIds.count)
+                targetSpeechFrames = speechDurations.reduce(0, +)
+            }
         }
 
-        // Pure Swift PitchTracker による実音声からの実測 F0、有声度、および実測短時間 RMS 抽出（冒頭で取得済み）
+        if targetSpeechFrames <= 0 {
+            return nil
+        }
 
-        // なぜ学習データ構築時に発話ピーク正規化を行うか:
-        // 実録音のゲインばらつきを吸収し、発話内ピーク（有声母音）を正確に 0.80（推論側の母音エネルギー 0.80）
-        // にスケーリングすることで、推論時のエネルギー条件付け特徴量（ch70）の確率分布と 1 対 1 で整合させるため。
+        // 実音声の発話本体区間（speechMel, speechF0, speechVoiced, speechEnergy）を抽出
+        let speechEnd = min(origFrames, leadSilence + actualSpeechFrames)
+        var speechMel: [[Float]] = []
+        var speechF0: [Float] = []
+        var speechVoiced: [Float] = []
+        var speechEnergy: [Float] = []
+
         var maxEnergy: Float = 0.0
         var ef = 0
         while ef < pitchResult.frameCount {
@@ -225,22 +196,130 @@ extension SpikeSpeechEngine {
             normScale = 0.80 / maxEnergy
         }
 
-        var alignedF0 = [Float](repeating: 0.0, count: targetFrames)
-        var alignedVoiced = [Float](repeating: 0.0, count: targetFrames)
-        var alignedEnergy = [Float](repeating: 0.0, count: targetFrames)
-        var f = 0
-        while f < targetFrames {
-            if f < pitchResult.frameCount {
-                alignedF0[f] = pitchResult.f0[f]
-                alignedVoiced[f] = pitchResult.voiced[f]
-                let scaledVal = pitchResult.energy[f] * normScale
-                if 1.0 < scaledVal {
-                    alignedEnergy[f] = 1.0
+        var sf = leadSilence
+        while sf < speechEnd {
+            speechMel.append(targetMel[sf])
+            var vF0: Float = 0.0
+            var vVoiced: Float = 0.0
+            var vEnergy: Float = 0.0
+            if sf < pitchResult.frameCount {
+                vF0 = pitchResult.f0[sf]
+                vVoiced = pitchResult.voiced[sf]
+                let sc = pitchResult.energy[sf] * normScale
+                if 1.0 < sc {
+                    vEnergy = 1.0
                 } else {
-                    alignedEnergy[f] = scaledVal
+                    vEnergy = sc
                 }
             }
-            f += 1
+            speechF0.append(vF0)
+            speechVoiced.append(vVoiced)
+            speechEnergy.append(vEnergy)
+            sf += 1
+        }
+
+        if speechMel.isEmpty {
+            return nil
+        }
+
+        // 教師 Mel・F0・有声度・エネルギーを targetSpeechFrames へ時間方向に線形リサンプリング
+        let melCh = AudioConfig.melChannels
+        var resampledMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: targetSpeechFrames)
+        var resampledF0 = [Float](repeating: 0.0, count: targetSpeechFrames)
+        var resampledVoiced = [Float](repeating: 0.0, count: targetSpeechFrames)
+        var resampledEnergy = [Float](repeating: 0.0, count: targetSpeechFrames)
+
+        let srcLen = speechMel.count
+        let maxSrcIdx = Float(max(0, srcLen - 1))
+        let maxDstIdx = Float(max(1, targetSpeechFrames - 1))
+
+        var tf = 0
+        while tf < targetSpeechFrames {
+            let pos = (Float(tf) / maxDstIdx) * maxSrcIdx
+            var t0 = Int(pos)
+            if srcLen <= t0 { t0 = srcLen - 1 }
+            if t0 < 0 { t0 = 0 }
+            var t1 = t0 + 1
+            if srcLen <= t1 { t1 = srcLen - 1 }
+            let alpha = pos - Float(t0)
+
+            var c = 0
+            while c < melCh {
+                resampledMel[tf][c] = (1.0 - alpha) * speechMel[t0][c] + alpha * speechMel[t1][c]
+                c += 1
+            }
+            resampledF0[tf] = (1.0 - alpha) * speechF0[t0] + alpha * speechF0[t1]
+            resampledVoiced[tf] = (1.0 - alpha) * speechVoiced[t0] + alpha * speechVoiced[t1]
+            resampledEnergy[tf] = (1.0 - alpha) * speechEnergy[t0] + alpha * speechEnergy[t1]
+
+            tf += 1
+        }
+
+        // 先頭無音・発話本体・末尾無音の結合
+        var fullPhoneIds: [Int32] = []
+        var fullDurations: [Int] = []
+
+        if 0 < leadSilence {
+            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
+            fullDurations.append(leadSilence)
+        }
+
+        var bIdx = 0
+        while bIdx < phoneIds.count {
+            fullPhoneIds.append(phoneIds[bIdx])
+            fullDurations.append(speechDurations[bIdx])
+            bIdx += 1
+        }
+
+        if 0 < trailSilence {
+            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
+            fullDurations.append(trailSilence)
+        }
+
+        let totalTargetFrames = leadSilence + targetSpeechFrames + trailSilence
+        var alignedMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: totalTargetFrames)
+        var alignedF0 = [Float](repeating: 0.0, count: totalTargetFrames)
+        var alignedVoiced = [Float](repeating: 0.0, count: totalTargetFrames)
+        var alignedEnergy = [Float](repeating: 0.0, count: totalTargetFrames)
+
+        // 先頭無音区間の埋め込み
+        var lf = 0
+        while lf < leadSilence {
+            let srcF = min(lf, targetMel.count - 1)
+            alignedMel[lf] = targetMel[srcF]
+            if srcF < pitchResult.frameCount {
+                alignedF0[lf] = pitchResult.f0[srcF]
+                alignedVoiced[lf] = pitchResult.voiced[srcF]
+                alignedEnergy[lf] = pitchResult.energy[srcF] * normScale
+            }
+            lf += 1
+        }
+
+        // 発話本体区間の埋め込み
+        var bf = 0
+        while bf < targetSpeechFrames {
+            let dstF = leadSilence + bf
+            alignedMel[dstF] = resampledMel[bf]
+            alignedF0[dstF] = resampledF0[bf]
+            alignedVoiced[dstF] = resampledVoiced[bf]
+            alignedEnergy[dstF] = resampledEnergy[bf]
+            bf += 1
+        }
+
+        // 末尾無音区間の埋め込み
+        var trf = 0
+        while trf < trailSilence {
+            let dstF = leadSilence + targetSpeechFrames + trf
+            let srcF = min(origFrames - 1, leadSilence + actualSpeechFrames + trf)
+            if 0 <= srcF && srcF < targetMel.count {
+                alignedMel[dstF] = targetMel[srcF]
+            }
+            if 0 <= srcF && srcF < pitchResult.frameCount {
+                alignedF0[dstF] = pitchResult.f0[srcF]
+                alignedVoiced[dstF] = pitchResult.voiced[srcF]
+                alignedEnergy[dstF] = pitchResult.energy[srcF] * normScale
+            }
+            trf += 1
         }
 
         var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
@@ -256,31 +335,24 @@ extension SpikeSpeechEngine {
             f0Contour: alignedF0,
             voicedFlags: alignedVoiced,
             energyContour: alignedEnergy,
-            totalFrames: targetFrames
+            totalFrames: totalTargetFrames
         )
 
         let alignedFeatures = encodeLinguisticFeatures(
             features: alignedLinguistic
         )
 
-        let finalCount = min(alignedFeatures.count, targetMel.count)
+        let finalCount = min(alignedFeatures.count, alignedMel.count)
         var safeFeatures = alignedFeatures
         if finalCount < safeFeatures.count {
             safeFeatures.removeSubrange(finalCount..<safeFeatures.count)
         }
 
-        var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: finalCount)
-
-        // 目標 Mel 系列を実音声の絶対対数 Mel スペクトル（targetMel）として直接設定
-        // なぜ事前知識の残差学習を完全撤廃するか:
-        // SNN 音響モデルが実音声データの絶対対数 Mel スペクトルを直接予測するように学習することで、
-        // 不自然なロボット感・機械的歪みを排し、
-        // ニューラルボコーダーの学習 Mel 分布と推論 Mel 分布を完全に一致させるため。
-        let melCh = AudioConfig.melChannels
+        var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: finalCount)
         var t = 0
         while t < finalCount {
             safeTargets[t].withUnsafeMutableBufferPointer { pDst in
-                targetMel[t].withUnsafeBufferPointer { pSrc in
+                alignedMel[t].withUnsafeBufferPointer { pSrc in
                     pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
                 }
             }

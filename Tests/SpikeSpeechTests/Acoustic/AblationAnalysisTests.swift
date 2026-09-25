@@ -159,8 +159,9 @@ final class AblationAnalysisTests: XCTestCase {
         let targets = [
             (".tmp/wave15/tts_tenki.wav", ".tmp/wave15_spec/tts_tenki.png"),
             (".tmp/wave15/copy_BASIC5000_0001.wav", ".tmp/wave15_spec/copy_BASIC5000_0001.png"),
+            (".tmp/wave15/recon_BASIC5000_0001.wav", ".tmp/wave15_spec/recon_BASIC5000_0001.png"),
             (".tmp/wave15/tts_konnichiwa.wav", ".tmp/wave15_spec/tts_konnichiwa.png"),
-            (".tmp/wave15/tts_aiueo.wav", ".tmp/wave15_spec/tts_aiueo.png")
+            (".tmp/wave15/tts_mizuwomare.wav", ".tmp/wave15_spec/tts_mizuwomare.png")
         ]
 
         var idx = 0
@@ -349,9 +350,7 @@ final class AblationAnalysisTests: XCTestCase {
         let wavData = WavEncoder.encode(samples: samples)
         let outPath = ".tmp/wave15/test_aligned_snn.wav"
         try wavData.write(to: URL(fileURLWithPath: outPath))
-        let reconPath = ".tmp/wave15/recon_BASIC5000_0001.wav"
-        try wavData.write(to: URL(fileURLWithPath: reconPath))
-        print("[Aligned SNN WAV] 出力完了: \(outPath) および \(reconPath) (\(samples.count) samples, \(Float(samples.count)/16000.0)s)")
+        print("[Aligned SNN WAV] 出力完了: \(outPath) (\(samples.count) samples, \(Float(samples.count)/16000.0)s)")
     }
 
     /// こんにちはの音素・Duration・無音マスク・F0の詳細調査
@@ -1461,13 +1460,9 @@ final class AblationAnalysisTests: XCTestCase {
     func testAcousticAudit() throws {
         let files = [
             (".tmp/wave15/copy_BASIC5000_0001.wav", "Copy-synth (教師基準)"),
-            (".tmp/wave15/ablate_copy.wav", "Ablation 1: 教師Mel + 教師F0"),
-            (".tmp/wave15/ablate_teacherMel_predF0.wav", "Ablation 2: 教師Mel + 予測F0"),
-            (".tmp/wave15/ablate_predMel_teacherF0.wav", "Ablation 3: 予測Mel + 教師F0"),
-            (".tmp/wave15/ablate_tts.wav", "Ablation 4: 予測Mel + 予測F0"),
+            (".tmp/wave15/recon_BASIC5000_0001.wav", "Recon (SNN予測Mel + ボコーダ)"),
             (".tmp/wave15/tts_konnichiwa.wav", "TTS: こんにちは"),
             (".tmp/wave15/tts_tenki.wav", "TTS: 今日はいい天気です"),
-            (".tmp/wave15/tts_aiueo.wav", "TTS: あいうえお"),
             (".tmp/wave15/tts_mizuwomare.wav", "TTS: 水をマレーシアから買わなくてはならないのです")
         ]
 
@@ -1532,11 +1527,71 @@ final class AblationAnalysisTests: XCTestCase {
 
             fIdx += 1
         }
+
+        // Copy-synth と Recon の Mel 比較
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        if let copyPCM = try? reader.loadWav16k(from: ".tmp/wave15/copy_BASIC5000_0001.wav"),
+           let reconPCM = try? reader.loadWav16k(from: ".tmp/wave15/recon_BASIC5000_0001.wav") {
+            let copyMel = melExtractor.extractLogMel(pcm: copyPCM)
+            let reconMel = melExtractor.extractLogMel(pcm: reconPCM)
+            let frames = min(copyMel.count, reconMel.count)
+            var totalL1: Float = 0.0
+            var totalMSE: Float = 0.0
+            var lowBandL1: Float = 0.0
+            var midBandL1: Float = 0.0
+            var highBandL1: Float = 0.0
+            var t = 0
+            while t < frames {
+                var c = 0
+                while c < AudioConfig.melChannels {
+                    let diff = abs(copyMel[t][c] - reconMel[t][c])
+                    totalL1 += diff
+                    totalMSE += diff * diff
+                    switch c {
+                    case 0..<16:
+                        lowBandL1 += diff
+                    case 16..<40:
+                        midBandL1 += diff
+                    default:
+                        highBandL1 += diff
+                    }
+                    c += 1
+                }
+                t += 1
+            }
+            let totalElements = Float(frames * AudioConfig.melChannels)
+            let meanL1 = totalL1 / totalElements
+            let meanMSE = totalMSE / totalElements
+            let meanLowL1 = lowBandL1 / Float(frames * 16)
+            let meanMidL1 = midBandL1 / Float(frames * 24)
+            let meanHighL1 = highBandL1 / Float(frames * 24)
+            print("MEL_COMPARE: frames=\(frames) | meanL1=\(String(format: "%.4f", meanL1)) | RMSE=\(String(format: "%.4f", sqrtf(meanMSE))) | lowL1(0-15)=\(String(format: "%.4f", meanLowL1)) | midL1(16-39)=\(String(format: "%.4f", meanMidL1)) | highL1(40-63)=\(String(format: "%.4f", meanHighL1))")
+        }
     }
 
     /// コーパス実音声から音素別アライメント平均フレーム数を精密集計
     func testCalculateCorpusPhonemeAverages() throws {
         let corpusDir = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000"
+        let corpusMasCachePath = "\(corpusDir)/mas_alignments.json"
+        let vocabulary = PhonemeVocabulary()
+
+        if FileManager.default.fileExists(atPath: corpusMasCachePath) {
+            let alignDict = try AlignmentStore.load(from: corpusMasCachePath)
+            let alignList = Array(alignDict.values)
+            let averages = AlignmentStore.computeAverageDurations(from: alignList)
+            print("\n=======================================================")
+            print("コーパス実測音素平均フレーム数 (キャッシュ読み込み: \(alignList.count) 発話)")
+            print("=======================================================")
+            for (pid, avg) in averages.sorted(by: { $0.key < $1.key }) {
+                let sym = vocabulary.token(for: Int(pid))
+                print("  ID \(pid) (\(sym)): 平均=\(String(format: "%.2f", avg)) frames (\(String(format: "%.1f", avg * 10.0))ms)")
+            }
+            return
+        }
+
         let wavDir = "\(corpusDir)/wav"
         let transcriptPath = "\(corpusDir)/transcript_utf8.txt"
         guard FileManager.default.fileExists(atPath: transcriptPath) else { return }
@@ -1550,7 +1605,6 @@ final class AblationAnalysisTests: XCTestCase {
         let masAligner = MonotonicAlignmentSearch()
 
         let normalizer = TextNormalizer(morphology: ViterbiMorphology())
-        let vocabulary = PhonemeVocabulary()
         let prosodyModel = ProsodyModel()
 
         var durationSums: [Int32: Float] = [:]
@@ -1659,5 +1713,160 @@ final class AblationAnalysisTests: XCTestCase {
             print("  ID \(pid) (\(sym)): 平均=\(String(format: "%.2f", avg)) frames (\(String(format: "%.1f", avg * 10.0))ms, N=\(Int(count)))")
             averages[pid] = roundf(avg * 10.0) / 10.0
         }
+    }
+
+    /// 全 5,000 発話の MAS アライメントを集計し、mas_alignments.json および Models/weights.json を更新する
+    func testExtractFullCorpusMASAndExportDurations() throws {
+        let corpusDir = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000"
+        let corpusMasCachePath = "\(corpusDir)/mas_alignments.json"
+        let wavDir = "\(corpusDir)/wav"
+        let transcriptPath = "\(corpusDir)/transcript_utf8.txt"
+        guard FileManager.default.fileExists(atPath: transcriptPath) else {
+            XCTFail("transcript_utf8.txt が存在しません")
+            return
+        }
+
+        let content = try String(contentsOfFile: transcriptPath, encoding: .utf8)
+        let lines = content.components(separatedBy: .newlines)
+
+        let wavReader = WavAudioReader()
+        let melExtractor = MelSpectrogramExtractor(sampleRate: 16000.0, melChannels: AudioConfig.melChannels)
+        let pitchTracker = PitchTracker()
+        let normalizer = TextNormalizer(morphology: ViterbiMorphology())
+        let vocabulary = PhonemeVocabulary()
+        let prosodyModel = ProsodyModel()
+
+        var inputItems: [MonotonicAlignmentSearch.AlignmentInputItem] = []
+        var lIdx = 0
+        while lIdx < lines.count {
+            let line = lines[lIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+            lIdx += 1
+            if line.isEmpty { continue }
+
+            var parts = line.split(separator: ":", maxSplits: 1).map { String($0) }
+            if parts.count != 2 {
+                parts = line.split(separator: "\t", maxSplits: 1).map { String($0) }
+            }
+            if parts.count != 2 { continue }
+
+            let id = parts[0].trimmingCharacters(in: .whitespaces)
+            let text = parts[1].trimmingCharacters(in: .whitespaces)
+
+            var wavFile = "\(wavDir)/\(id).wav"
+            if FileManager.default.fileExists(atPath: wavFile) != true {
+                let uppercaseWav = "\(wavDir)/\(id).WAV"
+                if FileManager.default.fileExists(atPath: uppercaseWav) {
+                    wavFile = uppercaseWav
+                }
+            }
+            guard FileManager.default.fileExists(atPath: wavFile),
+                  let rawPCM = try? wavReader.loadWav16k(from: wavFile) else {
+                continue
+            }
+
+            var peak: Float = 0.0
+            var pIdx = 0
+            while pIdx < rawPCM.count {
+                let a = abs(rawPCM[pIdx])
+                if peak < a { peak = a }
+                pIdx += 1
+            }
+            var pcm16k = rawPCM
+            if 0.01 < peak {
+                let normFactor = 0.85 / peak
+                var s = 0
+                while s < pcm16k.count {
+                    pcm16k[s] = pcm16k[s] * normFactor
+                    s += 1
+                }
+            }
+
+            let morphemes = normalizer.normalize(text: text)
+            let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
+            var tokens: [PhonemeToken] = []
+            for phrase in phrases {
+                for mora in phrase.moras {
+                    for ph in mora.phonemes {
+                        tokens.append(ph)
+                    }
+                }
+            }
+            if tokens.isEmpty { continue }
+
+            let hopSize = AudioConfig.hopSize
+            let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
+            let totalFrames = max(1, targetMel.count)
+            let boundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+                pcm: pcm16k,
+                hopSize: hopSize,
+                totalFrames: totalFrames
+            )
+            let speechFrames = boundaries.speechFrames
+            let leadSilence = boundaries.leadSilence
+            let trailSilence = boundaries.trailSilence
+
+            if speechFrames < tokens.count || speechFrames <= 0 { continue }
+
+            let pitchRes = pitchTracker.track(pcm: pcm16k)
+            let speechEnd = min(targetMel.count, leadSilence + speechFrames)
+            var speechMel: [[Float]] = []
+            var speechVoiced: [Float] = []
+            var sf = leadSilence
+            while sf < speechEnd {
+                speechMel.append(targetMel[sf])
+                var v: Float = 0.0
+                if sf < pitchRes.frameCount {
+                    v = pitchRes.voiced[sf]
+                }
+                speechVoiced.append(v)
+                sf += 1
+            }
+
+            inputItems.append(MonotonicAlignmentSearch.AlignmentInputItem(
+                utteranceId: id,
+                leadSilence: leadSilence,
+                trailSilence: trailSilence,
+                totalSpeechFrames: speechFrames,
+                mel: speechMel,
+                voiced: speechVoiced,
+                phonemes: tokens
+            ))
+
+            if (inputItems.count % 1000) == 0 {
+                print("入力アイテム準備進行中: \(inputItems.count) / 5000 件")
+            }
+        }
+
+        print("全発話データ準備完了: \(inputItems.count) 件。MAS 反復自己収束 (iterativelyAlign, 3 iterations) を開始します...")
+        let newAlignments = MonotonicAlignmentSearch.iterativelyAlign(
+            items: inputItems,
+            iterations: 3,
+            meanFramesPerMora: 16.0
+        )
+        print("MAS 反復自己収束完了: \(newAlignments.count) 件確定")
+
+        try AlignmentStore.save(newAlignments, to: corpusMasCachePath)
+        print("mas_alignments.json を更新保存しました: \(corpusMasCachePath) (\(newAlignments.count) 件)")
+
+        let averages = AlignmentStore.computeAverageDurations(from: newAlignments)
+        var roundedAverages: [Int32: Float] = [:]
+        print("\n=======================================================")
+        print("全 5,000 発話 MAS 反復自己収束実測音素平均フレーム数 (集計発話数: \(newAlignments.count))")
+        print("=======================================================")
+        for (pid, avg) in averages.sorted(by: { $0.key < $1.key }) {
+            let sym = vocabulary.token(for: Int(pid))
+            let rAvg = roundf(avg * 10.0) / 10.0
+            let finalAvg = max(1.0, rAvg)
+            roundedAverages[pid] = finalAvg
+            print("  ID \(pid) (\(sym)): 平均=\(String(format: "%.2f", avg)) frames -> 確定=\(String(format: "%.1f", finalAvg)) frames (\(String(format: "%.1f", finalAvg * 10.0))ms)")
+        }
+
+        // Models/weights.json をロードし、phonemeAverageDurations を更新して保存
+        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
+        let weightsData = try Data(contentsOf: weightsURL)
+        let loadedWeights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        let updatedWeights = loadedWeights.withPhonemeAverageDurations(roundedAverages)
+        try WeightCheckpoint.atomicWritePretty(updatedWeights, to: weightsURL)
+        print("Models/weights.json の phonemeAverageDurations を MAS 反復収束値で更新保存しました！")
     }
 }
