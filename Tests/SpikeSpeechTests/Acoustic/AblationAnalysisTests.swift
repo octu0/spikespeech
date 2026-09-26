@@ -3,30 +3,345 @@ import XCTest
 
 final class AblationAnalysisTests: XCTestCase {
     func testAnalyzeAblationFourWavs() throws {
+        let outputDir = ".tmp/wave15"
+        try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: "Models/weights.json"))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        var vocWeights: NeuralVocoderWeights? = nil
+        if let vData = try? Data(contentsOf: URL(fileURLWithPath: "Models/vocoder_weights.json")) {
+            vocWeights = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: vData)
+        }
+        let vocoder = NeuralVocoder(weights: vocWeights)
+        let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+        let text = "水をマレーシアから買わなくてはならないのです。"
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        guard FileManager.default.fileExists(atPath: wavPath) else {
+            XCTFail("BASIC5000_0001.wav が存在しません: \(wavPath)")
+            return
+        }
+
         let wavReader = WavAudioReader()
+        let rawPCM = try wavReader.loadWav16k(from: wavPath)
+        var peak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawPCM.count {
+            let a = abs(rawPCM[pIdx])
+            if peak < a { peak = a }
+            pIdx += 1
+        }
+        var pcm16k = rawPCM
+        if 0.01 < peak {
+            let normFactor = 0.85 / peak
+            var s = 0
+            while s < pcm16k.count {
+                pcm16k[s] = pcm16k[s] * normFactor
+                s += 1
+            }
+        }
+
         let melExtractor = MelSpectrogramExtractor(
             sampleRate: Float(AudioConfig.sampleRate),
             melChannels: AudioConfig.melChannels
         )
         let pitchTracker = PitchTracker()
 
+        var effectiveAlign: UtteranceAlignment? = nil
+        let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        if FileManager.default.fileExists(atPath: corpusAlignPath) {
+            if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                effectiveAlign = alignMap["BASIC5000_0001"]
+            }
+        }
+
+        guard let pair = engine.prepareTrainingPair(
+            text: text,
+            pcm16k: pcm16k,
+            melExtractor: melExtractor,
+            pitchTracker: pitchTracker,
+            alignment: effectiveAlign,
+            useScaledDuration: false
+        ) else {
+            XCTFail("prepareTrainingPair に失敗しました")
+            return
+        }
+
+        let totalF319 = pair.features.count
+        print("[Ablation] 教師アライメント特徴量フレーム数: \(totalF319)")
+
+        // 1. SNN 推論 (319フレーム)
+        engine.workspace.reset()
+        let snnMel319 = engine.decoder.decodeSequence(featuresSeq: pair.features, workspace: engine.workspace)
+
+        var melSeq319 = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: totalF319)
+        var f = 0
+        while f < totalF319 {
+            if f < snnMel319.count {
+                let copyCount = min(AudioConfig.melChannels, snnMel319[f].count)
+                melSeq319[f].withUnsafeMutableBufferPointer { dst in
+                    snnMel319[f].withUnsafeBufferPointer { src in
+                        dst.baseAddress!.update(from: src.baseAddress!, count: copyCount)
+                    }
+                }
+            }
+            f += 1
+        }
+
+        // 教師 F0 / 有声フラグ (319フレーム)
+        var teacherF0_319 = [Float](repeating: 0.0, count: totalF319)
+        var teacherVoiced_319 = [Float](repeating: 0.0, count: totalF319)
+        f = 0
+        while f < totalF319 {
+            if 194 < pair.features[f].count {
+                teacherF0_319[f] = pair.features[f][194] * 500.0
+            }
+            if 192 < pair.features[f].count {
+                teacherVoiced_319[f] = pair.features[f][192]
+            }
+            f += 1
+        }
+
+        // =======================================================
+        // 1. ablate_recon.wav
+        // =======================================================
+        vocoder.reset()
+        let samplesRecon = vocoder.synthesize(
+            mel: melSeq319,
+            f0Contour: teacherF0_319,
+            voicedFlags: teacherVoiced_319,
+            speaker: .zero
+        )
+        let path1 = "\(outputDir)/ablate_recon.wav"
+        try WavEncoder.encode(samples: samplesRecon, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path1))
+        print("[Ablation 1] 生成完了: \(path1)")
+
+        // =======================================================
+        // 2. ablate_recon_mel_pred_f0.wav
+        // =======================================================
+        let ttsLinguistic = engine.lengthRegulator.processText(
+            text: text,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.female.baseF0,
+            addBoundarySilence: true
+        )
+        let ttsFrames = ttsLinguistic.totalFrames
+        var predF0_319 = [Float](repeating: 0.0, count: totalF319)
+        var predVoiced_319 = [Float](repeating: 0.0, count: totalF319)
+        let maxDst319 = Float(max(1, totalF319 - 1))
+        let maxSrcTTS = Float(max(1, ttsFrames - 1))
+        var rIdx = 0
+        while rIdx < totalF319 {
+            let pos = (Float(rIdx) / maxDst319) * maxSrcTTS
+            var s0 = Int(pos)
+            if ttsFrames <= s0 { s0 = ttsFrames - 1 }
+            if s0 < 0 { s0 = 0 }
+            var s1 = s0 + 1
+            if ttsFrames <= s1 { s1 = ttsFrames - 1 }
+            let alpha = pos - Float(s0)
+            predF0_319[rIdx] = (1.0 - alpha) * ttsLinguistic.f0Contour[s0] + alpha * ttsLinguistic.f0Contour[s1]
+            let vInterp = (1.0 - alpha) * ttsLinguistic.voicedFlags[s0] + alpha * ttsLinguistic.voicedFlags[s1]
+            switch 0.5 <= vInterp {
+            case true:
+                predVoiced_319[rIdx] = 1.0
+            case false:
+                predVoiced_319[rIdx] = 0.0
+            }
+            rIdx += 1
+        }
+
+        vocoder.reset()
+        let samplesReconPredF0 = vocoder.synthesize(
+            mel: melSeq319,
+            f0Contour: predF0_319,
+            voicedFlags: predVoiced_319,
+            speaker: .zero
+        )
+        let path2 = "\(outputDir)/ablate_recon_mel_pred_f0.wav"
+        try WavEncoder.encode(samples: samplesReconPredF0, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path2))
+        print("[Ablation 2] 生成完了: \(path2)")
+
+        // =======================================================
+        // 3. ablate_tts.wav
+        // =======================================================
+        engine.workspace.reset()
+        vocoder.reset()
+        let samplesTTS = engine.synthesize(text: text)
+        let path3 = "\(outputDir)/ablate_tts.wav"
+        try WavEncoder.encode(samples: samplesTTS, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path3))
+        print("[Ablation 3] 生成完了: \(path3)")
+
+        // =======================================================
+        // 4. ablate_tts_teacher_f0.wav
+        // =======================================================
+        var teacherF0_tts = [Float](repeating: 0.0, count: ttsFrames)
+        var teacherVoiced_tts = [Float](repeating: 0.0, count: ttsFrames)
+        var tIdx = 0
+        while tIdx < ttsFrames {
+            let pos = (Float(tIdx) / maxSrcTTS) * maxDst319
+            var s0 = Int(pos)
+            if totalF319 <= s0 { s0 = totalF319 - 1 }
+            if s0 < 0 { s0 = 0 }
+            var s1 = s0 + 1
+            if totalF319 <= s1 { s1 = totalF319 - 1 }
+            let alpha = pos - Float(s0)
+            teacherF0_tts[tIdx] = (1.0 - alpha) * teacherF0_319[s0] + alpha * teacherF0_319[s1]
+            let vInterp = (1.0 - alpha) * teacherVoiced_319[s0] + alpha * teacherVoiced_319[s1]
+            switch 0.5 <= vInterp {
+            case true:
+                teacherVoiced_tts[tIdx] = 1.0
+            case false:
+                teacherVoiced_tts[tIdx] = 0.0
+            }
+            tIdx += 1
+        }
+
+        let ttsTeacherLinguistic = LinguisticFeatures(
+            phoneIds: ttsLinguistic.phoneIds,
+            durations: ttsLinguistic.durations,
+            f0Contour: teacherF0_tts,
+            voicedFlags: teacherVoiced_tts,
+            energyContour: ttsLinguistic.energyContour,
+            totalFrames: ttsFrames
+        )
+        let ttsTeacherSeq = engine.encodeLinguisticFeatures(features: ttsTeacherLinguistic)
+
+        engine.workspace.reset()
+        let snnMelTTS = engine.decoder.decodeSequence(featuresSeq: ttsTeacherSeq, workspace: engine.workspace)
+
+        var melSeqTTS = [[Float]](repeating: [Float](repeating: 0.0, count: AudioConfig.melChannels), count: ttsFrames)
+        f = 0
+        while f < ttsFrames {
+            if f < snnMelTTS.count {
+                let copyCount = min(AudioConfig.melChannels, snnMelTTS[f].count)
+                melSeqTTS[f].withUnsafeMutableBufferPointer { dst in
+                    snnMelTTS[f].withUnsafeBufferPointer { src in
+                        dst.baseAddress!.update(from: src.baseAddress!, count: copyCount)
+                    }
+                }
+            }
+            f += 1
+        }
+
+        vocoder.reset()
+        var samplesTTS_TeacherF0 = vocoder.synthesize(
+            mel: melSeqTTS,
+            f0Contour: teacherF0_tts,
+            voicedFlags: teacherVoiced_tts,
+            speaker: .zero
+        )
+
+        let silenceMask = engine.computeFrameSilenceMask(linguisticFeatures: ttsTeacherLinguistic, totalFrames: ttsFrames)
+        let frameSize = AudioConfig.hopSize
+        var fIdx = 0
+        while fIdx < ttsFrames {
+            let isSilence = silenceMask[fIdx]
+            switch isSilence {
+            case true:
+                var prevIsSilence = true
+                if 0 < fIdx {
+                    prevIsSilence = silenceMask[fIdx - 1]
+                }
+                let startSample = fIdx * frameSize
+                let endSample = min(samplesTTS_TeacherF0.count, startSample + frameSize)
+                switch prevIsSilence {
+                case false:
+                    let invN = 1.0 / Float(frameSize)
+                    var s = startSample
+                    while s < endSample {
+                        let sampleOffset = s - startSample
+                        let fade = 1.0 - (Float(sampleOffset) * invN)
+                        samplesTTS_TeacherF0[s] = samplesTTS_TeacherF0[s] * fade
+                        s += 1
+                    }
+                case true:
+                    var s = startSample
+                    while s < endSample {
+                        samplesTTS_TeacherF0[s] = 0.0
+                        s += 1
+                    }
+                }
+            case false:
+                break
+            }
+            fIdx += 1
+        }
+
+        let targetPeak: Float = 0.85
+        var currentPeak: Float = 0.0
+        var pkIdx = 0
+        while pkIdx < samplesTTS_TeacherF0.count {
+            let absVal = abs(samplesTTS_TeacherF0[pkIdx])
+            if currentPeak < absVal {
+                currentPeak = absVal
+            }
+            pkIdx += 1
+        }
+        if 0.01 < currentPeak {
+            var normScale = targetPeak / currentPeak
+            if 6.0 < normScale {
+                normScale = 6.0
+            }
+            var s = 0
+            while s < samplesTTS_TeacherF0.count {
+                var scaled = samplesTTS_TeacherF0[s] * normScale
+                if targetPeak < scaled {
+                    scaled = targetPeak
+                }
+                if scaled < -targetPeak {
+                    scaled = -targetPeak
+                }
+                samplesTTS_TeacherF0[s] = scaled
+                s += 1
+            }
+        }
+
+        let fadeLen = 160
+        if (fadeLen * 2) <= samplesTTS_TeacherF0.count {
+            let invFade: Float = 1.0 / Float(fadeLen)
+            var s = 0
+            while s < fadeLen {
+                let factor = Float(s) * invFade
+                samplesTTS_TeacherF0[s] = samplesTTS_TeacherF0[s] * factor
+                s += 1
+            }
+            let endOffset = samplesTTS_TeacherF0.count - fadeLen
+            s = 0
+            while s < fadeLen {
+                let factor = Float(fadeLen - 1 - s) * invFade
+                samplesTTS_TeacherF0[endOffset + s] = samplesTTS_TeacherF0[endOffset + s] * factor
+                s += 1
+            }
+        }
+
+        let path4 = "\(outputDir)/ablate_tts_teacher_f0.wav"
+        try WavEncoder.encode(samples: samplesTTS_TeacherF0, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path4))
+        print("[Ablation 4] 生成完了: \(path4)")
+
+        // =======================================================
+        // 客観音響特性の計測とフォーマット出力
+        // =======================================================
         let paths = [
-            ("1. Copy (Teacher Mel + Teacher F0)", ".tmp/wave15/ablate_copy.wav"),
-            ("2. Teacher Mel + Pred F0", ".tmp/wave15/ablate_teacherMel_predF0.wav"),
-            ("3. Pred Mel + Teacher F0", ".tmp/wave15/ablate_predMel_teacherF0.wav"),
-            ("4. TTS (Pred Mel + Pred F0)", ".tmp/wave15/ablate_tts.wav")
+            ("1. ablate_recon.wav (SNN Recon Mel + Teacher F0)", path1),
+            ("2. ablate_recon_mel_pred_f0.wav (SNN Recon Mel + Pred F0)", path2),
+            ("3. ablate_tts.wav (TTS Standard: Pred Mel + Pred F0)", path3),
+            ("4. ablate_tts_teacher_f0.wav (TTS Teacher F0: SNN Mel w/ Teacher F0)", path4)
         ]
 
         print("\n=======================================================")
         print("Ablation 4本 客観音響特性分析 (Ablation Analysis)")
         print("=======================================================")
 
-        var pIdx = 0
-        while pIdx < paths.count {
-            let (label, path) = paths[pIdx]
+        var pCount = 0
+        while pCount < paths.count {
+            let (label, path) = paths[pCount]
             guard FileManager.default.fileExists(atPath: path) else {
-                print("[\(label)] ファイルが存在しません: \(path)")
-                pIdx += 1
+                XCTFail("生成ファイルが存在しません: \(path)")
+                pCount += 1
                 continue
             }
 
@@ -34,14 +349,13 @@ final class AblationAnalysisTests: XCTestCase {
             let mel = melExtractor.extractLogMel(pcm: pcm)
             let pitch = pitchTracker.track(pcm: pcm)
 
-            // F0 統計
             var voicedF0s: [Float] = []
-            var f = 0
-            while f < pitch.frameCount {
-                if 0.5 <= pitch.voiced[f] && 50.0 <= pitch.f0[f] && pitch.f0[f] <= 500.0 {
-                    voicedF0s.append(pitch.f0[f])
+            var pf = 0
+            while pf < pitch.frameCount {
+                if 0.5 <= pitch.voiced[pf] && 50.0 <= pitch.f0[pf] && pitch.f0[pf] <= 500.0 {
+                    voicedF0s.append(pitch.f0[pf])
                 }
-                f += 1
+                pf += 1
             }
 
             var meanF0: Float = 0.0
@@ -57,8 +371,6 @@ final class AblationAnalysisTests: XCTestCase {
                 maxF0 = voicedF0s.max() ?? 0.0
             }
 
-            // Mel フォルマント時間動態度 (フレーム間スペクトル差分平均: Spectral Flux)
-            // 横縞（定常平坦）なら flux はほぼ 0 に近くなる。動的フォルマントなら大きな値になる。
             var spectralFluxSum: Float = 0.0
             var fluxCount = 0
             var t = 1
@@ -79,7 +391,6 @@ final class AblationAnalysisTests: XCTestCase {
                 meanSpectralFlux = spectralFluxSum / Float(fluxCount)
             }
 
-            // チャネル間分散（スペクトルの凹凸・フォルマントピーク度）
             var channelVarSum: Float = 0.0
             t = 0
             while t < mel.count {
@@ -100,7 +411,7 @@ final class AblationAnalysisTests: XCTestCase {
             print("  フォルマント凹凸度 (Channel Variance): \(String(format: "%.4f", meanChannelVar)) (平坦度/横縞の逆指標)")
             print("-------------------------------------------------------")
 
-            pIdx += 1
+            pCount += 1
         }
     }
 
@@ -1240,9 +1551,84 @@ final class AblationAnalysisTests: XCTestCase {
         try konWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_konnichiwa.wav"))
         print("[TTS Output] tts_konnichiwa.wav 保存完了 (\(konWavData.count) bytes)")
 
+        let tenkiPath = ".tmp/wave15/tts_tenki.wav"
         let tenkiWavData = engine.synthesizeWav(text: "今日はいい天気です")
-        try tenkiWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_tenki.wav"))
+        try tenkiWavData.write(to: URL(fileURLWithPath: tenkiPath))
         print("[TTS Output] tts_tenki.wav 保存完了 (\(tenkiWavData.count) bytes)")
+
+        let wavReader = WavAudioReader()
+        let tenkiPcm = try wavReader.loadWav16k(from: tenkiPath)
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let pitchTracker = PitchTracker()
+        let tenkiMel = melExtractor.extractLogMel(pcm: tenkiPcm)
+        let tenkiPitch = pitchTracker.track(pcm: tenkiPcm)
+
+        var voicedF0s: [Float] = []
+        var pf = 0
+        while pf < tenkiPitch.frameCount {
+            if 0.5 <= tenkiPitch.voiced[pf] && 50.0 <= tenkiPitch.f0[pf] && tenkiPitch.f0[pf] <= 500.0 {
+                voicedF0s.append(tenkiPitch.f0[pf])
+            }
+            pf += 1
+        }
+
+        var meanF0: Float = 0.0
+        var stdF0: Float = 0.0
+        var minF0: Float = 0.0
+        var maxF0: Float = 0.0
+        if voicedF0s.isEmpty != true {
+            let sumF = voicedF0s.reduce(0, +)
+            meanF0 = sumF / Float(voicedF0s.count)
+            let sumSq = voicedF0s.reduce(0) { $0 + powf($1 - meanF0, 2) }
+            stdF0 = sqrtf(sumSq / Float(voicedF0s.count))
+            minF0 = voicedF0s.min() ?? 0.0
+            maxF0 = voicedF0s.max() ?? 0.0
+        }
+
+        var spectralFluxSum: Float = 0.0
+        var fluxCount = 0
+        var t = 1
+        while t < tenkiMel.count {
+            var frameDiff: Float = 0.0
+            var c = 0
+            while c < AudioConfig.melChannels {
+                let d = tenkiMel[t][c] - tenkiMel[t - 1][c]
+                frameDiff += d * d
+                c += 1
+            }
+            spectralFluxSum += sqrtf(frameDiff)
+            fluxCount += 1
+            t += 1
+        }
+        var meanSpectralFlux: Float = 0.0
+        if 0 < fluxCount {
+            meanSpectralFlux = spectralFluxSum / Float(fluxCount)
+        }
+
+        var channelVarSum: Float = 0.0
+        t = 0
+        while t < tenkiMel.count {
+            let m = tenkiMel[t].reduce(0, +) / Float(AudioConfig.melChannels)
+            let v = tenkiMel[t].reduce(0) { $0 + powf($1 - m, 2) } / Float(AudioConfig.melChannels)
+            channelVarSum += v
+            t += 1
+        }
+        var meanChannelVar: Float = 0.0
+        if 0 < tenkiMel.count {
+            meanChannelVar = channelVarSum / Float(tenkiMel.count)
+        }
+
+        print("\n=======================================================")
+        print("tts_tenki.wav 客観音響特性分析")
+        print("=======================================================")
+        print("  時間: \(String(format: "%.2f", Float(tenkiPcm.count) / 16000.0))s (\(tenkiPcm.count) samples, \(tenkiMel.count) frames)")
+        print("  有声 F0: 平均=\(String(format: "%.1f", meanF0)) Hz, 標準偏差=\(String(format: "%.1f", stdF0)) Hz, min=\(String(format: "%.1f", minF0)) Hz, max=\(String(format: "%.1f", maxF0)) Hz")
+        print("  スペクトル動態度 (Spectral Flux): \(String(format: "%.4f", meanSpectralFlux)) (時間変化の激しさ)")
+        print("  フォルマント凹凸度 (Channel Variance): \(String(format: "%.4f", meanChannelVar)) (平坦度/横縞の逆指標)")
+        print("-------------------------------------------------------\n")
 
         let mizuWavData = engine.synthesizeWav(text: "水をマレーシアから買わなくてはならないのです。")
         try mizuWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_mizuwomare.wav"))
@@ -1861,12 +2247,323 @@ final class AblationAnalysisTests: XCTestCase {
             print("  ID \(pid) (\(sym)): 平均=\(String(format: "%.2f", avg)) frames -> 確定=\(String(format: "%.1f", finalAvg)) frames (\(String(format: "%.1f", finalAvg * 10.0))ms)")
         }
 
-        // Models/weights.json をロードし、phonemeAverageDurations を更新して保存
-        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
-        let weightsData = try Data(contentsOf: weightsURL)
-        let loadedWeights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
-        let updatedWeights = loadedWeights.withPhonemeAverageDurations(roundedAverages)
-        try WeightCheckpoint.atomicWritePretty(updatedWeights, to: weightsURL)
-        print("Models/weights.json の phonemeAverageDurations を MAS 反復収束値で更新保存しました！")
+        // 注意: Models/weights.json の phonemeAverageDurations は testUpdateWeightsWithHealthyDurations
+        // により自然な物理比率テーブルが正本として管理されるため、ここでは上書きしない。
+        print("MAS 反復収束音素平均フレーム数の抽出・キャッシュ保存が完了しました。")
+    }
+
+    /// 音響試聴エンジニア用 詳細音響診断テスト
+    func testAcousticListeningAuditDetail() throws {
+        let outputDir = ".tmp/wave15"
+        let specDir = ".tmp/wave15_spec"
+        try FileManager.default.createDirectory(atPath: specDir, withIntermediateDirectories: true)
+
+        let targetFiles = [
+            ("1. ablate_recon.wav", "\(outputDir)/ablate_recon.wav", "\(specDir)/ablate_recon.png"),
+            ("2. ablate_recon_mel_pred_f0.wav", "\(outputDir)/ablate_recon_mel_pred_f0.wav", "\(specDir)/ablate_recon_mel_pred_f0.png"),
+            ("3. ablate_tts.wav", "\(outputDir)/ablate_tts.wav", "\(specDir)/ablate_tts.png"),
+            ("4. ablate_tts_teacher_f0.wav", "\(outputDir)/ablate_tts_teacher_f0.wav", "\(specDir)/ablate_tts_teacher_f0.png"),
+            ("5. tts_tenki.wav", "\(outputDir)/tts_tenki.wav", "\(specDir)/tts_tenki.png")
+        ]
+
+        let reader = WavAudioReader()
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let tracker = PitchTracker()
+
+        print("\n=======================================================")
+        print("【音響試聴エンジニア 5ファイル詳細音響診断】")
+        print("=======================================================")
+
+        var fIdx = 0
+        while fIdx < targetFiles.count {
+            let (label, wavPath, pngPath) = targetFiles[fIdx]
+            guard FileManager.default.fileExists(atPath: wavPath) else {
+                print("[\(label)] ファイルが存在しません: \(wavPath)")
+                fIdx += 1
+                continue
+            }
+
+            // スペクトログラム PNG 生成
+            try SpectrogramRenderer.renderWavToPNG(wavPath: wavPath, outputPath: pngPath, scale: 2)
+
+            let pcm = try reader.loadWav16k(from: wavPath)
+            let mel = melExtractor.extractLogMel(pcm: pcm)
+            let pitch = tracker.track(pcm: pcm)
+
+            var voicedF0s: [Float] = []
+            var pf = 0
+            while pf < pitch.frameCount {
+                if 0.5 <= pitch.voiced[pf] && 50.0 <= pitch.f0[pf] && pitch.f0[pf] <= 500.0 {
+                    voicedF0s.append(pitch.f0[pf])
+                }
+                pf += 1
+            }
+
+            var meanF0: Float = 0.0
+            var stdF0: Float = 0.0
+            var minF0: Float = 0.0
+            var maxF0: Float = 0.0
+            if voicedF0s.isEmpty != true {
+                let sumF = voicedF0s.reduce(0, +)
+                meanF0 = sumF / Float(voicedF0s.count)
+                let sumSq = voicedF0s.reduce(0) { $0 + powf($1 - meanF0, 2) }
+                stdF0 = sqrtf(sumSq / Float(voicedF0s.count))
+                minF0 = voicedF0s.min() ?? 0.0
+                maxF0 = voicedF0s.max() ?? 0.0
+            }
+
+            // 時間方向のスペクトル動態度 (Spectral Flux)
+            var fluxSum: Float = 0.0
+            var fluxCount = 0
+            var t = 1
+            while t < mel.count {
+                var dSum: Float = 0.0
+                var c = 0
+                while c < AudioConfig.melChannels {
+                    let d = mel[t][c] - mel[t - 1][c]
+                    dSum += d * d
+                    c += 1
+                }
+                fluxSum += sqrtf(dSum)
+                fluxCount += 1
+                t += 1
+            }
+            let spectralFlux = fluxSum / Float(max(1, fluxCount))
+
+            // 周波数方向の凹凸度 (Channel Variance: フォルマント明瞭度)
+            var varSum: Float = 0.0
+            t = 0
+            while t < mel.count {
+                let mean = mel[t].reduce(0, +) / Float(AudioConfig.melChannels)
+                let v = mel[t].reduce(0) { $0 + powf($1 - mean, 2) } / Float(AudioConfig.melChannels)
+                varSum += v
+                t += 1
+            }
+            let channelVar = varSum / Float(max(1, mel.count))
+
+            // 横縞度指標 (Horizontal Striation Index): 時間変化が極めて小さい（静止している）フレームの割合
+            var staticFrameCount = 0
+            t = 1
+            while t < mel.count {
+                var diffMax: Float = 0.0
+                var c = 0
+                while c < AudioConfig.melChannels {
+                    let diff = abs(mel[t][c] - mel[t - 1][c])
+                    if diffMax < diff { diffMax = diff }
+                    c += 1
+                }
+                if diffMax <= 0.15 {
+                    staticFrameCount += 1
+                }
+                t += 1
+            }
+            let striationRatio = Float(staticFrameCount) / Float(max(1, mel.count - 1)) * 100.0
+
+            // 帯域別エネルギー分布 (低域 0-15: F1/基本波, 中域 16-39: F2/母音識別, 高域 40-63: 子音摩擦音)
+            var lowBandSum: Float = 0.0
+            var midBandSum: Float = 0.0
+            var highBandSum: Float = 0.0
+            t = 0
+            while t < mel.count {
+                var c = 0
+                while c < AudioConfig.melChannels {
+                    let v = mel[t][c]
+                    if c < 16 {
+                        lowBandSum += v
+                    } else {
+                        switch c < 40 {
+                        case true:
+                            midBandSum += v
+                        case false:
+                            highBandSum += v
+                        }
+                    }
+                    c += 1
+                }
+                t += 1
+            }
+            let lowE = lowBandSum / Float(max(1, mel.count * 16))
+            let midE = midBandSum / Float(max(1, mel.count * 24))
+            let highE = highBandSum / Float(max(1, mel.count * 24))
+
+            print("-------------------------------------------------------")
+            print("【\(label)】")
+            print("  WAV パス: \(wavPath)")
+            print("  時間長: \(String(format: "%.3f", Float(pcm.count) / 16000.0)) 秒 (\(pcm.count) サンプル, \(mel.count) フレーム)")
+            print("  有声比率: \(String(format: "%.1f", Float(voicedF0s.count) / Float(max(1, pitch.frameCount)) * 100.0))%")
+            print("  F0: 平均=\(String(format: "%.1f", meanF0)) Hz, 標準偏差=\(String(format: "%.1f", stdF0)) Hz, min=\(String(format: "%.1f", minF0)), max=\(String(format: "%.1f", maxF0))")
+            print("  スペクトル動態 (Spectral Flux): \(String(format: "%.4f", spectralFlux))")
+            print("  フォルマント凹凸 (Channel Variance): \(String(format: "%.4f", channelVar))")
+            print("  横縞・静止フレーム比率 (Striation Ratio): \(String(format: "%.1f", striationRatio))%")
+            print("  帯域エネルギー: 低域=\(String(format: "%.2f", lowE)), 中域=\(String(format: "%.2f", midE)), 高域=\(String(format: "%.2f", highE))")
+
+            fIdx += 1
+        }
+
+        // =======================================================
+        // 教師特徴量 (pair.features) と TTS 特徴量の完全チャンネル差分
+        // =======================================================
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: "Models/weights.json"))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        let engine = SpikeSpeechEngine(weights: weights)
+
+        let text = "水をマレーシアから買わなくてはならないのです。"
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        if FileManager.default.fileExists(atPath: wavPath) {
+            let rawPCM = try reader.loadWav16k(from: wavPath)
+            var effectiveAlign: UtteranceAlignment? = nil
+            let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+            if FileManager.default.fileExists(atPath: corpusAlignPath) {
+                if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                    effectiveAlign = alignMap["BASIC5000_0001"]
+                }
+            }
+
+            if let pair = engine.prepareTrainingPair(
+                text: text,
+                pcm16k: rawPCM,
+                melExtractor: melExtractor,
+                pitchTracker: tracker,
+                alignment: effectiveAlign,
+                useScaledDuration: false
+            ) {
+                let ttsLinguistic = engine.lengthRegulator.processText(
+                    text: text,
+                    normalizer: engine.normalizer,
+                    prosodyModel: engine.prosodyModel,
+                    vocabulary: engine.vocabulary,
+                    prosodyPredictor: engine.prosodyPredictor,
+                    speedFactor: 1.0,
+                    baseF0: VoiceProfile.female.baseF0,
+                    addBoundarySilence: true
+                )
+                let ttsSeq = engine.encodeLinguisticFeatures(features: ttsLinguistic)
+
+                print("\n=======================================================")
+                print("【学習特徴量 (pair) vs TTS推論特徴量 (ttsSeq) 差分分析】")
+                print("  学習特徴量フレーム数: \(pair.features.count)")
+                print("  TTS推論特徴量フレーム数: \(ttsSeq.count)")
+                print("  音素数: 教師=\(pair.features.count) frames, TTS=\(ttsLinguistic.phoneIds.count) 音素, 計\(ttsLinguistic.totalFrames) frames")
+
+                // 教師音素列の復元と表示
+                print("\n[教師 (pair) 音素列と Duration]")
+                var teacherPhones: [Int] = []
+                var teacherDurs: [Int] = []
+                var curPh = -1
+                var curDur = 0
+                var f = 0
+                while f < pair.features.count {
+                    var ph = -1
+                    var c = 0
+                    while c < 64 {
+                        if 0.5 <= pair.features[f][c] { ph = c }
+                        c += 1
+                    }
+                    if ph == curPh {
+                        curDur += 1
+                    } else {
+                        if 0 <= curPh {
+                            teacherPhones.append(curPh)
+                            teacherDurs.append(curDur)
+                            let sym = engine.vocabulary.token(for: curPh)
+                            print("  [\(teacherPhones.count - 1)] id=\(curPh) (\(sym)): dur=\(curDur) frames")
+                        }
+                        curPh = ph
+                        curDur = 1
+                    }
+                    f += 1
+                }
+                if 0 <= curPh {
+                    teacherPhones.append(curPh)
+                    teacherDurs.append(curDur)
+                    let sym = engine.vocabulary.token(for: curPh)
+                    print("  [\(teacherPhones.count - 1)] id=\(curPh) (\(sym)): dur=\(curDur) frames")
+                }
+
+                // 音素列の比較
+                print("\n[音素列の比較 (教師 vs TTS)]")
+                print("教師音素数: \(teacherPhones.count), TTS音素数: \(ttsLinguistic.phoneIds.count)")
+                let maxP = max(teacherPhones.count, ttsLinguistic.phoneIds.count)
+                var p = 0
+                while p < maxP {
+                    var tStr = "None"
+                    if p < teacherPhones.count {
+                        let tPid = teacherPhones[p]
+                        let tSym = engine.vocabulary.token(for: tPid)
+                        let tDur = teacherDurs[p]
+                        tStr = "id=\(tPid) (\(tSym)) dur=\(tDur)"
+                    }
+                    var sStr = "None"
+                    if p < ttsLinguistic.phoneIds.count {
+                        let sPid = Int(ttsLinguistic.phoneIds[p])
+                        let sSym = engine.vocabulary.token(for: sPid)
+                        let sDur = ttsLinguistic.durations[p]
+                        sStr = "id=\(sPid) (\(sSym)) dur=\(sDur)"
+                    }
+                    print("  [\(p)] 教師: [\(tStr)] vs TTS: [\(sStr)]")
+                    p += 1
+                }
+
+                // 各チャンネルの平均値比較
+                print("\n[チャンネルグループ別 平均値比較]")
+                let groups = [
+                    ("ch 0-63 (現在の音素 one-hot)", 0, 63),
+                    ("ch 64-127 (前の音素 one-hot)", 64, 127),
+                    ("ch 128-191 (次の音素 one-hot)", 128, 191),
+                    ("ch 192 (voiced)", 192, 192),
+                    ("ch 193 (unvoiced)", 193, 193),
+                    ("ch 194 (F0 / 500)", 194, 194),
+                    ("ch 195 (deltaF0)", 195, 195),
+                    ("ch 196 (phonePos)", 196, 196),
+                    ("ch 197 (rate)", 197, 197),
+                    ("ch 198 (energy)", 198, 198),
+                    ("ch 199 (pulse)", 199, 199),
+                    ("ch 200-255 (その他/未使用)", 200, 255)
+                ]
+
+                var g = 0
+                while g < groups.count {
+                    let (gName, startCh, endCh) = groups[g]
+                    var pairSum: Float = 0.0
+                    var pairCount = 0
+                    var fIdx = 0
+                    while fIdx < pair.features.count {
+                        var c = startCh
+                        while c <= endCh {
+                            if c < pair.features[fIdx].count {
+                                pairSum += pair.features[fIdx][c]
+                                pairCount += 1
+                            }
+                            c += 1
+                        }
+                        fIdx += 1
+                    }
+
+                    var ttsSum: Float = 0.0
+                    var ttsCount = 0
+                    fIdx = 0
+                    while fIdx < ttsSeq.count {
+                        var c = startCh
+                        while c <= endCh {
+                            if c < ttsSeq[fIdx].count {
+                                ttsSum += ttsSeq[fIdx][c]
+                                ttsCount += 1
+                            }
+                            c += 1
+                        }
+                        fIdx += 1
+                    }
+
+                    let pairAvg = pairSum / Float(max(1, pairCount))
+                    let ttsAvg = ttsSum / Float(max(1, ttsCount))
+                    print("  \(gName): pairAvg=\(String(format: "%.4f", pairAvg)) vs ttsAvg=\(String(format: "%.4f", ttsAvg))")
+                    g += 1
+                }
+            }
+        }
     }
 }
+

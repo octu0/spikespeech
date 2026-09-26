@@ -147,12 +147,64 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             if (p + 1) < phoneCount {
                 nextPid = Int(features.phoneIds[p + 1])
             }
+            var nextNextPid: Int = PhonemeVocabulary.silId
+            if (p + 2) < phoneCount {
+                nextNextPid = Int(features.phoneIds[p + 2])
+            }
+
+            // 子音（過渡音 1〜4F）の判定:
+            // 実音声において子音（k, s, t, d, w 等）は 1〜4 フレーム（10〜40ms）の過渡音である。
+            // 文全体線形スケーリングにより子音が 4 フレームを超えて伸長された場合、
+            // 同一の子音 One-Hot が定常持続すると LIF ニューロンがリミットサイクル（横縞倍音）を起こすため、
+            // アタック過渡期（最大 4 フレーム）を超過した区間は後続音素への正当な先行調音結合（Coarticulation）として処理する。
+            let symbol = vocabulary.token(for: pid)
+            let cat = vocabulary.category(for: symbol)
+            let isConsonant: Bool
+            switch cat {
+            case .consonant, .contracted:
+                isConsonant = true
+            default:
+                isConsonant = false
+            }
+
+            let hasValidNextPhone: Bool
+            switch vocabulary.isPauseOrSilence(id: nextPid) {
+            case true:
+                hasValidNextPhone = false
+            case false:
+                hasValidNextPhone = true
+            }
+
+            let maxConsonantFrames = 4
 
             var f = 0
             while f < duration {
                 let frameIdx = currentFrameOffset + f
                 if totalFrames <= frameIdx {
                     break
+                }
+
+                let isCoarticulationTransition: Bool
+                switch (isConsonant, hasValidNextPhone, maxConsonantFrames <= f) {
+                case (true, true, true):
+                    isCoarticulationTransition = true
+                default:
+                    isCoarticulationTransition = false
+                }
+
+                let effectivePid: Int
+                let effectivePrevPid: Int
+                let effectiveNextPid: Int
+
+                switch isCoarticulationTransition {
+                case true:
+                    effectivePid = nextPid
+                    effectivePrevPid = pid
+                    effectiveNextPid = nextNextPid
+                case false:
+                    effectivePid = pid
+                    effectivePrevPid = prevPid
+                    effectiveNextPid = nextPid
                 }
 
                 var rawF0: Float = 0.0
@@ -168,19 +220,36 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     f0 = 0.0
                 }
 
+                var effVoiced = voiced
+                if isCoarticulationTransition {
+                    let nextSymbol = vocabulary.token(for: nextPid)
+                    if vocabulary.isVoiced(symbol: nextSymbol) {
+                        effVoiced = 1.0
+                        if f0 <= 0.0 {
+                            let nextStartIdx = currentFrameOffset + duration
+                            if nextStartIdx < features.f0Contour.count {
+                                let nF0 = features.f0Contour[nextStartIdx]
+                                if 0.0 < nF0 {
+                                    f0 = nF0
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 1. 現在の音素 ID の One-Hot 符号化 (ch 0 ..< 64)
-                if 0 <= pid {
-                    if pid < 64 {
-                        if pid < inDim {
-                            seq[frameIdx][pid] = 3.0
+                if 0 <= effectivePid {
+                    if effectivePid < 64 {
+                        if effectivePid < inDim {
+                            seq[frameIdx][effectivePid] = 3.0
                         }
                     }
                 }
 
                 // 2. 直前の音素 ID の One-Hot 符号化 (ch 64 ..< 128)
-                if 0 <= prevPid {
-                    if prevPid < 64 {
-                        let prevCh = 64 + prevPid
+                if 0 <= effectivePrevPid {
+                    if effectivePrevPid < 64 {
+                        let prevCh = 64 + effectivePrevPid
                         if prevCh < inDim {
                             seq[frameIdx][prevCh] = 3.0
                         }
@@ -188,9 +257,9 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
 
                 // 3. 直後の音素 ID の One-Hot 符号化 (ch 128 ..< 192)
-                if 0 <= nextPid {
-                    if nextPid < 64 {
-                        let nextCh = 128 + nextPid
+                if 0 <= effectiveNextPid {
+                    if effectiveNextPid < 64 {
+                        let nextCh = 128 + effectiveNextPid
                         if nextCh < inDim {
                             seq[frameIdx][nextCh] = 3.0
                         }
@@ -199,11 +268,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
 
                 // 4. 韻律および音響生理学的特徴の付加 (ch 192 ..< 199)
                 if 192 < inDim {
-                    seq[frameIdx][192] = voiced * 1.0
+                    seq[frameIdx][192] = effVoiced * 1.0
                 }
                 if 193 < inDim {
                     // 有声度に対する直交抑制電流として機能させる無声度 (1.0 - voiced)
-                    let unvoiced = 1.0 - voiced
+                    let unvoiced = 1.0 - effVoiced
                     seq[frameIdx][193] = unvoiced * 1.0
                 }
                 if 194 < inDim {
@@ -218,7 +287,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 }
                 if 195 < inDim {
                     var deltaF0: Float = 0.0
-                    if 0.5 <= voiced && 0 < frameIdx {
+                    if 0.5 <= effVoiced && 0 < frameIdx {
                         let prevIdx = frameIdx - 1
                         var prevVoiced: Float = 0.0
                         if prevIdx < features.voicedFlags.count {
@@ -257,6 +326,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     var engVal: Float = 0.50
                     if frameIdx < features.energyContour.count {
                         engVal = features.energyContour[frameIdx]
+                    }
+                    if isCoarticulationTransition {
+                        if engVal < 0.50 {
+                            engVal = 0.50
+                        }
                     }
                     if 1.0 < engVal {
                         engVal = 1.0
@@ -431,10 +505,23 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         }
 
         // 4. ニューラルボコーダーによる 16kHz PCM 波形展開
+        var vocoderF0 = [Float](repeating: 0.0, count: totalFrames)
+        var vocoderVoiced = [Float](repeating: 0.0, count: totalFrames)
+        var vf = 0
+        while vf < totalFrames {
+            if 194 < inputSeq[vf].count {
+                vocoderF0[vf] = inputSeq[vf][194] * 500.0
+            }
+            if 192 < inputSeq[vf].count {
+                vocoderVoiced[vf] = inputSeq[vf][192]
+            }
+            vf += 1
+        }
+
         var rawSamples = neuralVocoder.synthesize(
             mel: melSeq,
-            f0Contour: linguisticFeatures.f0Contour,
-            voicedFlags: linguisticFeatures.voicedFlags,
+            f0Contour: vocoderF0,
+            voicedFlags: vocoderVoiced,
             speaker: speaker
         )
 
