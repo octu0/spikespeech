@@ -2446,6 +2446,15 @@ final class AblationAnalysisTests: XCTestCase {
                 print("【学習特徴量 (pair) vs TTS推論特徴量 (ttsSeq) 差分分析】")
                 print("  学習特徴量フレーム数: \(pair.features.count)")
                 print("  TTS推論特徴量フレーム数: \(ttsSeq.count)")
+                let morphs = engine.normalizer.normalize(text: text)
+                let dbgPhrases = engine.prosodyModel.buildAccentPhrases(morphemes: morphs, vocabulary: engine.vocabulary)
+                var dbgTotalMoras = 0
+                for p in dbgPhrases {
+                    dbgTotalMoras += p.moras.count
+                    let moraTexts = p.moras.map { $0.text }.joined(separator: ", ")
+                    print("  句: [\(moraTexts)] (モーラ数: \(p.moras.count), pauseAfter: \(p.pauseAfter), pauseDur: \(p.pauseDurationFrames))")
+                }
+                print("  形態素数: \(morphs.count), モーラ総数: \(dbgTotalMoras)")
                 print("  音素数: 教師=\(pair.features.count) frames, TTS=\(ttsLinguistic.phoneIds.count) 音素, 計\(ttsLinguistic.totalFrames) frames")
 
                 // 教師音素列の復元と表示

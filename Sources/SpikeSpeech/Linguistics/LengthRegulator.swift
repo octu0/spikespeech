@@ -394,9 +394,8 @@ public final class LengthRegulator: Sendable {
         }
 
         // 6. F0 輪郭パラメータの生成（学習済み予測器を主経路とし、未指定時は藤崎モデル規則）
-        let f0Contour: [Float]
-        let voicedFlags: [Float]
-        let totalFrames: Int
+        let rawF0Contour: [Float]
+        let rawVoicedFlags: [Float]
         let finalIntDurations = durations.map { Int($0) }
         switch prosodyPredictor {
         case .some(let predictor):
@@ -408,9 +407,8 @@ public final class LengthRegulator: Sendable {
                 durations: finalIntDurations,
                 applyFluctuation: applyFluctuation
             )
-            f0Contour = predRes.f0Contour
-            voicedFlags = predRes.voicedFlags
-            totalFrames = predRes.totalFrames
+            rawF0Contour = predRes.f0Contour
+            rawVoicedFlags = predRes.voicedFlags
         case .none:
             var bioFluctuation = BiologicalFluctuation(seed: BiologicalFluctuation.seed(from: text))
             let fujisakiRes = prosodyModel.generateF0Contour(
@@ -420,9 +418,46 @@ public final class LengthRegulator: Sendable {
                 fluctuation: &bioFluctuation,
                 applyFluctuation: applyFluctuation
             )
-            f0Contour = fujisakiRes.f0Contour
-            voicedFlags = fujisakiRes.voicedFlags
-            totalFrames = fujisakiRes.totalFrames
+            rawF0Contour = fujisakiRes.f0Contour
+            rawVoicedFlags = fujisakiRes.voicedFlags
+        }
+
+        // 7. 発話本体総フレーム数の厳格な整合性保証
+        // なぜ durations.reduce の合計値を totalFrames とするのか:
+        // 外部の予測器や藤崎規則が不要なポーズや丸め誤差で異なるフレーム数を返した場合でも、
+        // 音素 One-Hot 展開長（durations の総和）と F0/voiced/energy 輪郭のフレーム数を 100% 厳格に一致させ、
+        // フレーム長不一致による音素崩れや末尾の無音ゴースト（足された pau）を根本排除するため。
+        var bodyTotalFrames = 0
+        var bI = 0
+        while bI < durations.count {
+            bodyTotalFrames += Int(durations[bI])
+            bI += 1
+        }
+        let totalFrames = bodyTotalFrames
+
+        var f0Contour = rawF0Contour
+        if f0Contour.count < totalFrames {
+            let lastF0: Float
+            switch f0Contour.last {
+            case .some(let v):
+                lastF0 = v
+            case .none:
+                lastF0 = baseF0
+            }
+            let diff = totalFrames - f0Contour.count
+            f0Contour.append(contentsOf: [Float](repeating: lastF0, count: diff))
+        }
+        if totalFrames < f0Contour.count {
+            f0Contour = Array(f0Contour.prefix(totalFrames))
+        }
+
+        var voicedFlags = rawVoicedFlags
+        if voicedFlags.count < totalFrames {
+            let diff = totalFrames - voicedFlags.count
+            voicedFlags.append(contentsOf: [Float](repeating: 0.0, count: diff))
+        }
+        if totalFrames < voicedFlags.count {
+            voicedFlags = Array(voicedFlags.prefix(totalFrames))
         }
 
         // 8. 音素物理カテゴリに基づく音響エネルギー輪郭の生成

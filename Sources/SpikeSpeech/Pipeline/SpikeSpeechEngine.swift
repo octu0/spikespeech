@@ -147,64 +147,15 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             if (p + 1) < phoneCount {
                 nextPid = Int(features.phoneIds[p + 1])
             }
-            var nextNextPid: Int = PhonemeVocabulary.silId
-            if (p + 2) < phoneCount {
-                nextNextPid = Int(features.phoneIds[p + 2])
-            }
-
-            // 子音（過渡音 1〜4F）の判定:
-            // 実音声において子音（k, s, t, d, w 等）は 1〜4 フレーム（10〜40ms）の過渡音である。
-            // 文全体線形スケーリングにより子音が 4 フレームを超えて伸長された場合、
-            // 同一の子音 One-Hot が定常持続すると LIF ニューロンがリミットサイクル（横縞倍音）を起こすため、
-            // アタック過渡期（最大 4 フレーム）を超過した区間は後続音素への正当な先行調音結合（Coarticulation）として処理する。
-            let symbol = vocabulary.token(for: pid)
-            let cat = vocabulary.category(for: symbol)
-            let isConsonant: Bool
-            switch cat {
-            case .consonant, .contracted:
-                isConsonant = true
-            default:
-                isConsonant = false
-            }
-
-            let hasValidNextPhone: Bool
-            switch vocabulary.isPauseOrSilence(id: nextPid) {
-            case true:
-                hasValidNextPhone = false
-            case false:
-                hasValidNextPhone = true
-            }
-
-            let maxConsonantFrames = 4
+            let effectivePid = pid
+            let effectivePrevPid = prevPid
+            let effectiveNextPid = nextPid
 
             var f = 0
             while f < duration {
                 let frameIdx = currentFrameOffset + f
                 if totalFrames <= frameIdx {
                     break
-                }
-
-                let isCoarticulationTransition: Bool
-                switch (isConsonant, hasValidNextPhone, maxConsonantFrames <= f) {
-                case (true, true, true):
-                    isCoarticulationTransition = true
-                default:
-                    isCoarticulationTransition = false
-                }
-
-                let effectivePid: Int
-                let effectivePrevPid: Int
-                let effectiveNextPid: Int
-
-                switch isCoarticulationTransition {
-                case true:
-                    effectivePid = nextPid
-                    effectivePrevPid = pid
-                    effectiveNextPid = nextNextPid
-                case false:
-                    effectivePid = pid
-                    effectivePrevPid = prevPid
-                    effectiveNextPid = nextPid
                 }
 
                 var rawF0: Float = 0.0
@@ -220,22 +171,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     f0 = 0.0
                 }
 
-                var effVoiced = voiced
-                if isCoarticulationTransition {
-                    let nextSymbol = vocabulary.token(for: nextPid)
-                    if vocabulary.isVoiced(symbol: nextSymbol) {
-                        effVoiced = 1.0
-                        if f0 <= 0.0 {
-                            let nextStartIdx = currentFrameOffset + duration
-                            if nextStartIdx < features.f0Contour.count {
-                                let nF0 = features.f0Contour[nextStartIdx]
-                                if 0.0 < nF0 {
-                                    f0 = nF0
-                                }
-                            }
-                        }
-                    }
-                }
+                let effVoiced = voiced
 
                 // 1. 現在の音素 ID の One-Hot 符号化 (ch 0 ..< 64)
                 if 0 <= effectivePid {
@@ -326,11 +262,6 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     var engVal: Float = 0.50
                     if frameIdx < features.energyContour.count {
                         engVal = features.energyContour[frameIdx]
-                    }
-                    if isCoarticulationTransition {
-                        if engVal < 0.50 {
-                            engVal = 0.50
-                        }
                     }
                     if 1.0 < engVal {
                         engVal = 1.0

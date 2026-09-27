@@ -294,12 +294,6 @@ public final class ProsodyPredictor: Sendable {
                     }
                     m += 1
                 }
-                if workingPhrases[p].pauseAfter && 0 < workingPhrases[p].pauseDurationFrames {
-                    if qIdx < durations.count {
-                        workingPhrases[p].pauseDurationFrames = durations[qIdx]
-                        qIdx += 1
-                    }
-                }
                 p += 1
             }
         }
@@ -402,10 +396,6 @@ public final class ProsodyPredictor: Sendable {
                     phIdx += 1
                 }
                 mIdx += 1
-            }
-
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                curF += phrase.pauseDurationFrames
             }
             pIdx += 1
         }

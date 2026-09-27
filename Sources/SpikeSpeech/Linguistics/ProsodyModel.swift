@@ -380,16 +380,6 @@ public final class ProsodyModel: Sendable {
                 }
             }
 
-            // 後続ポーズ（読点・句点）フレームの追加
-            if phrase.pauseAfter && 0 < phrase.pauseDurationFrames {
-                var pf = 0
-                while pf < phrase.pauseDurationFrames {
-                    latentF0List.append(effectiveBaseF0)
-                    voicedList.append(0.0)
-                    pf += 1
-                }
-            }
-
             pIdx += 1
         }
 
