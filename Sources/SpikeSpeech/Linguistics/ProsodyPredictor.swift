@@ -256,13 +256,15 @@ public final class ProsodyPredictor: Sendable {
         lengthRegulator: LengthRegulator,
         speedFactor: Float = 1.0,
         applyFluctuation: Bool = true,
-        text: String = ""
+        text: String = "",
+        meanFramesPerMora: Float? = nil
     ) -> [Int] {
         let rawFloatDurations = lengthRegulator.computeDataDrivenDurations(
             phrases: phrases,
             speedFactor: speedFactor,
             applyFluctuation: applyFluctuation,
-            text: text
+            text: text,
+            meanFramesPerMora: meanFramesPerMora
         )
         return lengthRegulator.quantizeDurations(durations: rawFloatDurations)
     }

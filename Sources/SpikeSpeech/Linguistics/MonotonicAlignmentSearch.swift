@@ -28,6 +28,25 @@ public final class MonotonicAlignmentSearch: Sendable {
         self.prototypes = prototypes
     }
 
+    /// 各音素カテゴリの物理的最小継続時間フレーム数 (1フレーム=10ms)
+    ///
+    /// なぜ 1 フレーム音素を禁止し母音 4F / 子音 3F を下限とするか:
+    /// 人が発音する際、子音調音には最低 30ms、母音共鳴には最低 40ms の物理的時間が必要であり、
+    /// 単調 DP が特定音素を 1 フレーム (10ms) に押し潰して余剰時間を母音に寄せる縮退現象を構造的に根絶するため。
+    public static func minDuration(for phoneme: PhonemeToken) -> Int {
+        switch phoneme.category {
+        case .pause:
+            return 1
+        case .vowel, .prolonged:
+            return 4
+        default:
+            return 3
+        }
+    }
+
+    /// 各音素の標準最大許容継続時間フレーム数 (20 フレーム = 200ms)
+    public static let standardMaxDuration: Int = 20
+
     /// 各音素の標準的な相対継続時間重み（仮分割用）
     public static func priorWeight(for phoneme: PhonemeToken) -> Float {
         switch phoneme.category {
@@ -55,7 +74,7 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
     }
 
-    /// 発話区間のフレーム総数をモーラ等時性と音素比率により初期仮分割する
+    /// 発話区間のフレーム総数を制約（母音>=4F, 子音>=3F, 最大<=20F）と音素比率により初期仮分割する
     ///
     /// なぜ手書き固定表ではなく仮分割から開始するか:
     /// 音素ラベルの初期推定区間を教師 WAV の全体長から比例配分で設定し、
@@ -68,70 +87,98 @@ public final class MonotonicAlignmentSearch: Sendable {
         if totalFrames <= 0 || n <= 0 {
             return []
         }
-        if totalFrames < n {
-            return [Int](repeating: 1, count: n)
+
+        var minDurs = [Int](repeating: 1, count: n)
+        var sumMin = 0
+        var i = 0
+        while i < n {
+            let md = minDuration(for: phonemes[i])
+            minDurs[i] = md
+            sumMin += md
+            i += 1
         }
+
+        if totalFrames < sumMin {
+            return []
+        }
+
+        let maxPerPhone: Int
+        let avgPerPhone = Float(totalFrames) / Float(max(1, n))
+        if 10.0 < avgPerPhone {
+            maxPerPhone = max(standardMaxDuration, Int(ceilf(avgPerPhone * 1.5)))
+        } else {
+            maxPerPhone = standardMaxDuration
+        }
+
+        let sumMax = maxPerPhone * n
+        if sumMax < totalFrames {
+            return []
+        }
+
+        var durations = minDurs
+        var remaining = totalFrames - sumMin
 
         var weights = [Float](repeating: 1.0, count: n)
         var sumWeight: Float = 0.0
-        var i = 0
-        while i < n {
-            let w = priorWeight(for: phonemes[i])
-            weights[i] = w
+        var wIdx = 0
+        while wIdx < n {
+            let w = priorWeight(for: phonemes[wIdx])
+            weights[wIdx] = w
             sumWeight += w
-            i += 1
+            wIdx += 1
         }
         if sumWeight <= 0.001 {
             sumWeight = Float(n)
         }
 
-        var durations = [Int](repeating: 1, count: n)
-        var cumulativeFloat: Float = 0.0
-        var cumulativeInt = 0
-
-        var idx = 0
-        while idx < n {
-            let ratio = weights[idx] / sumWeight
-            let expectedF = Float(totalFrames) * ratio
-            cumulativeFloat += expectedF
-
-            let targetInt: Int
-            if idx == n - 1 {
-                targetInt = totalFrames
-            } else {
-                targetInt = Int(roundf(cumulativeFloat))
-            }
-
-            var dur = targetInt - cumulativeInt
-            if dur < 1 {
-                dur = 1
-            }
-            durations[idx] = dur
-            cumulativeInt += dur
-            idx += 1
-        }
-
-        // 丸めによる余剰または不足の補正
-        var curSum = 0
-        var cIdx = 0
-        while cIdx < n {
-            curSum += durations[cIdx]
-            cIdx += 1
-        }
-        if curSum < totalFrames {
-            durations[n - 1] += (totalFrames - curSum)
-        } else {
-            var diff = curSum - totalFrames
-            var r = n - 1
-            while 0 < diff && 0 <= r {
-                if 1 < durations[r] {
-                    let canReduce = durations[r] - 1
-                    let reduce = min(diff, canReduce)
-                    durations[r] -= reduce
-                    diff -= reduce
+        while 0 < remaining {
+            var activeWeight: Float = 0.0
+            var c = 0
+            while c < n {
+                if durations[c] < maxPerPhone {
+                    activeWeight += weights[c]
                 }
-                r -= 1
+                c += 1
             }
+            if activeWeight <= 0.001 {
+                break
+            }
+
+            var distributed = 0
+            var dIdx = 0
+            while dIdx < n && 0 < remaining {
+                if durations[dIdx] < maxPerPhone {
+                    let share = max(1, Int(roundf(Float(remaining) * (weights[dIdx] / activeWeight))))
+                    let space = maxPerPhone - durations[dIdx]
+                    let add = min(share, min(space, remaining))
+                    if 0 < add {
+                        durations[dIdx] += add
+                        remaining -= add
+                        distributed += add
+                    }
+                }
+                dIdx += 1
+            }
+            if distributed == 0 {
+                var rIdx = 0
+                while rIdx < n && 0 < remaining {
+                    if durations[rIdx] < maxPerPhone {
+                        durations[rIdx] += 1
+                        remaining -= 1
+                    }
+                    rIdx += 1
+                }
+            }
+        }
+
+        var curSum = 0
+        var chk = 0
+        while chk < n {
+            curSum += durations[chk]
+            chk += 1
+        }
+        if curSum != totalFrames {
+            return []
         }
 
         return durations
@@ -260,12 +307,14 @@ public final class MonotonicAlignmentSearch: Sendable {
     ///   - voiced: 各フレームの有声度系列 (長さ T, 0.0〜1.0)
     ///   - phonemes: 発話区間の音素トークン系列 (長さ N)
     ///   - meanFramesPerMora: コーパスまたはモデルの平均モーラフレーム数 (~16.0)
+    ///   - maxDurationPerPhoneme: 1音素あたりの最大フレーム数（nil時は通常20F、極小音素数時は適応上限）
     /// - Returns: 各音素の確定フレーム数配列 (長さ N, 総和が T と厳密一致)
     public func align(
         mel: [[Float]],
         voiced: [Float],
         phonemes: [PhonemeToken],
-        meanFramesPerMora: Float = 16.0
+        meanFramesPerMora: Float = 16.0,
+        maxDurationPerPhoneme: Int? = nil
     ) -> [Int]? {
         let tTotal = mel.count
         let nTotal = phonemes.count
@@ -273,9 +322,63 @@ public final class MonotonicAlignmentSearch: Sendable {
         if tTotal <= 0 || nTotal <= 0 {
             return nil
         }
-        if tTotal < nTotal {
-            // フレーム数が音素数未満の場合は各音素に最低 1F を配分できない
+
+        let maxDurLimit: Int
+        switch maxDurationPerPhoneme {
+        case .some(let m):
+            maxDurLimit = m
+        case .none:
+            let avgPerPhone = Float(tTotal) / Float(max(1, nTotal))
+            if 10.0 < avgPerPhone {
+                // 合成単体テスト等で極小音素数に対し大フレーム数が渡された場合
+                maxDurLimit = max(Self.standardMaxDuration, Int(ceilf(avgPerPhone * 1.5)))
+            } else {
+                // 通常発話: 1 音素 20 フレーム超は不採用（設計書 2 項）
+                maxDurLimit = Self.standardMaxDuration
+            }
+        }
+
+        var minDurs = [Int](repeating: 1, count: nTotal)
+        var maxDurs = [Int](repeating: maxDurLimit, count: nTotal)
+        var sumMin = 0
+        var sumMax = 0
+
+        var p = 0
+        while p < nTotal {
+            let md = Self.minDuration(for: phonemes[p])
+            minDurs[p] = md
+            maxDurs[p] = maxDurLimit
+            sumMin += md
+            sumMax += maxDurLimit
+            p += 1
+        }
+
+        if tTotal < sumMin || sumMax < tTotal {
             return nil
+        }
+
+        // 累積最小/最大継続時間配列（探索枝刈り用）
+        var prefixMin = [Int](repeating: 0, count: nTotal)
+        var prefixMax = [Int](repeating: 0, count: nTotal)
+        var suffixMin = [Int](repeating: 0, count: nTotal + 1)
+
+        var runMin = 0
+        var runMax = 0
+        var i = 0
+        while i < nTotal {
+            runMin += minDurs[i]
+            runMax += maxDurs[i]
+            prefixMin[i] = runMin
+            prefixMax[i] = runMax
+            i += 1
+        }
+
+        var sufRun = 0
+        var sIdx = nTotal - 1
+        while 0 <= sIdx {
+            sufRun += minDurs[sIdx]
+            suffixMin[sIdx] = sufRun
+            sIdx -= 1
         }
 
         // 発話内 Mel 平均（未登録音素のフォールバック用）
@@ -295,11 +398,11 @@ public final class MonotonicAlignmentSearch: Sendable {
             c += 1
         }
 
-        // 1. 各音素と全フレームの音響対数尤度行列を事前計算
+        // 1. 各音素と全フレームの対数尤度行列の計算
         var logLikelihoods = [[Float]](repeating: [Float](repeating: 0.0, count: tTotal), count: nTotal)
-        var i = 0
-        while i < nTotal {
-            let pid = phonemes[i].id
+        var phIdx = 0
+        while phIdx < nTotal {
+            let pid = phonemes[phIdx].id
             var t = 0
             while t < tTotal {
                 let v: Float
@@ -308,7 +411,7 @@ public final class MonotonicAlignmentSearch: Sendable {
                 } else {
                     v = 0.0
                 }
-                logLikelihoods[i][t] = frameLogLikelihood(
+                logLikelihoods[phIdx][t] = frameLogLikelihood(
                     phoneId: pid,
                     frameMel: mel[t],
                     frameVoiced: v,
@@ -316,76 +419,117 @@ public final class MonotonicAlignmentSearch: Sendable {
                 )
                 t += 1
             }
-            i += 1
+            phIdx += 1
         }
 
-        // 2. 単調動的計画法 (MAS: Monotonic Alignment Search)
-        // Q[i][t]: 音素 i がフレーム t を消費した時点での最大累積スコア
-        // transition[i][t]: 0: 自己遷移 (同一音素継続), 1: 前進遷移 (直前音素から切替)
-        let negInf: Float = -1.0e18
-        var qTable = [[Float]](repeating: [Float](repeating: negInf, count: tTotal), count: nTotal)
-        var transition = [[UInt8]](repeating: [UInt8](repeating: 0, count: tTotal), count: nTotal)
-
-        // 初期化: 音素 0
-        qTable[0][0] = logLikelihoods[0][0]
-        var t0 = 1
-        let maxT0 = tTotal - (nTotal - 1)
-        while t0 < maxT0 {
-            qTable[0][t0] = qTable[0][t0 - 1] + logLikelihoods[0][t0]
-            transition[0][t0] = 0
-            t0 += 1
-        }
-
-        // 漸化式更新: ph = 1..<nTotal
-        var ph = 1
+        // 2. 対数尤度の累積和配列（区間スコア O(1) 算出用）
+        // prefLL[ph][k] = sum(logLikelihoods[ph][0 ..< k])
+        var prefLL = [[Float]](repeating: [Float](repeating: 0.0, count: tTotal + 1), count: nTotal)
+        var ph = 0
         while ph < nTotal {
-            let minT = ph
-            let maxT = tTotal - (nTotal - ph)
-
-            var curT = minT
-            while curT <= maxT {
-                let score = logLikelihoods[ph][curT]
-
-                let stayScore = qTable[ph][curT - 1]
-                let advanceScore = qTable[ph - 1][curT - 1]
-
-                if stayScore < advanceScore {
-                    qTable[ph][curT] = advanceScore + score
-                    transition[ph][curT] = 1
-                } else {
-                    qTable[ph][curT] = stayScore + score
-                    transition[ph][curT] = 0
-                }
-                curT += 1
+            var k = 0
+            var accum: Float = 0.0
+            while k < tTotal {
+                accum += logLikelihoods[ph][k]
+                prefLL[ph][k + 1] = accum
+                k += 1
             }
             ph += 1
         }
 
-        // 3. バックトラックによる最適パスの確定
-        var durations = [Int](repeating: 0, count: nTotal)
-        var curPh = nTotal - 1
-        var curFrame = tTotal - 1
+        // 3. 制約付き単調動的計画法 (Constrained MAS)
+        // dp[i][k]: 音素 0...i をフレーム 0..<k に割り当てたときの最大対数尤度
+        // bestD[i][k]: その最大スコアを達成した音素 i のフレーム数 d
+        let negInf: Float = -1.0e18
+        var dp = [[Float]](repeating: [Float](repeating: negInf, count: tTotal + 1), count: nTotal)
+        var bestD = [[UInt8]](repeating: [UInt8](repeating: 0, count: tTotal + 1), count: nTotal)
 
-        while 0 <= curFrame {
-            durations[curPh] += 1
-            switch transition[curPh][curFrame] {
-            case 1:
-                curPh -= 1
-            default:
-                break
-            }
-            curFrame -= 1
+        // 初期化: 音素 0
+        let k0Min = minDurs[0]
+        let k0Max = min(maxDurs[0], tTotal - suffixMin[1])
+        var k0 = k0Min
+        while k0 <= k0Max {
+            dp[0][k0] = prefLL[0][k0]
+            bestD[0][k0] = UInt8(k0)
+            k0 += 1
         }
 
-        // 検証: 全音素が 1F 以上、かつ総和が tTotal と完全一致
-        var sumDurs = 0
-        var chk = 0
-        while chk < nTotal {
-            if durations[chk] < 1 {
+        // 漸化式更新: ph = 1 ..< nTotal
+        var curPh = 1
+        while curPh < nTotal {
+            let kMin = prefixMin[curPh]
+            let kMax = min(prefixMax[curPh], tTotal - suffixMin[curPh + 1])
+
+            var curK = kMin
+            while curK <= kMax {
+                let dMin = max(minDurs[curPh], curK - prefixMax[curPh - 1])
+                let dMax = min(maxDurs[curPh], curK - prefixMin[curPh - 1])
+
+                var bestScore = negInf
+                var bestDur: UInt8 = 0
+
+                var d = dMin
+                while d <= dMax {
+                    let prevK = curK - d
+                    let prevScore = dp[curPh - 1][prevK]
+                    if -1.0e17 < prevScore {
+                        let segScore = prefLL[curPh][curK] - prefLL[curPh][prevK]
+                        let totalScore = prevScore + segScore
+                        if bestScore < totalScore {
+                            bestScore = totalScore
+                            bestDur = UInt8(d)
+                        }
+                    }
+                    d += 1
+                }
+
+                dp[curPh][curK] = bestScore
+                bestD[curPh][curK] = bestDur
+                curK += 1
+            }
+            curPh += 1
+        }
+
+        // 4. バックトラックによる最適持続時間の確定
+        if dp[nTotal - 1][tTotal] <= -1.0e17 {
+            return nil
+        }
+
+        var durations = [Int](repeating: 0, count: nTotal)
+        var traceK = tTotal
+        var tracePh = nTotal - 1
+
+        while 0 <= tracePh {
+            let d = Int(bestD[tracePh][traceK])
+            if d < minDurs[tracePh] || maxDurs[tracePh] < d {
                 return nil
             }
-            sumDurs += durations[chk]
-            chk += 1
+            durations[tracePh] = d
+            traceK -= d
+            tracePh -= 1
+        }
+
+        if traceK != 0 {
+            return nil
+        }
+
+        // 5. 厳格受入検証:
+        // - 無音以外の 1 フレーム音素は禁止（母音 >= 4, 子音 >= 3）
+        // - 1 音素が maxDurLimit を超えない
+        // - 総和が tTotal と完全一致
+        var sumDurs = 0
+        var chkIdx = 0
+        while chkIdx < nTotal {
+            let dur = durations[chkIdx]
+            let reqMin = minDurs[chkIdx]
+            if dur < reqMin {
+                return nil
+            }
+            if maxDurs[chkIdx] < dur {
+                return nil
+            }
+            sumDurs += dur
+            chkIdx += 1
         }
         if sumDurs != tTotal {
             return nil
@@ -502,24 +646,26 @@ public final class MonotonicAlignmentSearch: Sendable {
                 )
             }
 
-            var phList: [PhonemeAlignment] = []
-            var p = 0
-            while p < item.phonemes.count && p < finalDurs.count {
-                phList.append(PhonemeAlignment(
-                    symbol: item.phonemes[p].symbol,
-                    phoneId: Int32(item.phonemes[p].id),
-                    durationFrames: finalDurs[p]
-                ))
-                p += 1
-            }
+            if finalDurs.count == item.phonemes.count {
+                var phList: [PhonemeAlignment] = []
+                var p = 0
+                while p < item.phonemes.count && p < finalDurs.count {
+                    phList.append(PhonemeAlignment(
+                        symbol: item.phonemes[p].symbol,
+                        phoneId: Int32(item.phonemes[p].id),
+                        durationFrames: finalDurs[p]
+                    ))
+                    p += 1
+                }
 
-            results.append(UtteranceAlignment(
-                utteranceId: item.utteranceId,
-                leadSilenceFrames: item.leadSilence,
-                trailSilenceFrames: item.trailSilence,
-                totalSpeechFrames: item.totalSpeechFrames,
-                phonemes: phList
-            ))
+                results.append(UtteranceAlignment(
+                    utteranceId: item.utteranceId,
+                    leadSilenceFrames: item.leadSilence,
+                    trailSilenceFrames: item.trailSilence,
+                    totalSpeechFrames: item.totalSpeechFrames,
+                    phonemes: phList
+                ))
+            }
             fIdx += 1
         }
 

@@ -194,11 +194,15 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
     public var baseF0: Float
     /// 全体音響エネルギースケーリング
     public var energyScale: Float
+    /// 1モーラあたりの目標平均フレーム数 (1フレーム=10ms)
+    /// nil の場合は LengthRegulator のデフォルト (16.0) を使用
+    public var meanFramesPerMora: Float?
 
     public init(
         name: String,
         baseF0: Float = 220.0,
-        energyScale: Float = 1.0
+        energyScale: Float = 1.0,
+        meanFramesPerMora: Float? = nil
     ) {
         var safeF0 = baseF0
         if safeF0.isFinite != true {
@@ -222,44 +226,67 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
             safeEnergy = 5.0
         }
 
+        var safeMoraFrames = meanFramesPerMora
+        switch safeMoraFrames {
+        case .some(var m):
+            if m.isFinite != true {
+                m = 13.26
+            }
+            if m < 5.0 {
+                m = 5.0
+            }
+            if 30.0 < m {
+                m = 30.0
+            }
+            safeMoraFrames = m
+        case .none:
+            break
+        }
+
         self.name = name
         self.baseF0 = safeF0
         self.energyScale = safeEnergy
+        self.meanFramesPerMora = safeMoraFrames
     }
 
-    /// 標準的な女性声プロファイル（baseF0 220Hz）
+    /// 標準的な女性声プロファイル（baseF0 220Hz, 実測モーラ長 13.26F = 132.6ms）
     public static let female = VoiceProfile(
         name: "female",
         baseF0: 220.0,
-        energyScale: 1.00
+        energyScale: 1.00,
+        meanFramesPerMora: 13.26
     )
 
     /// 成人男性声プロファイル（baseF0 120Hz）
     public static let male = VoiceProfile(
         name: "male",
         baseF0: 120.0,
-        energyScale: 1.00
+        energyScale: 1.00,
+        meanFramesPerMora: 13.26
     )
 
     /// 中性的な声プロファイル（baseF0 170Hz）
     public static let neutral = VoiceProfile(
         name: "neutral",
         baseF0: 170.0,
-        energyScale: 1.00
+        energyScale: 1.00,
+        meanFramesPerMora: 13.26
     )
 
     /// 子供・高音ボイスプロファイル（baseF0 300Hz）
     public static let child = VoiceProfile(
         name: "child",
         baseF0: 300.0,
-        energyScale: 1.00
+        energyScale: 1.00,
+        meanFramesPerMora: 13.26
     )
 
     /// 重低音男性ボイスプロファイル（超低域 baseF0 95Hz）
     public static let deepMale = VoiceProfile(
         name: "deepMale",
         baseF0: 95.0,
-        energyScale: 1.00
+        energyScale: 1.00,
+        meanFramesPerMora: 13.26
     )
 
     /// 既定プロファイル

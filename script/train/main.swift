@@ -429,6 +429,16 @@ func main() {
             }
         }
         var needMASGen = alignmentMap.isEmpty
+        if needMASGen != true {
+            if let sample0 = alignmentMap["BASIC5000_0001"] {
+                if AlignmentStore.isUtteranceAlignmentValid(sample0) != true {
+                    print("警告: キャッシュされた BASIC5000_0001 アライメントが縮退（1フレーム音素または20F超過）しています。制約付きMAS再集計を実行します。")
+                    needMASGen = true
+                }
+            } else {
+                needMASGen = true
+            }
+        }
         if let limit = maxSamples {
             if alignmentMap.count < limit {
                 needMASGen = true
@@ -442,7 +452,7 @@ func main() {
             case .none:
                 targetCountStr = "全"
             }
-            print("キャッシュされたアライメント数 (\(alignmentMap.count)) では不足しているため、教師 Mel 実測平均と 3 周 MAS 反復集計を実行して \(targetCountStr) 発話のアライメントを自己生成します...")
+            print("キャッシュされたアライメント数 (\(alignmentMap.count)) では不足、または縮退が検出されたため、教師 Mel 実測平均と 3 周 MAS 反復集計を実行して \(targetCountStr) 発話のアライメントを自己生成します...")
             let wavDir = cleanDatasetPath + "/wav"
             let transcriptPath = cleanDatasetPath + "/transcript_utf8.txt"
             if let tContent = try? String(contentsOfFile: transcriptPath, encoding: .utf8) {
@@ -743,17 +753,17 @@ func main() {
                             useScaledDuration: true
                         ) {
                             trainingData.append(pair)
-                            if let reconPair = engine.prepareTrainingPair(
-                                text: text,
-                                pcm16k: pcm16k,
-                                melExtractor: melExtractor,
-                                pitchTracker: pitchTracker,
-                                alignment: effectiveAlign,
-                                useScaledDuration: false
-                            ) {
-                                reconTargetSample = reconPair
-                            } else {
-                                reconTargetSample = pair
+                            if id == "BASIC5000_0001" {
+                                if let reconPair = engine.prepareTrainingPair(
+                                    text: text,
+                                    pcm16k: pcm16k,
+                                    melExtractor: melExtractor,
+                                    pitchTracker: pitchTracker,
+                                    alignment: effectiveAlign,
+                                    useScaledDuration: false
+                                ) {
+                                    reconTargetSample = reconPair
+                                }
                             }
                             let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
                             let pitchResult = pitchTracker.track(pcm: pcm16k)
@@ -1210,13 +1220,13 @@ func main() {
         phonemeAverages = LengthRegulator.defaultPhonemeAverageDurations
     }
 
-    var corpusMeanFramesPerMora: Float = 16.0
+    var corpusMeanFramesPerMora: Float = 13.26
     if 0 < totalMorasAcrossCorpus {
         corpusMeanFramesPerMora = Float(totalSpeechFramesAcrossCorpus) / Float(totalMorasAcrossCorpus)
     }
-    // 教師 WAV 実測会話速度（約 160ms/モーラ）の健全な基準範囲に制限
-    if corpusMeanFramesPerMora < 14.0 { corpusMeanFramesPerMora = 16.0 }
-    if 18.0 < corpusMeanFramesPerMora { corpusMeanFramesPerMora = 16.0 }
+    // 教師 WAV 実測会話速度（約 120〜160ms/モーラ）の健全な基準範囲に制限
+    if corpusMeanFramesPerMora < 10.0 { corpusMeanFramesPerMora = 13.26 }
+    if 20.0 < corpusMeanFramesPerMora { corpusMeanFramesPerMora = 13.26 }
     print("コーパス平均モーラ長: \(String(format: "%.2f", corpusMeanFramesPerMora)) frames (\(String(format: "%.1f", corpusMeanFramesPerMora * 10.0)) ms/モーラ)")
 
     let exportedWeights = bestSNNWeights
@@ -1238,7 +1248,7 @@ func main() {
     if trainingData.isEmpty != true {
         let reconDir = ".tmp/wave15"
         try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
-        let reconURL = URL(fileURLWithPath: reconDir + "/recon_5000_0001.wav")
+        let reconURL = URL(fileURLWithPath: reconDir + "/recon_BASIC5000_0001.wav")
 
         let reconEngine = SpikeSpeechEngine(weights: exportedWeights)
         let sample0 = reconTargetSample ?? trainingData[0]

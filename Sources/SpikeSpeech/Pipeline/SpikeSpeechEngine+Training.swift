@@ -145,7 +145,8 @@ extension SpikeSpeechEngine {
                 phrases: phrases,
                 speedFactor: 1.0,
                 applyFluctuation: false,
-                text: text
+                text: text,
+                meanFramesPerMora: VoiceProfile.female.meanFramesPerMora
             )
             let quantizedDurs = lengthRegulator.quantizeDurations(durations: scaledDurs)
             if quantizedDurs.count != phoneIds.count {
@@ -222,7 +223,7 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        // 教師 Mel・F0・有声度・エネルギーを targetSpeechFrames へ時間方向に線形リサンプリング
+        // 教師 Mel・F0・有声度・エネルギーを音素境界単位で目標フレーム数へ線形リサンプリング（設計書 5 項）
         let melCh = AudioConfig.melChannels
         var resampledMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: targetSpeechFrames)
         var resampledF0 = [Float](repeating: 0.0, count: targetSpeechFrames)
@@ -230,29 +231,144 @@ extension SpikeSpeechEngine {
         var resampledEnergy = [Float](repeating: 0.0, count: targetSpeechFrames)
 
         let srcLen = speechMel.count
-        let maxSrcIdx = Float(max(0, srcLen - 1))
-        let maxDstIdx = Float(max(1, targetSpeechFrames - 1))
 
-        var tf = 0
-        while tf < targetSpeechFrames {
-            let pos = (Float(tf) / maxDstIdx) * maxSrcIdx
-            var t0 = Int(pos)
-            if srcLen <= t0 { t0 = srcLen - 1 }
-            if t0 < 0 { t0 = 0 }
-            var t1 = t0 + 1
-            if srcLen <= t1 { t1 = srcLen - 1 }
-            let alpha = pos - Float(t0)
-
-            var c = 0
-            while c < melCh {
-                resampledMel[tf][c] = (1.0 - alpha) * speechMel[t0][c] + alpha * speechMel[t1][c]
-                c += 1
+        // 各音素のソース実測フレーム数を取得
+        var srcDurs: [Int] = []
+        switch alignment {
+        case .some(let uttAlign) where uttAlign.phonemes.count == phoneIds.count:
+            var p = 0
+            while p < uttAlign.phonemes.count {
+                srcDurs.append(max(1, uttAlign.phonemes[p].durationFrames))
+                p += 1
             }
-            resampledF0[tf] = (1.0 - alpha) * speechF0[t0] + alpha * speechF0[t1]
-            resampledVoiced[tf] = (1.0 - alpha) * speechVoiced[t0] + alpha * speechVoiced[t1]
-            resampledEnergy[tf] = (1.0 - alpha) * speechEnergy[t0] + alpha * speechEnergy[t1]
+        case _:
+            var rawFloatDurs: [Float] = []
+            var p = 0
+            while p < phoneIds.count {
+                let pid = phoneIds[p]
+                let avgDur = lengthRegulator.phonemeDuration(phoneId: pid, speedFactor: 1.0)
+                rawFloatDurs.append(avgDur)
+                p += 1
+            }
+            var sumFloat: Float = 0.0
+            var fI = 0
+            while fI < rawFloatDurs.count {
+                sumFloat += rawFloatDurs[fI]
+                fI += 1
+            }
+            let scale: Float
+            if 0.001 < sumFloat {
+                scale = Float(srcLen) / sumFloat
+            } else {
+                scale = 1.0
+            }
+            var scaledFloatDurs: [Float] = []
+            var sI = 0
+            while sI < rawFloatDurs.count {
+                scaledFloatDurs.append(max(1.0, rawFloatDurs[sI] * scale))
+                sI += 1
+            }
+            srcDurs = lengthRegulator.quantizeDurations(durations: scaledFloatDurs)
+        }
 
-            tf += 1
+        // srcDurs の総和を厳密に srcLen と一致させる
+        var curSrcSum = 0
+        var cI = 0
+        while cI < srcDurs.count {
+            curSrcSum += srcDurs[cI]
+            cI += 1
+        }
+        let srcDiff = srcLen - curSrcSum
+        if srcDiff != 0 && srcDurs.isEmpty != true {
+            let lastIdx = srcDurs.count - 1
+            let adj = srcDurs[lastIdx] + srcDiff
+            if 1 <= adj {
+                srcDurs[lastIdx] = adj
+            } else {
+                srcDurs[lastIdx] = 1
+            }
+        }
+
+        // 音素境界単位でのリサンプリング配置
+        var srcOffset = 0
+        var dstOffset = 0
+        var phSeqIdx = 0
+        while phSeqIdx < phoneIds.count {
+            let srcDur = srcDurs[phSeqIdx]
+            let dstDur = speechDurations[phSeqIdx]
+
+            switch (dstDur <= 1, srcDur <= 1) {
+            case (true, _):
+                let srcIdx: Int
+                if srcDur <= 1 {
+                    srcIdx = srcOffset
+                } else {
+                    srcIdx = srcOffset + (srcDur / 2)
+                }
+                let safeSrcIdx = min(srcLen - 1, max(0, srcIdx))
+                let dstIdx = min(targetSpeechFrames - 1, dstOffset)
+                resampledMel[dstIdx].withUnsafeMutableBufferPointer { pDst in
+                    speechMel[safeSrcIdx].withUnsafeBufferPointer { pSrc in
+                        pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                    }
+                }
+                resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
+                resampledEnergy[dstIdx] = speechEnergy[safeSrcIdx]
+
+            case (false, true):
+                let safeSrcIdx = min(srcLen - 1, max(0, srcOffset))
+                var f = 0
+                while f < dstDur {
+                    let dstIdx = min(targetSpeechFrames - 1, dstOffset + f)
+                    resampledMel[dstIdx].withUnsafeMutableBufferPointer { pDst in
+                        speechMel[safeSrcIdx].withUnsafeBufferPointer { pSrc in
+                            pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                        }
+                    }
+                    resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                    resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
+                    resampledEnergy[dstIdx] = speechEnergy[safeSrcIdx]
+                    f += 1
+                }
+
+            case (false, false):
+                let maxDstP = Float(dstDur - 1)
+                let maxSrcP = Float(srcDur - 1)
+                var f = 0
+                while f < dstDur {
+                    let dstIdx = min(targetSpeechFrames - 1, dstOffset + f)
+                    let posWithinPh = (Float(f) / maxDstP) * maxSrcP
+                    var s0 = Int(posWithinPh)
+                    if srcDur <= s0 {
+                        s0 = srcDur - 1
+                    }
+                    if s0 < 0 {
+                        s0 = 0
+                    }
+                    var s1 = s0 + 1
+                    if srcDur <= s1 {
+                        s1 = srcDur - 1
+                    }
+                    let alpha = posWithinPh - Float(s0)
+                    let src0 = min(srcLen - 1, max(0, srcOffset + s0))
+                    let src1 = min(srcLen - 1, max(0, srcOffset + s1))
+
+                    var c = 0
+                    while c < melCh {
+                        resampledMel[dstIdx][c] = (1.0 - alpha) * speechMel[src0][c] + alpha * speechMel[src1][c]
+                        c += 1
+                    }
+                    resampledF0[dstIdx] = (1.0 - alpha) * speechF0[src0] + alpha * speechF0[src1]
+                    resampledVoiced[dstIdx] = (1.0 - alpha) * speechVoiced[src0] + alpha * speechVoiced[src1]
+                    resampledEnergy[dstIdx] = (1.0 - alpha) * speechEnergy[src0] + alpha * speechEnergy[src1]
+                    f += 1
+                }
+            }
+
+            srcOffset += srcDur
+            dstOffset += dstDur
+            phSeqIdx += 1
         }
 
         // 先頭無音・発話本体・末尾無音の結合

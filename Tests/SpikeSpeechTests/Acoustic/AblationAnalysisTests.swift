@@ -113,8 +113,11 @@ final class AblationAnalysisTests: XCTestCase {
             speaker: .zero
         )
         let path1 = "\(outputDir)/ablate_recon.wav"
-        try WavEncoder.encode(samples: samplesRecon, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path1))
-        print("[Ablation 1] 生成完了: \(path1)")
+        let pathRecon = "\(outputDir)/recon_BASIC5000_0001.wav"
+        let reconData = WavEncoder.encode(samples: samplesRecon, sampleRate: AudioConfig.sampleRate)
+        try reconData.write(to: URL(fileURLWithPath: path1))
+        try reconData.write(to: URL(fileURLWithPath: pathRecon))
+        print("[Ablation 1] 生成完了: \(path1), \(pathRecon)")
 
         // =======================================================
         // 2. ablate_recon_mel_pred_f0.wav
@@ -127,7 +130,8 @@ final class AblationAnalysisTests: XCTestCase {
             prosodyPredictor: engine.prosodyPredictor,
             speedFactor: 1.0,
             baseF0: VoiceProfile.female.baseF0,
-            addBoundarySilence: true
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.female.meanFramesPerMora
         )
         let ttsFrames = ttsLinguistic.totalFrames
         var predF0_319 = [Float](repeating: 0.0, count: totalF319)
@@ -323,17 +327,30 @@ final class AblationAnalysisTests: XCTestCase {
         print("[Ablation 4] 生成完了: \(path4)")
 
         // =======================================================
+        // 5. tts_tenki.wav ("今日はいい天気です" 通常 TTS)
+        // =======================================================
+        engine.workspace.reset()
+        vocoder.reset()
+        let tenkiText = "今日はいい天気です"
+        let samplesTenki = engine.synthesize(text: tenkiText)
+        let path5 = "\(outputDir)/tts_tenki.wav"
+        try WavEncoder.encode(samples: samplesTenki, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path5))
+        print("[TTS Tenki] 生成完了: \(path5)")
+
+        // =======================================================
         // 客観音響特性の計測とフォーマット出力
         // =======================================================
         let paths = [
             ("1. ablate_recon.wav (SNN Recon Mel + Teacher F0)", path1),
+            ("1b. recon_BASIC5000_0001.wav (SNN Recon Mel + Teacher F0)", pathRecon),
             ("2. ablate_recon_mel_pred_f0.wav (SNN Recon Mel + Pred F0)", path2),
             ("3. ablate_tts.wav (TTS Standard: Pred Mel + Pred F0)", path3),
-            ("4. ablate_tts_teacher_f0.wav (TTS Teacher F0: SNN Mel w/ Teacher F0)", path4)
+            ("4. ablate_tts_teacher_f0.wav (TTS Teacher F0: SNN Mel w/ Teacher F0)", path4),
+            ("5. tts_tenki.wav (TTS Standard: 今日はいい天気です)", path5)
         ]
 
         print("\n=======================================================")
-        print("Ablation 4本 客観音響特性分析 (Ablation Analysis)")
+        print("Ablation波形およびTTS波形 客観音響特性分析 (Ablation Analysis)")
         print("=======================================================")
 
         var pCount = 0
@@ -2438,7 +2455,8 @@ final class AblationAnalysisTests: XCTestCase {
                     prosodyPredictor: engine.prosodyPredictor,
                     speedFactor: 1.0,
                     baseF0: VoiceProfile.female.baseF0,
-                    addBoundarySilence: true
+                    addBoundarySilence: true,
+                    meanFramesPerMora: VoiceProfile.female.meanFramesPerMora
                 )
                 let ttsSeq = engine.encodeLinguisticFeatures(features: ttsLinguistic)
 

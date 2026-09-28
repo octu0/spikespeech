@@ -401,7 +401,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             prosodyPredictor: prosodyPredictor,
             speedFactor: safeSpeed,
             baseF0: effectiveBaseF0,
-            addBoundarySilence: true
+            addBoundarySilence: true,
+            meanFramesPerMora: voice.meanFramesPerMora
         )
 
         let totalFrames = linguisticFeatures.totalFrames

@@ -65,11 +65,40 @@ public final class AlignmentStore: Sendable {
         try data.write(to: url, options: .atomic)
     }
 
+    /// 発話アライメントが縮退していないか（無音以外の 1 フレーム音素や 20F 超過が存在しないか）検証する
+    public static func isUtteranceAlignmentValid(_ utt: UtteranceAlignment) -> Bool {
+        if utt.phonemes.isEmpty {
+            return false
+        }
+        var i = 0
+        while i < utt.phonemes.count {
+            let ph = utt.phonemes[i]
+            let d = ph.durationFrames
+            if ph.symbol != "<sil>" && ph.symbol != "<pau>" {
+                if d < 3 {
+                    return false
+                }
+                switch ph.symbol {
+                case "a", "i", "u", "e", "o", "_":
+                    if d < 4 {
+                        return false
+                    }
+                default:
+                    break
+                }
+                if 20 < d {
+                    return false
+                }
+            }
+            i += 1
+        }
+        return true
+    }
+
     /// 全アライメントデータから音素 ID ごとの平均フレーム数を集計する
-    /// なぜ学習アライメント統計を推論正本とするか:
-    /// 16.0 モーラ固定や等時間割りを完全撤廃し、実音声データで観測された
-    /// 各音素の実際の継続時間（母音、子音、促音、撥音）の平均値を推論に適用することで、
-    /// 学習と推論で完全に同一の音素時間スケールを実現するため。
+    /// なぜ健全なアライメント統計のみを推論正本とするか:
+    /// 1 フレーム音素に潰れた縮退発話を統計から完全に排除し、
+    /// 実音声データで正しく観測された各音素の実際の継続時間（母音、子音、促音、撥音）の平均値を推論に適用するため。
     public static func computeAverageDurations(from alignments: [UtteranceAlignment]) -> [Int32: Float] {
         var durationSums: [Int32: Float] = [:]
         var counts: [Int32: Float] = [:]
@@ -77,15 +106,17 @@ public final class AlignmentStore: Sendable {
         var u = 0
         while u < alignments.count {
             let utt = alignments[u]
-            var p = 0
-            while p < utt.phonemes.count {
-                let ph = utt.phonemes[p]
-                let pid = ph.phoneId
-                let curSum = durationSums[pid] ?? 0.0
-                let curCount = counts[pid] ?? 0.0
-                durationSums[pid] = curSum + Float(ph.durationFrames)
-                counts[pid] = curCount + 1.0
-                p += 1
+            if isUtteranceAlignmentValid(utt) {
+                var p = 0
+                while p < utt.phonemes.count {
+                    let ph = utt.phonemes[p]
+                    let pid = ph.phoneId
+                    let curSum = durationSums[pid] ?? 0.0
+                    let curCount = counts[pid] ?? 0.0
+                    durationSums[pid] = curSum + Float(ph.durationFrames)
+                    counts[pid] = curCount + 1.0
+                    p += 1
+                }
             }
             u += 1
         }

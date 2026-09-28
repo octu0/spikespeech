@@ -117,7 +117,8 @@ public final class LengthRegulator: Sendable {
         phrases: [AccentPhrase],
         speedFactor: Float = 1.0,
         applyFluctuation: Bool = true,
-        text: String = ""
+        text: String = "",
+        meanFramesPerMora: Float? = nil
     ) -> [Float] {
         var rawDurations: [Float] = []
         var totalMoras = 0
@@ -162,8 +163,16 @@ public final class LengthRegulator: Sendable {
             rI += 1
         }
 
-        // 目標本体フレーム数 (meanFramesPerMora / safeSpeed * totalMoras)
-        let targetBodyFrames = (meanFramesPerMora / safeSpeed) * Float(totalMoras)
+        let effectiveMoraRate: Float
+        switch meanFramesPerMora {
+        case .some(let m):
+            effectiveMoraRate = m
+        case .none:
+            effectiveMoraRate = self.meanFramesPerMora
+        }
+
+        // 目標本体フレーム数 (effectiveMoraRate / safeSpeed * totalMoras)
+        let targetBodyFrames = (effectiveMoraRate / safeSpeed) * Float(totalMoras)
         var scaleFactor: Float = 1.0
         if 0.001 < rawSum {
             scaleFactor = targetBodyFrames / rawSum
@@ -312,7 +321,8 @@ public final class LengthRegulator: Sendable {
         speedFactor: Float = 1.0,
         baseF0: Float = 220.0,
         applyFluctuation: Bool = true,
-        addBoundarySilence: Bool = false
+        addBoundarySilence: Bool = false,
+        meanFramesPerMora: Float? = nil
     ) -> LinguisticFeatures {
         if text.isEmpty {
             return LinguisticFeatures(phoneIds: [], durations: [], f0Contour: [], voicedFlags: [], energyContour: [], totalFrames: 0)
@@ -346,14 +356,16 @@ public final class LengthRegulator: Sendable {
                 lengthRegulator: self,
                 speedFactor: safeSpeedFactor,
                 applyFluctuation: applyFluctuation,
-                text: text
+                text: text,
+                meanFramesPerMora: meanFramesPerMora
             )
         case .none:
             let rawFloatDurations = computeDataDrivenDurations(
                 phrases: phrases,
                 speedFactor: safeSpeedFactor,
                 applyFluctuation: applyFluctuation,
-                text: text
+                text: text,
+                meanFramesPerMora: meanFramesPerMora
             )
             quantizedDurations = quantizeDurations(durations: rawFloatDurations)
         }
