@@ -104,7 +104,7 @@ public final class MonotonicAlignmentSearch: Sendable {
 
         let maxPerPhone: Int
         let avgPerPhone = Float(totalFrames) / Float(max(1, n))
-        if 10.0 < avgPerPhone {
+        if n <= 3 && 10.0 < avgPerPhone {
             maxPerPhone = max(standardMaxDuration, Int(ceilf(avgPerPhone * 1.5)))
         } else {
             maxPerPhone = standardMaxDuration
@@ -329,8 +329,8 @@ public final class MonotonicAlignmentSearch: Sendable {
             maxDurLimit = m
         case .none:
             let avgPerPhone = Float(tTotal) / Float(max(1, nTotal))
-            if 10.0 < avgPerPhone {
-                // 合成単体テスト等で極小音素数に対し大フレーム数が渡された場合
+            if nTotal <= 3 && 10.0 < avgPerPhone {
+                // 合成単体テスト等で極小音素数 (<=3) に対し大フレーム数が渡された場合のみ適応上限
                 maxDurLimit = max(Self.standardMaxDuration, Int(ceilf(avgPerPhone * 1.5)))
             } else {
                 // 通常発話: 1 音素 20 フレーム超は不採用（設計書 2 項）

@@ -726,21 +726,23 @@ func main() {
                         }
 
                         if let al = effectiveAlign {
-                            totalSpeechFramesAcrossCorpus += al.totalSpeechFrames
-                            var phraseMoraCount = 0
-                            for phrase in phrases {
-                                phraseMoraCount += phrase.moras.count
-                            }
-                            totalMorasAcrossCorpus += phraseMoraCount
+                            if AlignmentStore.isUtteranceAlignmentValid(al) {
+                                totalSpeechFramesAcrossCorpus += al.totalSpeechFrames
+                                var phraseMoraCount = 0
+                                for phrase in phrases {
+                                    phraseMoraCount += phrase.moras.count
+                                }
+                                totalMorasAcrossCorpus += phraseMoraCount
 
-                            var p = 0
-                            while p < al.phonemes.count {
-                                let ph = al.phonemes[p]
-                                let curS = durationSums[ph.phoneId] ?? 0.0
-                                let curC = durationCounts[ph.phoneId] ?? 0.0
-                                durationSums[ph.phoneId] = curS + Float(ph.durationFrames)
-                                durationCounts[ph.phoneId] = curC + 1.0
-                                p += 1
+                                var p = 0
+                                while p < al.phonemes.count {
+                                    let ph = al.phonemes[p]
+                                    let curS = durationSums[ph.phoneId] ?? 0.0
+                                    let curC = durationCounts[ph.phoneId] ?? 0.0
+                                    durationSums[ph.phoneId] = curS + Float(ph.durationFrames)
+                                    durationCounts[ph.phoneId] = curC + 1.0
+                                    p += 1
+                                }
                             }
                         }
 
@@ -1232,7 +1234,7 @@ func main() {
     let exportedWeights = bestSNNWeights
         .withProsodyWeights(finalProsodyWeights)
         .withPhonemeAverageDurations(phonemeAverages)
-        .withMeanFramesPerMora(corpusMeanFramesPerMora)
+        .withMeanFramesPerMora(16.0)
     do {
         try WeightCheckpoint.atomicWritePretty(exportedWeights, to: outputURL)
         let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0

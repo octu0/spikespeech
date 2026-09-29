@@ -235,7 +235,7 @@ extension SpikeSpeechEngine {
         // 各音素のソース実測フレーム数を取得
         var srcDurs: [Int] = []
         switch alignment {
-        case .some(let uttAlign) where uttAlign.phonemes.count == phoneIds.count:
+        case .some(let uttAlign) where uttAlign.phonemes.count == phoneIds.count && AlignmentStore.isUtteranceAlignmentValid(uttAlign):
             var p = 0
             while p < uttAlign.phonemes.count {
                 srcDurs.append(max(1, uttAlign.phonemes[p].durationFrames))

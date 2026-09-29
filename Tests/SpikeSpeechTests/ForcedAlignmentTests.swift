@@ -293,5 +293,136 @@ final class ForcedAlignmentTests: XCTestCase {
         XCTAssertTrue(12 <= durs[0], "/s/ のフレーム長が短すぎます: \(durs[0])")
         XCTAssertTrue(durs[0] <= 18, "/s/ のフレーム長が長すぎます: \(durs[0])")
     }
+
+    /// 通常発話系列 (音素数 > 3) において 1音素20フレーム上限制約および最小継続時間制約が厳密に守られることを検証
+    func testMASStrictlyEnforcesStandardMaxDuration() {
+        let frameCount = 100
+        let testMel = [[Float]](repeating: [Float](repeating: -6.0, count: AudioConfig.melChannels), count: frameCount)
+        let testVoiced = [Float](repeating: 0.0, count: frameCount)
+
+        let tokens = [
+            PhonemeToken(id: 10, symbol: "k", category: .consonant),
+            PhonemeToken(id: 9, symbol: "o", category: .vowel),
+            PhonemeToken(id: 13, symbol: "n", category: .consonant),
+            PhonemeToken(id: 6, symbol: "i", category: .vowel),
+            PhonemeToken(id: 18, symbol: "w", category: .consonant),
+            PhonemeToken(id: 5, symbol: "a", category: .vowel)
+        ]
+
+        // 6 音素で 100 フレーム (1音素平均 16.6F)
+        let bootstrapDurs = MonotonicAlignmentSearch.initialBootstrapDurations(totalFrames: frameCount, phonemes: tokens)
+        XCTAssertEqual(bootstrapDurs.count, tokens.count)
+        var b = 0
+        while b < bootstrapDurs.count {
+            XCTAssertTrue(MonotonicAlignmentSearch.minDuration(for: tokens[b]) <= bootstrapDurs[b])
+            XCTAssertTrue(bootstrapDurs[b] <= 20)
+            b += 1
+        }
+
+        let prototypes = MonotonicAlignmentSearch.accumulatePrototypes(
+            utterances: [(mel: testMel, voiced: testVoiced, phonemes: tokens, durations: bootstrapDurs)]
+        )
+        let mas = MonotonicAlignmentSearch(prototypes: prototypes)
+        guard let durations = mas.align(mel: testMel, voiced: testVoiced, phonemes: tokens) else {
+            XCTFail("MAS alignment failed")
+            return
+        }
+
+        XCTAssertEqual(durations.count, tokens.count)
+        var sum = 0
+        var i = 0
+        while i < durations.count {
+            let d = durations[i]
+            let reqMin = MonotonicAlignmentSearch.minDuration(for: tokens[i])
+            XCTAssertTrue(reqMin <= d, "音素 \(tokens[i].symbol) のフレーム長 \(d) が最小要件 \(reqMin) 未満")
+            XCTAssertTrue(d <= 20, "音素 \(tokens[i].symbol) のフレーム長 \(d) が上限 20F を超過")
+            sum += d
+            i += 1
+        }
+        XCTAssertEqual(sum, frameCount)
+
+        var phList: [PhonemeAlignment] = []
+        var pIdx = 0
+        while pIdx < tokens.count {
+            phList.append(PhonemeAlignment(symbol: tokens[pIdx].symbol, phoneId: Int32(tokens[pIdx].id), durationFrames: durations[pIdx]))
+            pIdx += 1
+        }
+        let utt = UtteranceAlignment(
+            utteranceId: "TEST_MAX20",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: frameCount,
+            phonemes: phList
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(utt))
+    }
+
+    /// AlignmentStore.isUtteranceAlignmentValid が縮退音素 (1F, 子音<3F, 母音<4F, 20F超過) を厳格に拒絶することを検証
+    func testAlignmentStoreValidationRejectsDegenerateAndExcessiveDurations() {
+        // 正常発話
+        let validUtt = UtteranceAlignment(
+            utteranceId: "VALID",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: 15,
+            phonemes: [
+                PhonemeAlignment(symbol: "k", phoneId: 10, durationFrames: 5),
+                PhonemeAlignment(symbol: "a", phoneId: 5, durationFrames: 10)
+            ]
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(validUtt))
+
+        // 子音 1F (縮退)
+        let degConsonant1F = UtteranceAlignment(
+            utteranceId: "DEG_1F",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: 11,
+            phonemes: [
+                PhonemeAlignment(symbol: "k", phoneId: 10, durationFrames: 1),
+                PhonemeAlignment(symbol: "a", phoneId: 5, durationFrames: 10)
+            ]
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(degConsonant1F) != true)
+
+        // 子音 2F (< 3F)
+        let degConsonant2F = UtteranceAlignment(
+            utteranceId: "DEG_2F",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: 12,
+            phonemes: [
+                PhonemeAlignment(symbol: "k", phoneId: 10, durationFrames: 2),
+                PhonemeAlignment(symbol: "a", phoneId: 5, durationFrames: 10)
+            ]
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(degConsonant2F) != true)
+
+        // 母音 3F (< 4F)
+        let degVowel3F = UtteranceAlignment(
+            utteranceId: "DEG_V3F",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: 8,
+            phonemes: [
+                PhonemeAlignment(symbol: "k", phoneId: 10, durationFrames: 5),
+                PhonemeAlignment(symbol: "a", phoneId: 5, durationFrames: 3)
+            ]
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(degVowel3F) != true)
+
+        // 母音 21F (> 20F)
+        let excessVowel21F = UtteranceAlignment(
+            utteranceId: "EXCESS_21F",
+            leadSilenceFrames: 10,
+            trailSilenceFrames: 10,
+            totalSpeechFrames: 26,
+            phonemes: [
+                PhonemeAlignment(symbol: "k", phoneId: 10, durationFrames: 5),
+                PhonemeAlignment(symbol: "a", phoneId: 5, durationFrames: 21)
+            ]
+        )
+        XCTAssertTrue(AlignmentStore.isUtteranceAlignmentValid(excessVowel21F) != true)
+    }
 }
 

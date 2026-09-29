@@ -249,12 +249,12 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         self.meanFramesPerMora = safeMoraFrames
     }
 
-    /// 標準的な女性声プロファイル（baseF0 220Hz, 実測モーラ長 13.26F = 132.6ms）
+    /// 標準的な女性声プロファイル（baseF0 220Hz, 実測モーラ長 16.0F = 160ms）
     public static let female = VoiceProfile(
         name: "female",
         baseF0: 220.0,
         energyScale: 1.00,
-        meanFramesPerMora: 13.26
+        meanFramesPerMora: 16.0
     )
 
     /// 成人男性声プロファイル（baseF0 120Hz）
@@ -262,7 +262,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "male",
         baseF0: 120.0,
         energyScale: 1.00,
-        meanFramesPerMora: 13.26
+        meanFramesPerMora: 16.0
     )
 
     /// 中性的な声プロファイル（baseF0 170Hz）
@@ -270,7 +270,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "neutral",
         baseF0: 170.0,
         energyScale: 1.00,
-        meanFramesPerMora: 13.26
+        meanFramesPerMora: 16.0
     )
 
     /// 子供・高音ボイスプロファイル（baseF0 300Hz）
@@ -278,7 +278,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "child",
         baseF0: 300.0,
         energyScale: 1.00,
-        meanFramesPerMora: 13.26
+        meanFramesPerMora: 16.0
     )
 
     /// 重低音男性ボイスプロファイル（超低域 baseF0 95Hz）
@@ -286,7 +286,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "deepMale",
         baseF0: 95.0,
         energyScale: 1.00,
-        meanFramesPerMora: 13.26
+        meanFramesPerMora: 16.0
     )
 
     /// 既定プロファイル

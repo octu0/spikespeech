@@ -1557,7 +1557,9 @@ final class AblationAnalysisTests: XCTestCase {
         let loaded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
 
         // 健全な実測音素プロファイル
-        let updated = loaded.withPhonemeAverageDurations(LengthRegulator.defaultPhonemeAverageDurations)
+        let updated = loaded
+            .withPhonemeAverageDurations(LengthRegulator.defaultPhonemeAverageDurations)
+            .withMeanFramesPerMora(16.0)
         try WeightCheckpoint.atomicWritePretty(updated, to: weightsURL)
         print("[Weights Updated] Models/weights.json に自然な音素平均フレームテーブルを永続化しました。")
 
