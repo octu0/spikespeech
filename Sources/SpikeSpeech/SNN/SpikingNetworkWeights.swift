@@ -361,6 +361,57 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         )
     }
 
+    /// 入力重み wIn の音響特徴量チャンネル（ch 192..198: voiced, unvoiced, normF0, deltaF0, phonePos, rate, energy）の列のみを、
+    /// 未使用チャンネル（ch 200..255）と同等の初期化スケールで再初期化し、その他（one-hot列、再帰重み、上位層、ボコーダ等）を維持した重みインスタンスを生成する。
+    public func withResetAcousticInWeights(seed: UInt64 = 2026) -> SpikingNetworkWeights {
+        var newWIn = self.wIn
+        var rngState = seed
+        let scaleIn = sqrt(2.0 / Float(self.inputDim))
+
+        func nextUniform(scale: Float) -> Float {
+            rngState ^= rngState << 13
+            rngState ^= rngState >> 7
+            rngState ^= rngState << 17
+            let u01 = Float(rngState & 0x00FFFFFF) / Float(0x01000000)
+            return (u01 * 2.0 - 1.0) * scale
+        }
+
+        var h = 0
+        while h < self.maxHiddenDim {
+            let rowOffset = h * self.inputDim
+            var ch = 192
+            while ch <= 198 {
+                if ch < self.inputDim {
+                    newWIn[rowOffset + ch] = nextUniform(scale: scaleIn)
+                }
+                ch += 1
+            }
+            h += 1
+        }
+
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: newWIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
+        )
+    }
+
+
     /// 発火ニューロンから各出力ニューロンへの流出結合重みをメモリ上で連続配置に変換し、推論時の SIMD8 ロードにおけるキャッシュミスを根絶する。
     public func makeWRecT() -> [Float] {
         let hSize = maxHiddenDim

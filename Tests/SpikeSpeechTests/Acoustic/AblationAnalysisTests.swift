@@ -1127,8 +1127,8 @@ final class AblationAnalysisTests: XCTestCase {
         print("[Pinpoint 2] test_fast_predMel_teacherF0.wav 出力完了 (サンプル数: \(samplesMelOnly.count), \(Float(samplesMelOnly.count)/16000.0)s)")
     }
 
-    /// pair.features (肉声) と fastInputSeq (ロボット) の完全 diff 検査
-    func testDiffFeatures() throws {
+    /// prepareTrainingPair の特徴行列が processText / synthesize の特徴行列と完全一致することを検証（手順3要件）
+    func testTrainingFeaturesMatchProcessTextFeatures() throws {
         let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
         guard FileManager.default.fileExists(atPath: wavPath) else { return }
 
@@ -1147,72 +1147,82 @@ final class AblationAnalysisTests: XCTestCase {
             pcm16k: rawPCM,
             melExtractor: melExtractor,
             pitchTracker: pitchTracker
-        ) else { return }
+        ) else {
+            XCTFail("prepareTrainingPair に失敗しました")
+            return
+        }
 
-        let targetSpeed: Float = 459.0 / 319.0
-        let fastLinguistic = engine.lengthRegulator.processText(
+        let synthLinguistic = engine.lengthRegulator.processText(
             text: text,
             normalizer: engine.normalizer,
             prosodyModel: engine.prosodyModel,
             vocabulary: engine.vocabulary,
             prosodyPredictor: engine.prosodyPredictor,
-            speedFactor: targetSpeed,
-            baseF0: VoiceProfile.female.baseF0,
-            addBoundarySilence: true
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.default.baseF0,
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
         )
-        let fastInputSeq = engine.encodeLinguisticFeatures(features: fastLinguistic)
+        let synthFeatures = engine.encodeLinguisticFeatures(features: synthLinguistic)
 
-        print("\n=======================================================")
-        print("特徴量 完全 diff 検査: pair.features vs fastInputSeq")
-        print("  pair.features frames: \(pair.features.count)")
-        print("  fastInputSeq frames: \(fastInputSeq.count)")
-        print("=======================================================")
+        // 1. フレーム数の一致検証
+        XCTAssertEqual(pair.features.count, synthFeatures.count, "学習特徴行列と合成特徴行列のフレーム数が一致していません")
+        XCTAssertEqual(pair.targets.count, pair.features.count, "目標Melスペクトルと特徴量のフレーム数が一致していません")
 
-        // 各音素の最初のフレームにおける特徴量ベクトル (ch 0..127) を比較
-        var pIdx = 0
-        var curPPhone = -1
-        while pIdx < pair.features.count {
-            var ph = -1
+        // 2. 全チャンネル・全フレームの最大絶対差検証（手順3要件: 最大差 0）
+        var globalMaxDiff: Float = 0.0
+        var f = 0
+        while f < pair.features.count {
             var c = 0
-            while c < 64 {
-                if 1.0 < pair.features[pIdx][c] { ph = c }
+            let inDim = min(pair.features[f].count, synthFeatures[f].count)
+            while c < inDim {
+                let diff = abs(pair.features[f][c] - synthFeatures[f][c])
+                if globalMaxDiff < diff {
+                    globalMaxDiff = diff
+                }
                 c += 1
             }
-            if ph != curPPhone && 0 <= ph {
-                curPPhone = ph
-                let pSym = engine.vocabulary.token(for: ph)
+            f += 1
+        }
 
-                // fastInputSeq で同じ音素のフレームを探す
-                var fIdx = 0
-                var foundF = -1
-                while fIdx < fastInputSeq.count {
-                    if 1.0 < fastInputSeq[fIdx][ph] {
-                        foundF = fIdx
-                        break
-                    }
-                    fIdx += 1
-                }
+        XCTAssertTrue(globalMaxDiff <= 0.0, "全チャンネル・全フレームの特徴量最大絶対差が 0 ではありません: \(globalMaxDiff)")
 
-                if 0 <= foundF {
-                    print("\n[Phone \(pSym) (id=\(ph))] pair frame \(pIdx) vs fast frame \(foundF)")
-                    var diffChannels: [String] = []
-                    var ch = 0
-                    while ch < 128 {
-                        let pVal = pair.features[pIdx][ch]
-                        let fVal = fastInputSeq[foundF][ch]
-                        let diff = abs(pVal - fVal)
-                        if 0.05 < diff {
-                            diffChannels.append("ch\(ch): pair=\(String(format: "%.3f", pVal)) vs fast=\(String(format: "%.3f", fVal))")
-                        }
-                        ch += 1
-                    }
-                    print("  差分チャンネル数: \(diffChannels.count) / 128")
-                    for d in diffChannels.prefix(15) {
-                        print("    \(d)")
-                    }
-                }
+        // 3. アライメント指定時も特徴行列が厳密一致することの検証
+        var effectiveAlign: UtteranceAlignment? = nil
+        let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        if FileManager.default.fileExists(atPath: corpusAlignPath) {
+            if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                effectiveAlign = alignMap["BASIC5000_0001"]
             }
-            pIdx += 1
+        }
+        if effectiveAlign != nil {
+            guard let pairWithAlign = engine.prepareTrainingPair(
+                text: text,
+                pcm16k: rawPCM,
+                melExtractor: melExtractor,
+                pitchTracker: pitchTracker,
+                alignment: effectiveAlign
+            ) else {
+                XCTFail("アライメント指定時の prepareTrainingPair に失敗しました")
+                return
+            }
+            XCTAssertEqual(pairWithAlign.features.count, synthFeatures.count, "アライメント指定時のフレーム数が一致していません")
+            XCTAssertEqual(pairWithAlign.targets.count, synthFeatures.count, "アライメント指定時の目標Melフレーム数が一致していません")
+            var alignMaxDiff: Float = 0.0
+            var af = 0
+            while af < pairWithAlign.features.count {
+                var c = 0
+                let inDim = min(pairWithAlign.features[af].count, synthFeatures[af].count)
+                while c < inDim {
+                    let diff = abs(pairWithAlign.features[af][c] - synthFeatures[af][c])
+                    if alignMaxDiff < diff {
+                        alignMaxDiff = diff
+                    }
+                    c += 1
+                }
+                af += 1
+            }
+            XCTAssertTrue(alignMaxDiff <= 0.0, "アライメント指定時の全チャンネル・全フレーム特徴量最大絶対差が 0 ではありません: \(alignMaxDiff)")
         }
     }
 
@@ -2122,6 +2132,11 @@ final class AblationAnalysisTests: XCTestCase {
 
     /// 全 5,000 発話の MAS アライメントを集計し、mas_alignments.json および Models/weights.json を更新する
     func testExtractFullCorpusMASAndExportDurations() throws {
+        let shouldRun = ProcessInfo.processInfo.environment["SPIKESPEECH_STRESS_TEST"] != nil
+        if shouldRun != true {
+            throw XCTSkip("全 5000 発話の MAS 反復抽出は SPIKESPEECH_STRESS_TEST=1 で実行してください")
+        }
+
         let corpusDir = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000"
         let corpusMasCachePath = "\(corpusDir)/mas_alignments.json"
         let wavDir = "\(corpusDir)/wav"
@@ -2595,4 +2610,5 @@ final class AblationAnalysisTests: XCTestCase {
         }
     }
 }
+
 

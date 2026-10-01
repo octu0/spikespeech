@@ -34,10 +34,12 @@ func main() {
     var prosodyLearningRate: Float = 0.008
     var freshProsody: Bool = false
     var alignmentsPath: String? = nil
+    var forceMAS: Bool = false
 
     func printUsage() {
-        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [--fresh-snn] [-o <output.json>]")
+        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [--force-mas] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [--fresh-snn] [-o <output.json>]")
     }
+
 
     var i = 1
     while i < args.count {
@@ -241,9 +243,12 @@ func main() {
             forceFreshSNN = true
         case "--init-bout":
             forceInitBOut = true
+        case "--force-mas":
+            forceMAS = true
         case "-h", "--help":
             printUsage()
             return
+
         default:
             break
         }
@@ -428,15 +433,42 @@ func main() {
                 print("コーパス内キャッシュから教師 Mel 単調アライメント (MAS) 記録を読み込みました: \(corpusAlignPath) (\(alignmentMap.count) 発話)")
             }
         }
-        var needMASGen = alignmentMap.isEmpty
+        var needMASGen = alignmentMap.isEmpty || forceMAS
         if needMASGen != true {
             if let sample0 = alignmentMap["BASIC5000_0001"] {
                 if AlignmentStore.isUtteranceAlignmentValid(sample0) != true {
-                    print("警告: キャッシュされた BASIC5000_0001 アライメントが縮退（1フレーム音素または20F超過）しています。制約付きMAS再集計を実行します。")
+                    print("警告: キャッシュされた BASIC5000_0001 アライメントが縮退（2〜40F 範囲外）しています。新MAS再集計を実行します。")
                     needMASGen = true
                 }
             } else {
                 needMASGen = true
+            }
+        }
+        if needMASGen != true {
+            var sampleCount = 0
+            var vowelFourCount = 0
+            for (_, utt) in alignmentMap.prefix(100) {
+                var p = 0
+                while p < utt.phonemes.count {
+                    let ph = utt.phonemes[p]
+                    switch ph.symbol {
+                    case "a", "i", "u", "e", "o", "_":
+                        sampleCount += 1
+                        if ph.durationFrames == 4 {
+                            vowelFourCount += 1
+                        }
+                    default:
+                        break
+                    }
+                    p += 1
+                }
+            }
+            if 0 < sampleCount {
+                let ratio4 = Float(vowelFourCount) / Float(sampleCount)
+                if 0.30 < ratio4 {
+                    print("警告: キャッシュされたアライメントは旧スコアリング（4F集中率 \(String(format: "%.1f", ratio4 * 100.0))%）です。新MAS再集計（フレーム平均尤度＋二次ペナルティ）を実行します。")
+                    needMASGen = true
+                }
             }
         }
         if let limit = maxSamples {
@@ -444,6 +476,7 @@ func main() {
                 needMASGen = true
             }
         }
+
         if needMASGen {
             let targetCountStr: String
             switch maxSamples {
@@ -756,37 +789,32 @@ func main() {
                         ) {
                             trainingData.append(pair)
                             if id == "BASIC5000_0001" {
-                                if let reconPair = engine.prepareTrainingPair(
-                                    text: text,
-                                    pcm16k: pcm16k,
-                                    melExtractor: melExtractor,
-                                    pitchTracker: pitchTracker,
-                                    alignment: effectiveAlign,
-                                    useScaledDuration: false
-                                ) {
-                                    reconTargetSample = reconPair
-                                }
+                                reconTargetSample = pair
                             }
-                            let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
-                            let pitchResult = pitchTracker.track(pcm: pcm16k)
-                            vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                            if 0 < vocoderEpochs {
+                                let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
+                                let pitchResult = pitchTracker.track(pcm: pcm16k)
+                                vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                            }
                         }
-                        if let pSample = engine.prepareProsodyTrainingSample(
-                            text: text,
-                            pcm16k: pcm16k,
-                            pitchTracker: pitchTracker
-                        ) {
-                            var canAppendProsody = true
-                            switch prosodySamplesLimit {
-                            case .some(let limit):
-                                if limit <= prosodySamples.count {
-                                    canAppendProsody = false
+                        if 0 < prosodyEpochs {
+                            if let pSample = engine.prepareProsodyTrainingSample(
+                                text: text,
+                                pcm16k: pcm16k,
+                                pitchTracker: pitchTracker
+                            ) {
+                                var canAppendProsody = true
+                                switch prosodySamplesLimit {
+                                case .some(let limit):
+                                    if limit <= prosodySamples.count {
+                                        canAppendProsody = false
+                                    }
+                                case .none:
+                                    break
                                 }
-                            case .none:
-                                break
-                            }
-                            if canAppendProsody {
-                                prosodySamples.append(pSample)
+                                if canAppendProsody {
+                                    prosodySamples.append(pSample)
+                                }
                             }
                         }
                     }
@@ -813,6 +841,297 @@ func main() {
         return
     }
     print("有効学習サンプル数: \(trainingData.count) 件")
+
+    // ============================================================
+    // 受入検証ゲート（手順 3）: アライメント品質および音響特徴検証
+    // ============================================================
+    print("\n===========================================================")
+    print("【受入検証ゲート（手順 3）: アライメント品質および音響特徴検証】")
+    print("===========================================================")
+
+    // 1. 全発話の継続時間分布検証
+    // 母音（vowel, prolonged）の下限（2フレーム）一致率 < 15%
+    // 全音素の上限（40フレーム）一致率 < 5%
+    var totalVowels = 0
+    var minDurationVowels = 0
+    var totalPhonemes = 0
+    var maxDurationPhonemes = 0
+
+    for (_, utt) in alignmentMap {
+        var pIdx = 0
+        while pIdx < utt.phonemes.count {
+            let ph = utt.phonemes[pIdx]
+            let d = ph.durationFrames
+            totalPhonemes += 1
+            if d == 40 {
+                maxDurationPhonemes += 1
+            }
+            let isVowel: Bool
+            switch ph.symbol {
+            case "a", "i", "u", "e", "o", "_":
+                isVowel = true
+            default:
+                isVowel = false
+            }
+            if isVowel {
+                totalVowels += 1
+                if d == 2 {
+                    minDurationVowels += 1
+                }
+            }
+            pIdx += 1
+        }
+    }
+
+    let minVowelRatio = Float(minDurationVowels) / Float(max(1, totalVowels))
+    let maxPhoneRatio = Float(maxDurationPhonemes) / Float(max(1, totalPhonemes))
+
+    print("  全発話 母音総数: \(totalVowels), 下限 (2F) 一致数: \(minDurationVowels), 割合: \(String(format: "%.2f", minVowelRatio * 100.0))% (閾値: < 15.00%)")
+    print("  全発話 全音素総数: \(totalPhonemes), 上限 (40F) 一致数: \(maxDurationPhonemes), 割合: \(String(format: "%.2f", maxPhoneRatio * 100.0))% (閾値: < 5.00%)")
+
+    var gatePassed = true
+    if 0.15 <= minVowelRatio {
+        print("  エラー: 下限一致母音割合が 15% 以上です (\(String(format: "%.2f", minVowelRatio * 100.0))%)")
+        gatePassed = false
+    }
+    if 0.05 <= maxPhoneRatio {
+        print("  エラー: 上限一致音素割合が 5% 以上です (\(String(format: "%.2f", maxPhoneRatio * 100.0))%)")
+        gatePassed = false
+    }
+
+    // 2. BASIC5000_0001 音響特徴検証
+    let basic0001Text = "水をマレーシアから買わなくてはならないのです。"
+    let wavPath0001 = wavDir + "/BASIC5000_0001.wav"
+    guard fileManager.fileExists(atPath: wavPath0001),
+          let pcm0001 = try? wavReader.loadWav16k(from: wavPath0001),
+          let basic0001Align = alignmentMap["BASIC5000_0001"] else {
+        print("エラー: BASIC5000_0001.wav またはアライメントが存在しません。")
+        return
+    }
+
+    let hopSize = AudioConfig.hopSize
+
+    print("\n  --- BASIC5000_0001 音素区間音響検査 ---")
+    var curFrameOffset = basic0001Align.leadSilenceFrames
+    var bIdx = 0
+    var allVowelsRMSValid = true
+    var allFricativesCentroidValid = true
+
+    while bIdx < basic0001Align.phonemes.count {
+        let ph = basic0001Align.phonemes[bIdx]
+        let d = ph.durationFrames
+        let segStartSample = curFrameOffset * hopSize
+        let segEndSample = min(pcm0001.count, (curFrameOffset + d) * hopSize)
+
+        var segPCM: [Float] = []
+        if segStartSample < segEndSample {
+            segPCM = Array(pcm0001[segStartSample..<segEndSample])
+        }
+
+        let isVowel: Bool
+        switch ph.symbol {
+        case "a", "i", "u", "e", "o", "_":
+            isVowel = true
+        default:
+            isVowel = false
+        }
+
+        if isVowel {
+            let rms = MelSpectrogramExtractor.computeRMS(pcm: segPCM)
+            print("    母音 [\(ph.symbol)] (フレーム \(curFrameOffset)..<\(curFrameOffset + d), \(d)F): 平均 RMS = \(String(format: "%.4f", rms))")
+            if rms <= 0.01 {
+                print("      エラー: 母音 RMS が 0.01 以下です (\(rms))")
+                allVowelsRMSValid = false
+            }
+        }
+
+        let isFricative = (ph.symbol == "s" || ph.symbol == "sh")
+        if isFricative {
+            let centroid = melExtractor.computeSpectralCentroid(pcm: segPCM)
+            print("    摩擦音 [\(ph.symbol)] (フレーム \(curFrameOffset)..<\(curFrameOffset + d), \(d)F): スペクトル重心 = \(String(format: "%.1f", centroid)) Hz")
+            if centroid <= 2000.0 {
+                print("      エラー: 摩擦音スペクトル重心が 2000 Hz 以下です (\(centroid) Hz)")
+                allFricativesCentroidValid = false
+            }
+        }
+
+        curFrameOffset += d
+        bIdx += 1
+    }
+
+    if allVowelsRMSValid != true {
+        gatePassed = false
+    }
+    if allFricativesCentroidValid != true {
+        gatePassed = false
+    }
+
+    if gatePassed != true {
+        print("\n【受入検証ゲート REJECT】手順3 の条件を満たさないため学習を中止します。")
+        return
+    }
+    print("【受入検証ゲート（手順 3）PASS】下限/上限割合および音響特徴条件を達成しました。\n")
+
+    // ============================================================
+    // 手順 4: ゲート通過区間から実測音素平均フレームを再作成
+    // ============================================================
+    let healthyAlignments = Array(alignmentMap.values).filter { AlignmentStore.isUtteranceAlignmentValid($0) }
+    let healthyPhonemeAverages = AlignmentStore.computeAverageDurations(from: healthyAlignments)
+    print("===========================================================")
+    print("【手順 4: ゲート通過区間実測音素平均フレーム再作成 (通過発話数: \(healthyAlignments.count)/\(alignmentMap.count))】")
+    print("===========================================================")
+    for (pid, avg) in healthyPhonemeAverages.sorted(by: { $0.key < $1.key }) {
+        let sym = engine.vocabulary.token(for: Int(pid))
+        let rAvg = roundf(avg * 10.0) / 10.0
+        print("  ID \(pid) (\(sym)): 実測平均 = \(String(format: "%.2f", avg)) frames -> 確定 = \(String(format: "%.1f", rAvg)) frames (\(String(format: "%.1f", rAvg * 10.0))ms)")
+    }
+
+    // ============================================================
+    // 手順 5: wIn 音響特徴チャンネル (ch 192..198) 再初期化 & ウォームスタート重み設定
+    // ============================================================
+    print("\n===========================================================")
+    print("【手順 5: 入力重み wIn 音響特徴チャンネル (ch 192..198) 再初期化】")
+    print("===========================================================")
+    var effectiveWeights = weights
+        .withPhonemeAverageDurations(healthyPhonemeAverages)
+        .withMeanFramesPerMora(16.0)
+        .withResetAcousticInWeights(seed: 2026)
+
+    var colNorms = [Float](repeating: 0.0, count: inDim)
+    var cColIdx = 0
+    while cColIdx < inDim {
+        var sumSq: Float = 0.0
+        var h = 0
+        while h < hiddenDim {
+            let val = effectiveWeights.wIn[(h * inDim) + cColIdx]
+            sumSq += val * val
+            h += 1
+        }
+        colNorms[cColIdx] = sqrtf(sumSq)
+        cColIdx += 1
+    }
+    print("  --- wIn 列 L2 ノルム (再初期化後) ---")
+    print("  ch 192 (voiced):     \(String(format: "%.4f", colNorms[192]))")
+    print("  ch 193 (unvoiced):   \(String(format: "%.4f", colNorms[193]))")
+    print("  ch 194 (normF0):     \(String(format: "%.4f", colNorms[194]))")
+    print("  ch 195 (deltaF0):    \(String(format: "%.4f", colNorms[195]))")
+    print("  ch 196 (phonePos):   \(String(format: "%.4f", colNorms[196]))")
+    print("  ch 197 (rate):       \(String(format: "%.4f", colNorms[197]))")
+    print("  ch 198 (energy):     \(String(format: "%.4f", colNorms[198]))")
+    var unusedNormSum: Float = 0.0
+    var unCh = 200
+    while unCh < inDim {
+        unusedNormSum += colNorms[unCh]
+        unCh += 1
+    }
+    let unusedAvgNorm = unusedNormSum / Float(max(1, inDim - 200))
+    print("  ch 200..255 (未使用平均): \(String(format: "%.4f", unusedAvgNorm))")
+    print("  母音 a (one-hot ch 5):   \(String(format: "%.4f", colNorms[5]))")
+
+    let gateEngine = SpikeSpeechEngine(weights: effectiveWeights)
+
+    // ============================================================
+    // 特徴差 0 ゲート: BASIC5000_0001 学習入力 vs 合成入力 特徴行列差分検証
+    // ============================================================
+    print("\n===========================================================")
+    print("【受入検証ゲート: BASIC5000_0001 学習入力 vs 合成入力 特徴行列差分検証】")
+    print("===========================================================")
+
+    // 1. prepareTrainingPair の特徴行列
+    guard let pair0001 = gateEngine.prepareTrainingPair(
+        text: basic0001Text,
+        pcm16k: pcm0001,
+        melExtractor: melExtractor,
+        pitchTracker: pitchTracker,
+        alignment: alignmentMap["BASIC5000_0001"],
+        useScaledDuration: true
+    ) else {
+        print("エラー: BASIC5000_0001 の prepareTrainingPair に失敗しました。")
+        return
+    }
+    let trainFeats = pair0001.features
+
+    // 2. synthesize が SNN に渡す特徴行列
+    let synthLinguistic = gateEngine.lengthRegulator.processText(
+        text: basic0001Text,
+        normalizer: gateEngine.normalizer,
+        prosodyModel: gateEngine.prosodyModel,
+        vocabulary: gateEngine.vocabulary,
+        prosodyPredictor: gateEngine.prosodyPredictor,
+        speedFactor: 1.0,
+        baseF0: VoiceProfile.default.baseF0,
+        addBoundarySilence: true,
+        meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+    )
+    let synthFeats = gateEngine.encodeLinguisticFeatures(features: synthLinguistic)
+
+    print("  学習特徴行列フレーム数: \(trainFeats.count), チャンネル数: \(trainFeats.first?.count ?? 0)")
+    print("  合成特徴行列フレーム数: \(synthFeats.count), チャンネル数: \(synthFeats.first?.count ?? 0)")
+
+    if trainFeats.count != synthFeats.count {
+        print("エラー: フレーム数が一致しません (学習: \(trainFeats.count) vs 合成: \(synthFeats.count))。学習を開始できません。")
+        return
+    }
+
+    var globalMaxAbsDiff: Float = 0.0
+    var channelMaxDiffs = [Float](repeating: 0.0, count: inDim)
+
+    var f = 0
+    while f < trainFeats.count {
+        var c = 0
+        let cCount = min(trainFeats[f].count, synthFeats[f].count)
+        while c < cCount {
+            let diff = abs(trainFeats[f][c] - synthFeats[f][c])
+            if channelMaxDiffs[c] < diff {
+                channelMaxDiffs[c] = diff
+            }
+            if globalMaxAbsDiff < diff {
+                globalMaxAbsDiff = diff
+            }
+            c += 1
+        }
+        f += 1
+    }
+
+    print("  全チャンネル・全フレーム 最大絶対差: \(globalMaxAbsDiff)")
+    print("  --- チャンネル別最大絶対差 ---")
+    let channelGroups: [(name: String, start: Int, end: Int)] = [
+        ("ch 0..63 (現在の音素 one-hot)", 0, 63),
+        ("ch 64..127 (前の音素 one-hot)", 64, 127),
+        ("ch 128..191 (次の音素 one-hot)", 128, 191),
+        ("ch 192 (voiced)", 192, 192),
+        ("ch 193 (unvoiced)", 193, 193),
+        ("ch 194 (normF0)", 194, 194),
+        ("ch 195 (deltaF0)", 195, 195),
+        ("ch 196 (phonePos)", 196, 196),
+        ("ch 197 (rate)", 197, 197),
+        ("ch 198 (energy)", 198, 198),
+        ("ch 199 (pulse)", 199, 199),
+        ("ch 200..255 (その他/未使用)", 200, 255)
+    ]
+    var gIdx = 0
+    while gIdx < channelGroups.count {
+        let grp = channelGroups[gIdx]
+        var grpMaxDiff: Float = 0.0
+        var ch = grp.start
+        while ch <= grp.end {
+            if ch < channelMaxDiffs.count {
+                if grpMaxDiff < channelMaxDiffs[ch] {
+                    grpMaxDiff = channelMaxDiffs[ch]
+                }
+            }
+            ch += 1
+        }
+        print("    \(grp.name): 最大差 = \(grpMaxDiff)")
+        gIdx += 1
+    }
+
+    if 0.0 < globalMaxAbsDiff {
+        print("エラー: 特徴差が 0 ではありません (\(globalMaxAbsDiff))。学習を中止します。")
+        return
+    }
+    print("【受入検証ゲート PASS】全チャンネル・全フレームの特徴差は厳密に 0 です。学習を開始します。\n")
+
 
     // なぜ実音声目標対数 Mel のチャンネル平均で bOut を初期化/適合させるか:
     // SNN の出力層バイアスを実音声エネルギーの基底値（約 +2.0〜+4.0）へ一括シフトし、
@@ -879,17 +1198,17 @@ func main() {
     }
     currentBOutMean = currentBOutMean / Float(max(1, weights.bOut.count))
 
-    var effectiveWeights = weights
     var shouldInitBOut = forceFresh || forceInitBOut
     if currentBOutMean < 0.5 {
         shouldInitBOut = true
     }
     if shouldInitBOut {
-        effectiveWeights = weights.withBOut(meanMel)
+        effectiveWeights = effectiveWeights.withBOut(meanMel)
         let meanVal = meanMel.reduce(0, +) / Float(outDim)
         print("SNN 出力バイアス bOut を実音声の平均対数 Mel スペクトルで初期化しました（チャンネル平均: \(String(format: "%.2f", meanVal))）")
         print("  meanMel[0..15]: \(meanMel.prefix(16).map { String(format: "%.2f", $0) })")
     }
+
 
     var network = MLXSpikingAcousticNetwork(weights: effectiveWeights)
 

@@ -22,30 +22,47 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
     }
 
-    public let prototypes: [Int: PhonemeMelPrototype]
+    /// 音素別継続時間実測統計（平均 mu、標準偏差 sigma、分散 variance）
+    public struct PhonemeDurationStats: Sendable {
+        public var mean: Float
+        public var stdDev: Float
+        public var variance: Float
+        public var count: Float
 
-    public init(prototypes: [Int: PhonemeMelPrototype] = [:]) {
+        public init(mean: Float, stdDev: Float, variance: Float, count: Float = 1.0) {
+            self.mean = mean
+            self.stdDev = stdDev
+            self.variance = variance
+            self.count = count
+        }
+    }
+
+    public let prototypes: [Int: PhonemeMelPrototype]
+    public let durationStats: [Int: PhonemeDurationStats]
+
+    public init(
+        prototypes: [Int: PhonemeMelPrototype] = [:],
+        durationStats: [Int: PhonemeDurationStats] = [:]
+    ) {
         self.prototypes = prototypes
+        self.durationStats = durationStats
     }
 
     /// 各音素カテゴリの物理的最小継続時間フレーム数 (1フレーム=10ms)
     ///
-    /// なぜ 1 フレーム音素を禁止し母音 4F / 子音 3F を下限とするか:
-    /// 人が発音する際、子音調音には最低 30ms、母音共鳴には最低 40ms の物理的時間が必要であり、
-    /// 単調 DP が特定音素を 1 フレーム (10ms) に押し潰して余剰時間を母音に寄せる縮退現象を構造的に根絶するため。
+    /// 安全柵を母音 2 以上、子音 2 以上、ポーズ 1 以上とし、
+    /// 探索の下限張り付きを防止して自然な音素継続時間の動的配分を可能にする。
     public static func minDuration(for phoneme: PhonemeToken) -> Int {
         switch phoneme.category {
         case .pause:
             return 1
-        case .vowel, .prolonged:
-            return 4
         default:
-            return 3
+            return 2
         }
     }
 
-    /// 各音素の標準最大許容継続時間フレーム数 (20 フレーム = 200ms)
-    public static let standardMaxDuration: Int = 20
+    /// 各音素の安全柵最大許容継続時間フレーム数 (40 フレーム = 400ms)
+    public static let standardMaxDuration: Int = 40
 
     /// 各音素の標準的な相対継続時間重み（仮分割用）
     public static func priorWeight(for phoneme: PhonemeToken) -> Float {
@@ -74,7 +91,7 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
     }
 
-    /// 発話区間のフレーム総数を制約（母音>=4F, 子音>=3F, 最大<=20F）と音素比率により初期仮分割する
+    /// 発話区間のフレーム総数を制約（安全柵: 母音 2〜40F, 子音 2〜40F）と音素比率により初期仮分割する
     ///
     /// なぜ手書き固定表ではなく仮分割から開始するか:
     /// 音素ラベルの初期推定区間を教師 WAV の全体長から比例配分で設定し、
@@ -256,6 +273,65 @@ public final class MonotonicAlignmentSearch: Sendable {
         return updated
     }
 
+    /// 各音素のデフォルト継続時間統計（未観測音素フォールバック用）
+    public static func defaultDurationStats(for phoneme: PhonemeToken) -> PhonemeDurationStats {
+        switch phoneme.category {
+        case .vowel, .prolonged:
+            return PhonemeDurationStats(mean: 12.0, stdDev: 4.0, variance: 16.0, count: 1.0)
+        case .pause:
+            return PhonemeDurationStats(mean: 10.0, stdDev: 5.0, variance: 25.0, count: 1.0)
+        default:
+            return PhonemeDurationStats(mean: 7.0, stdDev: 3.0, variance: 9.0, count: 1.0)
+        }
+    }
+
+    /// 前ラウンドのアライメント結果から音素 ID 別平均継続時間 mu とばらつき (分散 variance) を集計する
+    public static func accumulateDurationStats(
+        utterances: [(mel: [[Float]], voiced: [Float], phonemes: [PhonemeToken], durations: [Int])],
+        existing: [Int: PhonemeDurationStats] = [:]
+    ) -> [Int: PhonemeDurationStats] {
+        var sumDurs: [Int: Float] = [:]
+        var sumSqDurs: [Int: Float] = [:]
+        var counts: [Int: Float] = [:]
+
+        var uIdx = 0
+        while uIdx < utterances.count {
+            let utt = utterances[uIdx]
+            let phones = utt.phonemes
+            let durs = utt.durations
+            var p = 0
+            while p < phones.count && p < durs.count {
+                let pid = phones[p].id
+                let d = Float(durs[p])
+                sumDurs[pid] = (sumDurs[pid] ?? 0.0) + d
+                sumSqDurs[pid] = (sumSqDurs[pid] ?? 0.0) + (d * d)
+                counts[pid] = (counts[pid] ?? 0.0) + 1.0
+                p += 1
+            }
+            uIdx += 1
+        }
+
+        var updated = existing
+        for (pid, cnt) in counts {
+            if 0.0 < cnt {
+                let s = sumDurs[pid] ?? 0.0
+                let sq = sumSqDurs[pid] ?? 0.0
+                let mu = s / cnt
+                var variance = (sq / cnt) - (mu * mu)
+                if variance < 2.0 {
+                    variance = 2.0
+                }
+                if 25.0 < variance {
+                    variance = 25.0
+                }
+                let stdDev = sqrtf(variance)
+                updated[pid] = PhonemeDurationStats(mean: mu, stdDev: stdDev, variance: variance, count: cnt)
+            }
+        }
+        return updated
+    }
+
+
     /// 音素トークンとフレーム対数 Mel の適合度対数尤度を算出する
     public func frameLogLikelihood(
         phoneId: Int,
@@ -295,7 +371,7 @@ public final class MonotonicAlignmentSearch: Sendable {
 
         // 有声度整合性ペナルティ
         let voicedDiff = abs(frameVoiced - vTarget)
-        score -= voicedDiff * 2.0
+        score -= voicedDiff * 0.5
 
         return score
     }
@@ -333,7 +409,7 @@ public final class MonotonicAlignmentSearch: Sendable {
                 // 合成単体テスト等で極小音素数 (<=3) に対し大フレーム数が渡された場合のみ適応上限
                 maxDurLimit = max(Self.standardMaxDuration, Int(ceilf(avgPerPhone * 1.5)))
             } else {
-                // 通常発話: 1 音素 20 フレーム超は不採用（設計書 2 項）
+                // 通常発話: 1 音素 40 フレーム超は不採用（設計書 2 項: standardMaxDuration = 40）
                 maxDurLimit = Self.standardMaxDuration
             }
         }
@@ -447,9 +523,19 @@ public final class MonotonicAlignmentSearch: Sendable {
         // 初期化: 音素 0
         let k0Min = minDurs[0]
         let k0Max = min(maxDurs[0], tTotal - suffixMin[1])
+        let pid0 = phonemes[0].id
+        let stats0 = durationStats[pid0] ?? Self.defaultDurationStats(for: phonemes[0])
+        let var0 = max(2.0, stats0.variance)
+        let mean0 = stats0.mean
+
         var k0 = k0Min
         while k0 <= k0Max {
-            dp[0][k0] = prefLL[0][k0]
+            let sumLL = prefLL[0][k0]
+            let dFloat = Float(k0)
+            let avgLL = sumLL / dFloat
+            let diff = dFloat - mean0
+            let quadPenalty = -1.0 * (diff * diff) / var0
+            dp[0][k0] = avgLL + quadPenalty
             bestD[0][k0] = UInt8(k0)
             k0 += 1
         }
@@ -459,6 +545,10 @@ public final class MonotonicAlignmentSearch: Sendable {
         while curPh < nTotal {
             let kMin = prefixMin[curPh]
             let kMax = min(prefixMax[curPh], tTotal - suffixMin[curPh + 1])
+            let curPid = phonemes[curPh].id
+            let curStats = durationStats[curPid] ?? Self.defaultDurationStats(for: phonemes[curPh])
+            let curVar = max(2.0, curStats.variance)
+            let curMean = curStats.mean
 
             var curK = kMin
             while curK <= kMax {
@@ -473,7 +563,12 @@ public final class MonotonicAlignmentSearch: Sendable {
                     let prevK = curK - d
                     let prevScore = dp[curPh - 1][prevK]
                     if -1.0e17 < prevScore {
-                        let segScore = prefLL[curPh][curK] - prefLL[curPh][prevK]
+                        let sumLL = prefLL[curPh][curK] - prefLL[curPh][prevK]
+                        let dFloat = Float(d)
+                        let avgLL = sumLL / dFloat
+                        let diff = dFloat - curMean
+                        let quadPenalty = -1.0 * (diff * diff) / curVar
+                        let segScore = avgLL + quadPenalty
                         let totalScore = prevScore + segScore
                         if bestScore < totalScore {
                             bestScore = totalScore
@@ -489,6 +584,7 @@ public final class MonotonicAlignmentSearch: Sendable {
             }
             curPh += 1
         }
+
 
         // 4. バックトラックによる最適持続時間の確定
         if dp[nTotal - 1][tTotal] <= -1.0e17 {
@@ -514,7 +610,7 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
 
         // 5. 厳格受入検証:
-        // - 無音以外の 1 フレーム音素は禁止（母音 >= 4, 子音 >= 3）
+        // - 無音以外の 1 フレーム音素は禁止（母音 2 以上 40 以下, 子音 2 以上 40 以下）
         // - 1 音素が maxDurLimit を超えない
         // - 総和が tTotal と完全一致
         var sumDurs = 0
@@ -578,7 +674,7 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
 
         // Round 0: 初期仮分割（meanFramesPerMora と音素比率による配分）
-        print("MAS 反復集計: Round 0 (初期仮分割から第 1 世代音素プロトタイプを算出中...)")
+        print("MAS 反復集計: Round 0 (初期仮分割から第 1 世代音素プロトタイプおよび継続時間統計を算出中...)")
         var currentUtterances: [(mel: [[Float]], voiced: [Float], phonemes: [PhonemeToken], durations: [Int])] = []
         var i = 0
         while i < items.count {
@@ -594,13 +690,14 @@ public final class MonotonicAlignmentSearch: Sendable {
         }
 
         var prototypes = accumulatePrototypes(utterances: currentUtterances)
-        print("  第 1 世代プロトタイプ算出完了: \(prototypes.count) 音素カテゴリ集計済")
+        var durationStats = accumulateDurationStats(utterances: currentUtterances)
+        print("  第 1 世代プロトタイプ算出完了: \(prototypes.count) 音素カテゴリ, \(durationStats.count) 音素統計集計済")
 
-        // Round 1 ..< iterations: MAS アライメントとプロトタイプ再集計の反復
+        // Round 1 ... iterations: MAS アライメントとプロトタイプ・継続時間統計再集計の反復
         var iter = 1
-        while iter < iterations {
+        while iter <= iterations {
             print("MAS 反復集計: Round \(iter) (MAS 単調動的計画法による境界最適化中...)")
-            let aligner = MonotonicAlignmentSearch(prototypes: prototypes)
+            let aligner = MonotonicAlignmentSearch(prototypes: prototypes, durationStats: durationStats)
             var updatedUtterances: [(mel: [[Float]], voiced: [Float], phonemes: [PhonemeToken], durations: [Int])] = []
 
             var u = 0
@@ -617,14 +714,15 @@ public final class MonotonicAlignmentSearch: Sendable {
                 u += 1
             }
 
-            prototypes = accumulatePrototypes(utterances: updatedUtterances)
-            print("  Round \(iter) 完了: \(updatedUtterances.count)/\(items.count) 発話収束、\(prototypes.count) 音素プロトタイプ更新")
+            prototypes = accumulatePrototypes(utterances: updatedUtterances, existing: prototypes)
+            durationStats = accumulateDurationStats(utterances: updatedUtterances, existing: durationStats)
+            print("  Round \(iter) 完了: \(updatedUtterances.count)/\(items.count) 発話収束、\(prototypes.count) 音素プロトタイプ更新、\(durationStats.count) 音素継続時間統計更新")
             iter += 1
         }
 
-        // 最終パス: 確定した自己収束プロトタイプによる最終アライメント
-        print("MAS 反復集計: 最終パス (収束プロトタイプによる確定アライメント抽出)")
-        let finalAligner = MonotonicAlignmentSearch(prototypes: prototypes)
+        // 最終パス: 確定した自己収束プロトタイプおよび継続時間統計による最終アライメント
+        print("MAS 反復集計: 最終パス (収束プロトタイプおよび実測継続時間統計による確定アライメント抽出)")
+        let finalAligner = MonotonicAlignmentSearch(prototypes: prototypes, durationStats: durationStats)
         var results: [UtteranceAlignment] = []
 
         var fIdx = 0
@@ -645,6 +743,7 @@ public final class MonotonicAlignmentSearch: Sendable {
                     phonemes: item.phonemes
                 )
             }
+
 
             if finalDurs.count == item.phonemes.count {
                 var phList: [PhonemeAlignment] = []

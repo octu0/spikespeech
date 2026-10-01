@@ -46,8 +46,8 @@ extension SpikeSpeechEngine {
             f += 1
         }
 
-        // 発話内ピーク RMS の 8% を無音／有音の物理的境界閾値とする
-        let threshold = max(0.015, maxRms * 0.08)
+        // 発話内ピーク RMS の 6% を無音／有音の物理的境界閾値とする
+        let threshold = max(0.010, maxRms * 0.06)
 
         var firstSpeech = -1
         var lastSpeech = -1
@@ -66,14 +66,16 @@ extension SpikeSpeechEngine {
             return (leadSilence: 0, speechFrames: totalFrames, trailSilence: 0)
         }
 
-        let margin = 3 // 語頭・語尾の微弱子音（破裂音・摩擦音）を保護する 30ms マージン
-        let leadSilence = max(0, firstSpeech - margin)
-        let endFrame = min(totalFrames, lastSpeech + 1 + margin)
+        let leadMargin = 5 // 語頭の微弱子音（破裂音等）を保護する 50ms マージン
+        let trailMargin = 1 // 語尾の摩擦音を保護する 10ms マージン
+        let leadSilence = max(0, firstSpeech - leadMargin)
+        let endFrame = min(totalFrames, lastSpeech + 1 + trailMargin)
         let speechFrames = max(1, endFrame - leadSilence)
         let trailSilence = max(0, totalFrames - (leadSilence + speechFrames))
 
         return (leadSilence: leadSilence, speechFrames: speechFrames, trailSilence: trailSilence)
     }
+
 
     /// テキストと音声波形から VAD アライメント・目標 Mel 系列ペアを生成する唯一の正本メソッド
     ///
@@ -97,7 +99,6 @@ extension SpikeSpeechEngine {
         if origFrames <= 0 {
             return nil
         }
-        let pitchResult = pitchTracker.track(pcm: pcm16k)
 
         let boundaries = Self.detectSpeechBoundaries(
             pcm: pcm16k,
@@ -111,141 +112,70 @@ extension SpikeSpeechEngine {
             return nil
         }
 
-        let morphemes = normalizer.normalize(text: text)
-        let phrases = prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: vocabulary)
-        if phrases.isEmpty {
+        // 1. 学習入力は合成（synthesize）と全く同一の過程で生成する（設計書 1 項）
+        let linguisticFeatures = lengthRegulator.processText(
+            text: text,
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            prosodyPredictor: prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.default.baseF0,
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+        )
+
+        let totalFrames = linguisticFeatures.totalFrames
+        if totalFrames <= 0 {
             return nil
         }
 
-        var phoneIds: [Int32] = []
-        var pIdx = 0
-        while pIdx < phrases.count {
-            var mIdx = 0
-            while mIdx < phrases[pIdx].moras.count {
-                var phIdx = 0
-                while phIdx < phrases[pIdx].moras[mIdx].phonemes.count {
-                    phoneIds.append(Int32(phrases[pIdx].moras[mIdx].phonemes[phIdx].id))
-                    phIdx += 1
-                }
-                mIdx += 1
-            }
-            pIdx += 1
-        }
-        if phoneIds.isEmpty {
+        // 実測 F0・有声度・エネルギーを注入せず、processText の出力のみから特徴量を符号化
+        let features = encodeLinguisticFeatures(
+            features: linguisticFeatures
+        )
+        if features.count != totalFrames {
             return nil
         }
 
-        let speechDurations: [Int]
-        let targetSpeechFrames: Int
-
-        switch useScaledDuration {
-        case true:
-            // 推論と全く同一の関数（音素平均 × 文全体スケール）で各音素のフレーム数を決定
-            let scaledDurs = lengthRegulator.computeDataDrivenDurations(
-                phrases: phrases,
-                speedFactor: 1.0,
-                applyFluctuation: false,
-                text: text,
-                meanFramesPerMora: VoiceProfile.female.meanFramesPerMora
-            )
-            let quantizedDurs = lengthRegulator.quantizeDurations(durations: scaledDurs)
-            if quantizedDurs.count != phoneIds.count {
-                return nil
-            }
-            speechDurations = quantizedDurs
-            targetSpeechFrames = speechDurations.reduce(0, +)
-
-        case false:
-            // 生アライメント長（または動的アライメント）を使用
-            switch alignment {
-            case .some(let uttAlign):
-                var rawDurs: [Int] = []
-                var p = 0
-                while p < uttAlign.phonemes.count {
-                    rawDurs.append(uttAlign.phonemes[p].durationFrames)
-                    p += 1
-                }
-                speechDurations = rawDurs
-                targetSpeechFrames = speechDurations.reduce(0, +)
-            case .none:
-                speechDurations = [Int](repeating: max(1, actualSpeechFrames / phoneIds.count), count: phoneIds.count)
-                targetSpeechFrames = speechDurations.reduce(0, +)
-            }
+        // 2. 教師の対数 Mel は processText が切った音素区間の上に載せる（設計書 2 項）
+        let phoneCount = linguisticFeatures.phoneIds.count
+        if phoneCount < 3 {
+            return nil
         }
 
+        let leadSil = Int(linguisticFeatures.durations[0])
+        let trailSil = Int(linguisticFeatures.durations[phoneCount - 1])
+        let bodyPhoneCount = phoneCount - 2
+        let targetSpeechFrames = totalFrames - leadSil - trailSil
         if targetSpeechFrames <= 0 {
             return nil
         }
 
-        // 実音声の発話本体区間（speechMel, speechF0, speechVoiced, speechEnergy）を抽出
-        let speechEnd = min(origFrames, leadSilence + actualSpeechFrames)
-        var speechMel: [[Float]] = []
-        var speechF0: [Float] = []
-        var speechVoiced: [Float] = []
-        var speechEnergy: [Float] = []
-
-        var maxEnergy: Float = 0.0
-        var ef = 0
-        while ef < pitchResult.frameCount {
-            if maxEnergy < pitchResult.energy[ef] {
-                maxEnergy = pitchResult.energy[ef]
-            }
-            ef += 1
-        }
-        var normScale: Float = 1.0
-        if 0.01 < maxEnergy {
-            normScale = 0.80 / maxEnergy
-        }
-
-        var sf = leadSilence
-        while sf < speechEnd {
-            speechMel.append(targetMel[sf])
-            var vF0: Float = 0.0
-            var vVoiced: Float = 0.0
-            var vEnergy: Float = 0.0
-            if sf < pitchResult.frameCount {
-                vF0 = pitchResult.f0[sf]
-                vVoiced = pitchResult.voiced[sf]
-                let sc = pitchResult.energy[sf] * normScale
-                if 1.0 < sc {
-                    vEnergy = 1.0
-                } else {
-                    vEnergy = sc
-                }
-            }
-            speechF0.append(vF0)
-            speechVoiced.append(vVoiced)
-            speechEnergy.append(vEnergy)
-            sf += 1
-        }
-
-        if speechMel.isEmpty {
-            return nil
-        }
-
-        // 教師 Mel・F0・有声度・エネルギーを音素境界単位で目標フレーム数へ線形リサンプリング（設計書 5 項）
-        let melCh = AudioConfig.melChannels
-        var resampledMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: targetSpeechFrames)
-        var resampledF0 = [Float](repeating: 0.0, count: targetSpeechFrames)
-        var resampledVoiced = [Float](repeating: 0.0, count: targetSpeechFrames)
-        var resampledEnergy = [Float](repeating: 0.0, count: targetSpeechFrames)
-
-        let srcLen = speechMel.count
-
-        // 各音素のソース実測フレーム数を取得
+        // 各音素のソース実測フレーム数を取得（MAS アライメントまたはデータ駆動音素平均比率）
+        let effectiveLeadSilence: Int
+        let effectiveSpeechFrames: Int
+        let effectiveTrailSilence: Int
         var srcDurs: [Int] = []
+
         switch alignment {
-        case .some(let uttAlign) where uttAlign.phonemes.count == phoneIds.count && AlignmentStore.isUtteranceAlignmentValid(uttAlign):
+        case .some(let uttAlign) where uttAlign.phonemes.count == bodyPhoneCount && AlignmentStore.isUtteranceAlignmentValid(uttAlign):
+            effectiveLeadSilence = uttAlign.leadSilenceFrames
+            effectiveSpeechFrames = uttAlign.totalSpeechFrames
+            effectiveTrailSilence = uttAlign.trailSilenceFrames
             var p = 0
             while p < uttAlign.phonemes.count {
                 srcDurs.append(max(1, uttAlign.phonemes[p].durationFrames))
                 p += 1
             }
         case _:
+            effectiveLeadSilence = leadSilence
+            effectiveSpeechFrames = actualSpeechFrames
+            effectiveTrailSilence = trailSilence
             var rawFloatDurs: [Float] = []
             var p = 0
-            while p < phoneIds.count {
-                let pid = phoneIds[p]
+            while p < bodyPhoneCount {
+                let pid = linguisticFeatures.phoneIds[1 + p]
                 let avgDur = lengthRegulator.phonemeDuration(phoneId: pid, speedFactor: 1.0)
                 rawFloatDurs.append(avgDur)
                 p += 1
@@ -258,7 +188,7 @@ extension SpikeSpeechEngine {
             }
             let scale: Float
             if 0.001 < sumFloat {
-                scale = Float(srcLen) / sumFloat
+                scale = Float(actualSpeechFrames) / sumFloat
             } else {
                 scale = 1.0
             }
@@ -270,6 +200,19 @@ extension SpikeSpeechEngine {
             }
             srcDurs = lengthRegulator.quantizeDurations(durations: scaledFloatDurs)
         }
+
+        // 実音声の発話本体区間（speechMel）を抽出
+        let speechEnd = min(origFrames, effectiveLeadSilence + effectiveSpeechFrames)
+        var speechMel: [[Float]] = []
+        var sf = effectiveLeadSilence
+        while sf < speechEnd {
+            speechMel.append(targetMel[sf])
+            sf += 1
+        }
+        if speechMel.isEmpty {
+            return nil
+        }
+        let srcLen = speechMel.count
 
         // srcDurs の総和を厳密に srcLen と一致させる
         var curSrcSum = 0
@@ -289,13 +232,15 @@ extension SpikeSpeechEngine {
             }
         }
 
-        // 音素境界単位でのリサンプリング配置
+        // 音素境界単位で教師 Mel を目標フレーム数へ線形リサンプリング
+        let melCh = AudioConfig.melChannels
+        var resampledMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: targetSpeechFrames)
         var srcOffset = 0
         var dstOffset = 0
         var phSeqIdx = 0
-        while phSeqIdx < phoneIds.count {
+        while phSeqIdx < bodyPhoneCount {
             let srcDur = srcDurs[phSeqIdx]
-            let dstDur = speechDurations[phSeqIdx]
+            let dstDur = Int(linguisticFeatures.durations[1 + phSeqIdx])
 
             switch (dstDur <= 1, srcDur <= 1) {
             case (true, _):
@@ -312,9 +257,6 @@ extension SpikeSpeechEngine {
                         pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
                     }
                 }
-                resampledF0[dstIdx] = speechF0[safeSrcIdx]
-                resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
-                resampledEnergy[dstIdx] = speechEnergy[safeSrcIdx]
 
             case (false, true):
                 let safeSrcIdx = min(srcLen - 1, max(0, srcOffset))
@@ -326,9 +268,6 @@ extension SpikeSpeechEngine {
                             pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
                         }
                     }
-                    resampledF0[dstIdx] = speechF0[safeSrcIdx]
-                    resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
-                    resampledEnergy[dstIdx] = speechEnergy[safeSrcIdx]
                     f += 1
                 }
 
@@ -359,9 +298,6 @@ extension SpikeSpeechEngine {
                         resampledMel[dstIdx][c] = (1.0 - alpha) * speechMel[src0][c] + alpha * speechMel[src1][c]
                         c += 1
                     }
-                    resampledF0[dstIdx] = (1.0 - alpha) * speechF0[src0] + alpha * speechF0[src1]
-                    resampledVoiced[dstIdx] = (1.0 - alpha) * speechVoiced[src0] + alpha * speechVoiced[src1]
-                    resampledEnergy[dstIdx] = (1.0 - alpha) * speechEnergy[src0] + alpha * speechEnergy[src1]
                     f += 1
                 }
             }
@@ -372,110 +308,60 @@ extension SpikeSpeechEngine {
         }
 
         // 先頭無音・発話本体・末尾無音の結合
-        var fullPhoneIds: [Int32] = []
-        var fullDurations: [Int] = []
+        var alignedMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: totalFrames)
 
-        if 0 < leadSilence {
-            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-            fullDurations.append(leadSilence)
-        }
-
-        var bIdx = 0
-        while bIdx < phoneIds.count {
-            fullPhoneIds.append(phoneIds[bIdx])
-            fullDurations.append(speechDurations[bIdx])
-            bIdx += 1
-        }
-
-        if 0 < trailSilence {
-            fullPhoneIds.append(Int32(PhonemeVocabulary.silId))
-            fullDurations.append(trailSilence)
-        }
-
-        let totalTargetFrames = leadSilence + targetSpeechFrames + trailSilence
-        var alignedMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: totalTargetFrames)
-        var alignedF0 = [Float](repeating: 0.0, count: totalTargetFrames)
-        var alignedVoiced = [Float](repeating: 0.0, count: totalTargetFrames)
-        var alignedEnergy = [Float](repeating: 0.0, count: totalTargetFrames)
-
-        // 先頭無音区間の埋め込み
+        // 先頭無音区間: WAV の実測無音フレームの Mel を目標とする
         var lf = 0
-        while lf < leadSilence {
-            let srcF = min(lf, targetMel.count - 1)
-            alignedMel[lf] = targetMel[srcF]
-            if srcF < pitchResult.frameCount {
-                alignedF0[lf] = pitchResult.f0[srcF]
-                alignedVoiced[lf] = pitchResult.voiced[srcF]
-                alignedEnergy[lf] = pitchResult.energy[srcF] * normScale
+        while lf < leadSil {
+            let srcF: Int
+            switch 0 < effectiveLeadSilence {
+            case true:
+                srcF = min(lf, effectiveLeadSilence - 1)
+            case false:
+                srcF = 0
+            }
+            let safeSrcF = min(targetMel.count - 1, max(0, srcF))
+            alignedMel[lf].withUnsafeMutableBufferPointer { pDst in
+                targetMel[safeSrcF].withUnsafeBufferPointer { pSrc in
+                    pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                }
             }
             lf += 1
         }
 
-        // 発話本体区間の埋め込み
+        // 発話本体区間: 音素境界単位でリサンプリングされた Mel を配置
         var bf = 0
         while bf < targetSpeechFrames {
-            let dstF = leadSilence + bf
-            alignedMel[dstF] = resampledMel[bf]
-            alignedF0[dstF] = resampledF0[bf]
-            alignedVoiced[dstF] = resampledVoiced[bf]
-            alignedEnergy[dstF] = resampledEnergy[bf]
+            let dstF = leadSil + bf
+            alignedMel[dstF].withUnsafeMutableBufferPointer { pDst in
+                resampledMel[bf].withUnsafeBufferPointer { pSrc in
+                    pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                }
+            }
             bf += 1
         }
 
-        // 末尾無音区間の埋め込み
+        // 末尾無音区間: WAV の実測無音フレームの Mel を目標とする
         var trf = 0
-        while trf < trailSilence {
-            let dstF = leadSilence + targetSpeechFrames + trf
-            let srcF = min(origFrames - 1, leadSilence + actualSpeechFrames + trf)
-            if 0 <= srcF && srcF < targetMel.count {
-                alignedMel[dstF] = targetMel[srcF]
+        while trf < trailSil {
+            let dstF = leadSil + targetSpeechFrames + trf
+            let srcF: Int
+            switch 0 < effectiveTrailSilence {
+            case true:
+                srcF = min(origFrames - 1, effectiveLeadSilence + effectiveSpeechFrames + trf)
+            case false:
+                srcF = origFrames - 1
             }
-            if 0 <= srcF && srcF < pitchResult.frameCount {
-                alignedF0[dstF] = pitchResult.f0[srcF]
-                alignedVoiced[dstF] = pitchResult.voiced[srcF]
-                alignedEnergy[dstF] = pitchResult.energy[srcF] * normScale
+            let safeSrcF = min(targetMel.count - 1, max(0, srcF))
+            alignedMel[dstF].withUnsafeMutableBufferPointer { pDst in
+                targetMel[safeSrcF].withUnsafeBufferPointer { pSrc in
+                    pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
+                }
             }
             trf += 1
         }
 
-        var int32Durations = [Int32](repeating: 0, count: fullDurations.count)
-        var dIdx = 0
-        while dIdx < fullDurations.count {
-            int32Durations[dIdx] = Int32(fullDurations[dIdx])
-            dIdx += 1
-        }
-
-        let alignedLinguistic = LinguisticFeatures(
-            phoneIds: fullPhoneIds,
-            durations: int32Durations,
-            f0Contour: alignedF0,
-            voicedFlags: alignedVoiced,
-            energyContour: alignedEnergy,
-            totalFrames: totalTargetFrames
-        )
-
-        let alignedFeatures = encodeLinguisticFeatures(
-            features: alignedLinguistic
-        )
-
-        let finalCount = min(alignedFeatures.count, alignedMel.count)
-        var safeFeatures = alignedFeatures
-        if finalCount < safeFeatures.count {
-            safeFeatures.removeSubrange(finalCount..<safeFeatures.count)
-        }
-
-        var safeTargets = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: finalCount)
-        var t = 0
-        while t < finalCount {
-            safeTargets[t].withUnsafeMutableBufferPointer { pDst in
-                alignedMel[t].withUnsafeBufferPointer { pSrc in
-                    pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
-                }
-            }
-            t += 1
-        }
-
-        return (features: safeFeatures, targets: safeTargets)
+        return (features: features, targets: alignedMel)
     }
 
     /// テキストと実音声波形から韻律予測器（Duration & F0）学習用サンプルを抽出する

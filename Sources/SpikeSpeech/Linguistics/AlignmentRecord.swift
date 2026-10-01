@@ -65,7 +65,7 @@ public final class AlignmentStore: Sendable {
         try data.write(to: url, options: .atomic)
     }
 
-    /// 発話アライメントが縮退していないか（無音以外の 1 フレーム音素や 20F 超過が存在しないか）検証する
+    /// 発話アライメントが縮退していないか（安全柵 2〜40F の範囲内にあるか）検証する
     public static func isUtteranceAlignmentValid(_ utt: UtteranceAlignment) -> Bool {
         if utt.phonemes.isEmpty {
             return false
@@ -74,19 +74,14 @@ public final class AlignmentStore: Sendable {
         while i < utt.phonemes.count {
             let ph = utt.phonemes[i]
             let d = ph.durationFrames
-            if ph.symbol != "<sil>" && ph.symbol != "<pau>" {
-                if d < 3 {
+            let isPause = (ph.symbol == "<sil>" || ph.symbol == "<pau>")
+            switch isPause {
+            case true:
+                if d < 1 || 40 < d {
                     return false
                 }
-                switch ph.symbol {
-                case "a", "i", "u", "e", "o", "_":
-                    if d < 4 {
-                        return false
-                    }
-                default:
-                    break
-                }
-                if 20 < d {
+            case false:
+                if d < 2 || 40 < d {
                     return false
                 }
             }
@@ -94,6 +89,7 @@ public final class AlignmentStore: Sendable {
         }
         return true
     }
+
 
     /// 全アライメントデータから音素 ID ごとの平均フレーム数を集計する
     /// なぜ健全なアライメント統計のみを推論正本とするか:

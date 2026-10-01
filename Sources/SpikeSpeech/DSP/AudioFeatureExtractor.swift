@@ -511,4 +511,77 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
 
         return spectrogram
     }
+
+    /// 16kHz PCM 音声区間からスペクトル重心（Spectral Centroid: Hz）を算出する
+    public func computeSpectralCentroid(pcm: [Float]) -> Float {
+        if pcm.isEmpty {
+            return 0.0
+        }
+        let frameCount = max(1, pcm.count / hopSize)
+        var realBuf = [Float](repeating: 0.0, count: fftSize)
+        var imagBuf = [Float](repeating: 0.0, count: fftSize)
+        var centroidSum: Float = 0.0
+        var validFrames: Float = 0.0
+
+        let binFreqFactor = sampleRate / Float(fftSize)
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var s = 0
+            while s < fftSize {
+                let pcmIdx = sampleStart + s
+                if pcmIdx < pcm.count && s < frameSize {
+                    realBuf[s] = pcm[pcmIdx] * window[s]
+                } else {
+                    realBuf[s] = 0.0
+                }
+                imagBuf[s] = 0.0
+                s += 1
+            }
+
+            computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var num: Float = 0.0
+            var den: Float = 0.0
+            var b = 0
+            while b < fftBins {
+                let r = realBuf[b]
+                let im = imagBuf[b]
+                let mag = sqrtf(r * r + im * im)
+                let freq = Float(b) * binFreqFactor
+                num += freq * mag
+                den += mag
+                b += 1
+            }
+
+            if 1e-6 < den {
+                centroidSum += num / den
+                validFrames += 1.0
+            }
+
+            f += 1
+        }
+
+        if 0.0 < validFrames {
+            return centroidSum / validFrames
+        }
+        return 0.0
+    }
+
+    /// PCM 音声区間の平均二乗平方根 (RMS) を算出する
+    public static func computeRMS(pcm: [Float]) -> Float {
+        if pcm.isEmpty {
+            return 0.0
+        }
+        var sumSq: Float = 0.0
+        var i = 0
+        while i < pcm.count {
+            let v = pcm[i]
+            sumSq += v * v
+            i += 1
+        }
+        return sqrtf(sumSq / Float(pcm.count))
+    }
 }
+
