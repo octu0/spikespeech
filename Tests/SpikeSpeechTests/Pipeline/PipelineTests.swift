@@ -606,4 +606,90 @@ final class PipelineTests: XCTestCase {
         XCTAssertTrue(bodyFramesKonnichiwa <= 95, "こんにちは本体フレーム数 \(bodyFramesKonnichiwa) が 95 超です")
         XCTAssertEqual(bodyFramesKonnichiwa, 80, "こんにちは本体フレーム数が目標 80 (5モーラ×16) と完全一致していません")
     }
+
+    /// 受入基準検証: encodeLinguisticFeatures において phonePos (ch 196) が 0.0 から 3.0 の振幅でエンコードされること
+    func testPhonePosAmplitudeRangeZeroToThree() {
+        let engine = SpikeSpeechEngine()
+        let totalF = 10
+        let ling = LinguisticFeatures(
+            phoneIds: [1, 5, 1], // sil, a, sil
+            durations: [2, 6, 2], // 2 frames sil, 6 frames a, 2 frames sil
+            f0Contour: [Float](repeating: 200.0, count: totalF),
+            voicedFlags: [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+            energyContour: [Float](repeating: 0.5, count: totalF),
+            totalFrames: totalF
+        )
+        let encoded = engine.encodeLinguisticFeatures(features: ling)
+        XCTAssertEqual(encoded.count, totalF)
+
+        // 音素 a (duration = 6 frames, frameIdx = 2 ..< 8):
+        // f = 0: 3.0 * (0 / 5) = 0.0
+        // f = 5: 3.0 * (5 / 5) = 3.0
+        XCTAssertEqual(encoded[2][196], 0.0, accuracy: 1e-4)
+        XCTAssertEqual(encoded[3][196], 3.0 * 0.2, accuracy: 1e-4)
+        XCTAssertEqual(encoded[4][196], 3.0 * 0.4, accuracy: 1e-4)
+        XCTAssertEqual(encoded[5][196], 3.0 * 0.6, accuracy: 1e-4)
+        XCTAssertEqual(encoded[6][196], 3.0 * 0.8, accuracy: 1e-4)
+        XCTAssertEqual(encoded[7][196], 3.0, accuracy: 1e-4)
+
+        // 全フレームで 0.0 以上 3.0 以下であること
+        var f = 0
+        while f < totalF {
+            let pos = encoded[f][196]
+            XCTAssertTrue(0.0 <= pos, "phonePos が負値です: \(pos)")
+            XCTAssertTrue(pos <= 3.0, "phonePos が 3.0 を超過しています: \(pos)")
+            f += 1
+        }
+    }
+
+    /// 受入基準検証: Models/weights.json においてパルス列 (ch 199) の L2 ノルムが 0 であり、phonePos (ch 196) が健全に保持されていること
+    func testWeightsPhonePosAndPulseAcceptance() throws {
+        let weightsPath = "Models/weights.json"
+        guard FileManager.default.fileExists(atPath: weightsPath) else { return }
+        let data = try Data(contentsOf: URL(fileURLWithPath: weightsPath))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
+
+        let hiddenDim = weights.maxHiddenDim
+        let inDim = weights.inputDim
+
+        // パルス (ch 199) の L2 ノルム
+        var p199SumSq: Float = 0.0
+        var h = 0
+        while h < hiddenDim {
+            let val = weights.wIn[(h * inDim) + 199]
+            p199SumSq += val * val
+            h += 1
+        }
+        let pulseNorm = sqrtf(p199SumSq)
+        XCTAssertEqual(pulseNorm, 0.0, accuracy: 1e-5, "Models/weights.json のパルス列 L2 ノルムが 0 ではありません: \(pulseNorm)")
+
+        // phonePos (ch 196) の L2 ノルム
+        var p196SumSq: Float = 0.0
+        h = 0
+        while h < hiddenDim {
+            let val = weights.wIn[(h * inDim) + 196]
+            p196SumSq += val * val
+            h += 1
+        }
+        let phonePosNorm = sqrtf(p196SumSq)
+        XCTAssertTrue(1.0 <= phonePosNorm, "phonePos L2 ノルムが極小です: \(phonePosNorm)")
+
+        // 母音 5 列の平均 L2 ノルム
+        let vowelCols = [5, 6, 7, 8, 9]
+        var vowelNormSum: Float = 0.0
+        for vc in vowelCols {
+            var sumSq: Float = 0.0
+            h = 0
+            while h < hiddenDim {
+                let val = weights.wIn[(h * inDim) + vc]
+                sumSq += val * val
+                h += 1
+            }
+            vowelNormSum += sqrtf(sumSq)
+        }
+        let vowelAvgNorm = vowelNormSum / Float(vowelCols.count)
+
+        print("[Weights Norm Check] vowelAvgNorm: \(vowelAvgNorm), phonePosNorm: \(phonePosNorm), pulseNorm: \(pulseNorm)")
+    }
 }
+

@@ -201,13 +201,22 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             l += 1
         }
 
+        var exportedWIn = self.wIn.transposed().asArray(Float.self)
+        if AudioConfig.pulseChannel < inputDim {
+            var h = 0
+            while h < maxHiddenDim {
+                exportedWIn[(h * inputDim) + AudioConfig.pulseChannel] = 0.0
+                h += 1
+            }
+        }
+
         return SpikingNetworkWeights(
             inputDim: inputDim,
             maxHiddenDim: maxHiddenDim,
             outputDim: outputDim,
             timeSteps: timeSteps,
             lifConfig: lifConfig,
-            wIn: self.wIn.transposed().asArray(Float.self),
+            wIn: exportedWIn,
             wRec: self.wRec.transposed().asArray(Float.self),
             bH: self.bH.asArray(Float.self),
             wLayers: wl,
@@ -243,7 +252,15 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         // ------------------------------------------------------------
         // ブロック 0: 層 0 再帰 LIF
         // ------------------------------------------------------------
-        let currentSeq0 = matmul(features, self.wIn) + self.bH
+        var inFeats = features
+        if AudioConfig.pulseChannel < inputDim {
+            // パルス (ch 199) は layer0.reset() のゲートにのみ使用し、列からのクリック電流は遮断する
+            var maskData = [Float](repeating: 1.0, count: inputDim)
+            maskData[AudioConfig.pulseChannel] = 0.0
+            let chMask = MLXArray(maskData, [1, 1, inputDim])
+            inFeats = features * chMask
+        }
+        let currentSeq0 = matmul(inFeats, self.wIn) + self.bH
         var v0 = MLXArray.zeros([batchSize, hSize])
         var s0 = MLXArray.zeros([batchSize, hSize])
         var a0 = MLXArray.zeros([batchSize, hSize])

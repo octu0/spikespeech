@@ -252,7 +252,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     if 1 < duration {
                         phonePos = Float(f) / Float(duration - 1)
                     }
-                    seq[frameIdx][196] = phonePos * 1.0
+                    seq[frameIdx][196] = 3.0 * phonePos
                 }
                 if 197 < inDim {
                     let rate = 10.0 / Float(max(1, duration))

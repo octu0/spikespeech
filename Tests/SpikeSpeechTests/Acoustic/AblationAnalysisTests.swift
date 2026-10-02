@@ -2609,6 +2609,105 @@ final class AblationAnalysisTests: XCTestCase {
             }
         }
     }
+
+    /// 有声フレームの隣接スペクトル余弦 > 0.99 割合およびスペクトル重心変化中央値を計測する
+    func testSpectralCosineAndCentroid() throws {
+        let files = [
+            ("tts_tenki.wav", ".tmp/wave15/tts_tenki.wav"),
+            ("copy_BASIC5000_0001.wav", ".tmp/wave15/copy_BASIC5000_0001.wav")
+        ]
+        let reader = WavAudioReader()
+        let extractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let tracker = PitchTracker()
+
+        for (name, path) in files {
+            guard FileManager.default.fileExists(atPath: path) else {
+                print("[\(name)] ファイルが存在しません: \(path)")
+                continue
+            }
+            let pcm = try reader.loadWav16k(from: path)
+            let pitch = tracker.track(pcm: pcm)
+            let logMel = extractor.extractLogMel(pcm: pcm)
+
+            var linMel = logMel
+            var f = 0
+            while f < linMel.count {
+                var c = 0
+                while c < AudioConfig.melChannels {
+                    linMel[f][c] = expf(logMel[f][c])
+                    c += 1
+                }
+                f += 1
+            }
+
+            let stftMag = extractor.extractLinearMagnitudeSpectrogram(pcm: pcm)
+            let stftCentroids = extractor.computeSpectralCentroids(pcm: pcm)
+
+
+            func runEval(spec: [[Float]], customCentroids: [Float]?, label: String) {
+                var totalVoiced = 0
+                var cosOver99 = 0
+                var centroidDiffs: [Float] = []
+
+                var t = 1
+                let limit = min(spec.count, pitch.frameCount)
+                while t < limit {
+                    let isVoiced = (0.5 <= pitch.voiced[t] && 0.5 <= pitch.voiced[t - 1])
+                    if isVoiced {
+                        totalVoiced += 1
+                        var dot: Float = 0.0
+                        var normA: Float = 0.0
+                        var normB: Float = 0.0
+                        var c = 0
+                        while c < spec[t].count {
+                            let a = spec[t][c]
+                            let b = spec[t - 1][c]
+                            dot += a * b
+                            normA += a * a
+                            normB += b * b
+                            c += 1
+                        }
+                        let denom = sqrtf(normA) * sqrtf(normB)
+                        var cosSim: Float = 0.0
+                        if 1e-6 < denom {
+                            cosSim = dot / denom
+                        }
+                        if 0.99 < cosSim {
+                            cosOver99 += 1
+                        }
+
+                        if let cents = customCentroids {
+                            if t < cents.count {
+                                centroidDiffs.append(abs(cents[t] - cents[t - 1]))
+                            }
+                        }
+                    }
+                    t += 1
+                }
+
+                centroidDiffs.sort()
+                var medDiff: Float = 0.0
+                if centroidDiffs.isEmpty != true {
+                    medDiff = centroidDiffs[centroidDiffs.count / 2]
+                }
+                var ratio: Float = 0.0
+                if 0 < totalVoiced {
+                    ratio = Float(cosOver99) / Float(totalVoiced)
+                }
+                print("[\(name)] \(label): 有声数=\(totalVoiced), 余弦>0.99割合=\(String(format: "%.3f", ratio)), 重心変化中央値=\(String(format: "%.1f", medDiff)) Hz")
+            }
+
+            print("==================================================")
+            print("計測対象: \(name) (\(pcm.count) サンプル, \(Float(pcm.count) / 16000.0) 秒)")
+            runEval(spec: logMel, customCentroids: nil, label: "LogMel (64ch)")
+            runEval(spec: linMel, customCentroids: nil, label: "LinMel (64ch)")
+            runEval(spec: stftMag, customCentroids: stftCentroids, label: "STFT Mag (257 bins)")
+        }
+    }
 }
+
 
 

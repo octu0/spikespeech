@@ -987,21 +987,67 @@ func main() {
     }
 
     // ============================================================
-    // 手順 5: wIn 音響特徴チャンネル (ch 192..198) 再初期化 & ウォームスタート重み設定
+    // 手順 5: phonePos (ch 196) 電流スケーリング & パルス (ch 199) 列 0 化
     // ============================================================
     print("\n===========================================================")
-    print("【手順 5: 入力重み wIn 音響特徴チャンネル (ch 192..198) 再初期化】")
+    print("【手順 5: phonePos (ch 196) 電流スケーリング & パルス (ch 199) 列 0 化】")
     print("===========================================================")
+
+    // 1. 母音 5 列 (ch 5, 6, 7, 8, 9) の L2 ノルム平均および one-hot 電流 (振幅 3.0)
+    let vowelCols = [5, 6, 7, 8, 9]
+    var vowelNormSum: Float = 0.0
+    for vc in vowelCols {
+        var sumSq: Float = 0.0
+        var h = 0
+        while h < hiddenDim {
+            let val = weights.wIn[(h * inDim) + vc]
+            sumSq += val * val
+            h += 1
+        }
+        vowelNormSum += sqrtf(sumSq)
+    }
+    let vowelAvgNorm = vowelNormSum / Float(vowelCols.count)
+    let vowelOneHotCurrent = vowelAvgNorm * 3.0
+
+    // 2. phonePos (ch 196) のスケーリング前 L2 ノルムおよび電流
+    var p196SumSq: Float = 0.0
+    var h = 0
+    while h < hiddenDim {
+        let val = weights.wIn[(h * inDim) + 196]
+        p196SumSq += val * val
+        h += 1
+    }
+    let phonePosNormBefore = sqrtf(p196SumSq)
+    let phonePosCurrentBefore = phonePosNormBefore * 3.0
+
+    // 3. パルス (ch 199) のスケーリング前 L2 ノルム
+    var p199SumSq: Float = 0.0
+    h = 0
+    while h < hiddenDim {
+        let val = weights.wIn[(h * inDim) + 199]
+        p199SumSq += val * val
+        h += 1
+    }
+    let pulseNormBefore = sqrtf(p199SumSq)
+
+    // 4. 倍率の算出: (母音 5 列の L2 平均 × 3.0) / (ch 196 の L2 × 3.0)
+    var phonePosScale: Float = 1.0
+    if 1e-6 < phonePosNormBefore {
+        phonePosScale = (vowelAvgNorm * 3.0) / (phonePosNormBefore * 3.0)
+    }
+
+    // 5. 有効重みの適用 (既存重みを維持し、ch 196 スケーリングと ch 199 の 0 化)
     var effectiveWeights = weights
         .withPhonemeAverageDurations(healthyPhonemeAverages)
         .withMeanFramesPerMora(16.0)
-        .withResetAcousticInWeights(seed: 2026)
+        .withPhonePosScaledAndPulseZeroed(scale196: phonePosScale)
 
+    // 6. 変換後 wIn 各列 L2 ノルムの計測
     var colNorms = [Float](repeating: 0.0, count: inDim)
     var cColIdx = 0
     while cColIdx < inDim {
         var sumSq: Float = 0.0
-        var h = 0
+        h = 0
         while h < hiddenDim {
             let val = effectiveWeights.wIn[(h * inDim) + cColIdx]
             sumSq += val * val
@@ -1010,7 +1056,23 @@ func main() {
         colNorms[cColIdx] = sqrtf(sumSq)
         cColIdx += 1
     }
-    print("  --- wIn 列 L2 ノルム (再初期化後) ---")
+
+    let phonePosNormAfter = colNorms[196]
+    let phonePosCurrentAfter = phonePosNormAfter * 3.0
+    let pulseNormAfter = colNorms[199]
+    let currentRatio = phonePosCurrentAfter / max(1e-6, vowelOneHotCurrent)
+
+    print("  --- 学習前 電流・重みスケーリング検証 ---")
+    print("  母音 5 列 (ch 5, 6, 7, 8, 9) 平均 L2: \(String(format: "%.4f", vowelAvgNorm))")
+    print("  母音 one-hot 電流:               \(String(format: "%.4f", vowelOneHotCurrent)) (振幅 3.0)")
+    print("  phonePos スケーリング前 L2:          \(String(format: "%.4f", phonePosNormBefore))")
+    print("  phonePos スケーリング前 電流:        \(String(format: "%.4f", phonePosCurrentBefore)) (振幅 3.0 時)")
+    print("  phonePos スケーリング倍率:           \(String(format: "%.6f", phonePosScale))")
+    print("  phonePos スケーリング後 L2:          \(String(format: "%.4f", phonePosNormAfter))")
+    print("  phonePos スケーリング後 電流:        \(String(format: "%.4f", phonePosCurrentAfter)) (phonePos=1 時, 振幅 3.0)")
+    print("  phonePos / one-hot 電流比:          \(String(format: "%.4f", currentRatio)) (受入基準: 0.8〜1.2)")
+    print("  パルス列 (ch 199) スケーリング前 L2:   \(String(format: "%.4f", pulseNormBefore))")
+    print("  パルス列 (ch 199) スケーリング後 L2:   \(String(format: "%.4f", pulseNormAfter)) (受入基準: 0.0)")
     print("  ch 192 (voiced):     \(String(format: "%.4f", colNorms[192]))")
     print("  ch 193 (unvoiced):   \(String(format: "%.4f", colNorms[193]))")
     print("  ch 194 (normF0):     \(String(format: "%.4f", colNorms[194]))")
@@ -1018,15 +1080,18 @@ func main() {
     print("  ch 196 (phonePos):   \(String(format: "%.4f", colNorms[196]))")
     print("  ch 197 (rate):       \(String(format: "%.4f", colNorms[197]))")
     print("  ch 198 (energy):     \(String(format: "%.4f", colNorms[198]))")
-    var unusedNormSum: Float = 0.0
-    var unCh = 200
-    while unCh < inDim {
-        unusedNormSum += colNorms[unCh]
-        unCh += 1
+    print("  ch 199 (pulse):      \(String(format: "%.4f", colNorms[199]))")
+
+    // 受入ゲート: 電流比 0.8〜1.2 および パルス列 L2 = 0
+    if currentRatio < 0.8 || 1.2 < currentRatio {
+        print("エラー: phonePos 電流比 (\(currentRatio)) が 0.8〜1.2 の範囲外です。学習を中止します。")
+        return
     }
-    let unusedAvgNorm = unusedNormSum / Float(max(1, inDim - 200))
-    print("  ch 200..255 (未使用平均): \(String(format: "%.4f", unusedAvgNorm))")
-    print("  母音 a (one-hot ch 5):   \(String(format: "%.4f", colNorms[5]))")
+    if 1e-5 < pulseNormAfter {
+        print("エラー: パルス列 (ch 199) の L2 ノルム (\(pulseNormAfter)) が 0 ではありません。学習を中止します。")
+        return
+    }
+    print("【受入検証ゲート（電流整合）PASS】phonePos 電流が母音 one-hot と厳密に揃い、パルス列 L2 は 0 です。\n")
 
     let gateEngine = SpikeSpeechEngine(weights: effectiveWeights)
 
@@ -1615,6 +1680,16 @@ func main() {
             print("再構成 WAV を出力しました: \(reconURL.path) (\(rawSamples.count) サンプル, \(wavData.count) バイト)")
         } catch {
             print("警告: 再構成 WAV 出力失敗: \(error)")
+        }
+
+        let tenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
+        let tenkiWavData = reconEngine.synthesizeWav(text: "今日はいい天気です")
+        do {
+            try tenkiWavData.write(to: tenkiURL)
+            let tenkiSamples = max(0, (tenkiWavData.count - 44) / 2)
+            print("tts_tenki.wav を出力しました: \(tenkiURL.path) (\(tenkiSamples) サンプル, \(tenkiWavData.count) バイト, \(Float(tenkiSamples) / 16000.0) 秒)")
+        } catch {
+            print("警告: tts_tenki.wav 出力失敗: \(error)")
         }
     }
 

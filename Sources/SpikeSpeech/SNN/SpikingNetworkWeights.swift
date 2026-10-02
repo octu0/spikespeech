@@ -411,6 +411,47 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         )
     }
 
+    /// phonePos (ch 196) 列重みを指定スケール倍し、パルス (ch 199) 列重みを 0 にクリアした重みインスタンスを生成する。
+    /// なぜこの変換を行うか:
+    /// 1. phonePos の注入電流（振幅 3.0 × wIn L2）を母音 one-hot 電流と揃え、音素進行に伴うフォルマントの時間移動を膜電位に駆動させるため。
+    /// 2. ch 199 からのクリック電流を遮断し、layer0.reset() の純粋な状態リセットゲートとしてのみ機能させるため。
+    public func withPhonePosScaledAndPulseZeroed(scale196: Float) -> SpikingNetworkWeights {
+        var newWIn = self.wIn
+        var h = 0
+        while h < self.maxHiddenDim {
+            let rowOffset = h * self.inputDim
+            if 196 < self.inputDim {
+                newWIn[rowOffset + 196] = newWIn[rowOffset + 196] * scale196
+            }
+            if 199 < self.inputDim {
+                newWIn[rowOffset + 199] = 0.0
+            }
+            h += 1
+        }
+
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: newWIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
+        )
+    }
+
+
 
     /// 発火ニューロンから各出力ニューロンへの流出結合重みをメモリ上で連続配置に変換し、推論時の SIMD8 ロードにおけるキャッシュミスを根絶する。
     public func makeWRecT() -> [Float] {

@@ -512,6 +512,100 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
         return spectrogram
     }
 
+    /// 16kHz PCM 音声から各フレームの線形振幅スペクトログラム (STFT magnitude: 257 bins) を抽出する
+    public func extractLinearMagnitudeSpectrogram(pcm: [Float]) -> [[Float]] {
+        if pcm.isEmpty {
+            return []
+        }
+        let frameCount = max(1, pcm.count / hopSize)
+        var spectrogram = [[Float]](repeating: [Float](repeating: 0.0, count: fftBins), count: frameCount)
+        var realBuf = [Float](repeating: 0.0, count: fftSize)
+        var imagBuf = [Float](repeating: 0.0, count: fftSize)
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var s = 0
+            while s < fftSize {
+                if s < frameSize {
+                    let sampleIdx = sampleStart + s
+                    if sampleIdx < pcm.count {
+                        realBuf[s] = pcm[sampleIdx] * window[s]
+                    } else {
+                        realBuf[s] = 0.0
+                    }
+                } else {
+                    realBuf[s] = 0.0
+                }
+                imagBuf[s] = 0.0
+                s += 1
+            }
+
+            computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var k = 0
+            while k < fftBins {
+                let r = realBuf[k]
+                let im = imagBuf[k]
+                spectrogram[f][k] = sqrtf(r * r + im * im)
+                k += 1
+            }
+            f += 1
+        }
+        return spectrogram
+    }
+
+    /// 16kHz PCM 音声から各フレームのスペクトル重心（Spectral Centroid: Hz）列を算出する
+    public func computeSpectralCentroids(pcm: [Float]) -> [Float] {
+        if pcm.isEmpty {
+            return []
+        }
+        let frameCount = max(1, pcm.count / hopSize)
+        var centroids = [Float](repeating: 0.0, count: frameCount)
+        var realBuf = [Float](repeating: 0.0, count: fftSize)
+        var imagBuf = [Float](repeating: 0.0, count: fftSize)
+
+        let binFreqFactor = sampleRate / Float(fftSize)
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var s = 0
+            while s < fftSize {
+                let pcmIdx = sampleStart + s
+                if pcmIdx < pcm.count && s < frameSize {
+                    realBuf[s] = pcm[pcmIdx] * window[s]
+                } else {
+                    realBuf[s] = 0.0
+                }
+                imagBuf[s] = 0.0
+                s += 1
+            }
+
+            computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var num: Float = 0.0
+            var den: Float = 0.0
+            var b = 0
+            while b < fftBins {
+                let r = realBuf[b]
+                let im = imagBuf[b]
+                let mag = sqrtf(r * r + im * im)
+                let freq = Float(b) * binFreqFactor
+                num += freq * mag
+                den += mag
+                b += 1
+            }
+
+            if 1e-6 < den {
+                centroids[f] = num / den
+            }
+
+            f += 1
+        }
+        return centroids
+    }
+
     /// 16kHz PCM 音声区間からスペクトル重心（Spectral Centroid: Hz）を算出する
     public func computeSpectralCentroid(pcm: [Float]) -> Float {
         if pcm.isEmpty {
