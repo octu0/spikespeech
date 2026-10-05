@@ -380,7 +380,7 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
     }
 
     /// In-place FFT 計算
-    private func computeFFT(real: inout [Float], imag: inout [Float]) {
+    package func computeFFT(real: inout [Float], imag: inout [Float]) {
         var i = 0
         while i < fftSize {
             let rev = bitReversedIndices[i]

@@ -2614,6 +2614,7 @@ final class AblationAnalysisTests: XCTestCase {
     func testSpectralCosineAndCentroid() throws {
         let files = [
             ("tts_tenki.wav", ".tmp/wave15/tts_tenki.wav"),
+            ("tts_mizuwomare.wav", ".tmp/wave15/tts_mizuwomare.wav"),
             ("copy_BASIC5000_0001.wav", ".tmp/wave15/copy_BASIC5000_0001.wav")
         ]
         let reader = WavAudioReader()
@@ -2705,8 +2706,479 @@ final class AblationAnalysisTests: XCTestCase {
             runEval(spec: logMel, customCentroids: nil, label: "LogMel (64ch)")
             runEval(spec: linMel, customCentroids: nil, label: "LinMel (64ch)")
             runEval(spec: stftMag, customCentroids: stftCentroids, label: "STFT Mag (257 bins)")
+
+            let obj = Self.measureObjectiveAcousticMetrics(pcm: pcm)
+            print("[\(name)] 設計仕様基準 (窓512, Hann, 55%tile有声, 200-4000Hz重心): 有声対=\(obj.voicedCount), 余弦>0.99割合=\(String(format: "%.3f", obj.cosRatio)), 重心変化中央値=\(String(format: "%.1f", obj.centroidMedian)) Hz")
+            let objDetail = Self.measureObjectiveAcousticMetricsDetail(pcm: pcm)
+            print("[\(name)] 詳細基準: 有声対=\(objDetail.voicedCount), 余弦>0.99割合=\(String(format: "%.3f", objDetail.cosRatio)), 200-4000Hz重心変化=\(String(format: "%.1f", objDetail.centroidMedian200to4000)) Hz, 200-1500Hz重心変化=\(String(format: "%.1f", objDetail.centroidMedian200to1500)) Hz")
+
+            let halves = AcousticCentroidMetric.measureHalves(pcm: pcm)
+            let f0Full = AcousticCentroidMetric.measureF0Median(pcm: pcm)
+            print("[\(name)] 全体 F0 中央値=\(String(format: "%.1f", f0Full)) Hz")
+            print("[\(name)] 前半: 停止割合=\(String(format: "%.3f", halves.first.cosRatio)), 重心=\(String(format: "%.1f", halves.first.centroidMedian200to1500)) Hz, F0=\(String(format: "%.1f", halves.first.f0Median)) Hz")
+            print("[\(name)] 後半: 停止割合=\(String(format: "%.3f", halves.second.cosRatio)), 重心=\(String(format: "%.1f", halves.second.centroidMedian200to1500)) Hz, F0=\(String(format: "%.1f", halves.second.f0Median)) Hz")
         }
     }
+
+    /// 設計仕様書に基づく音響客観指標計測:
+    /// （窓 512、ホップ 160、Hann、平均振幅が全体の 55 パーセンタイルを超えるフレームを有声、200–4000 Hz の重心）
+    public static func measureObjectiveAcousticMetrics(pcm: [Float]) -> (cosRatio: Float, centroidMedian: Float, voicedCount: Int) {
+        if pcm.isEmpty {
+            return (0.0, 0.0, 0)
+        }
+        let winSize = 512
+        let hopSize = 160
+        let frameCount = max(1, (pcm.count - winSize) / hopSize)
+        let sampleRate: Float = 16000.0
+
+        var hann = [Float](repeating: 0.0, count: winSize)
+        var n = 0
+        while n < winSize {
+            hann[n] = 0.5 * (1.0 - cosf((2.0 * Float.pi * Float(n)) / Float(winSize)))
+            n += 1
+        }
+
+        let extractor = MelSpectrogramExtractor(
+            sampleRate: sampleRate,
+            melChannels: AudioConfig.melChannels,
+            hopSize: hopSize,
+            frameSize: winSize,
+            fftSize: winSize
+        )
+
+        var frameAmplitudes = [Float](repeating: 0.0, count: frameCount)
+        var frameMags = [[Float]](repeating: [Float](repeating: 0.0, count: 257), count: frameCount)
+        var frameCentroids = [Float](repeating: 0.0, count: frameCount)
+
+        let binHz = sampleRate / Float(winSize)
+        let kMin = 7
+        let kMax = 128
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var realBuf = [Float](repeating: 0.0, count: winSize)
+            var imagBuf = [Float](repeating: 0.0, count: winSize)
+
+            var ampSum: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let pcmIdx = sampleStart + s
+                var sampleVal: Float = 0.0
+                if pcmIdx < pcm.count {
+                    sampleVal = pcm[pcmIdx]
+                }
+                ampSum += abs(sampleVal)
+                realBuf[s] = sampleVal * hann[s]
+                imagBuf[s] = 0.0
+                s += 1
+            }
+            frameAmplitudes[f] = ampSum / Float(winSize)
+
+            extractor.computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var num: Float = 0.0
+            var den: Float = 0.0
+            var b = 0
+            while b <= 256 {
+                let r = realBuf[b]
+                let im = imagBuf[b]
+                let mag = sqrtf(r * r + im * im)
+                frameMags[f][b] = mag
+                if kMin <= b && b <= kMax {
+                    let freq = Float(b) * binHz
+                    num += freq * mag
+                    den += mag
+                }
+                b += 1
+            }
+
+            if 1e-6 < den {
+                frameCentroids[f] = num / den
+            }
+            f += 1
+        }
+
+        let sortedAmps = frameAmplitudes.sorted()
+        var p55Idx = Int(Float(frameCount) * 0.55)
+        if frameCount <= p55Idx {
+            p55Idx = frameCount - 1
+        }
+        let threshold55 = sortedAmps[p55Idx]
+
+        var voicedPairs = 0
+        var cosOver99Count = 0
+        var cosAllOver99Count = 0
+        var centroidDiffs: [Float] = []
+
+        var t = 1
+        while t < frameCount {
+            let isVoicedCurr = (threshold55 < frameAmplitudes[t])
+            let isVoicedPrev = (threshold55 < frameAmplitudes[t - 1])
+            if isVoicedCurr && isVoicedPrev {
+                voicedPairs += 1
+
+                var dot: Float = 0.0
+                var normA: Float = 0.0
+                var normB: Float = 0.0
+                var k = kMin
+                while k <= kMax {
+                    let a = frameMags[t][k]
+                    let b = frameMags[t - 1][k]
+                    dot += a * b
+                    normA += a * a
+                    normB += b * b
+                    k += 1
+                }
+                let denom = sqrtf(normA) * sqrtf(normB)
+                var cosSim: Float = 0.0
+                if 1e-6 < denom {
+                    cosSim = dot / denom
+                }
+                if 0.99 < cosSim {
+                    cosOver99Count += 1
+                }
+
+                var dotAll: Float = 0.0
+                var normAllA: Float = 0.0
+                var normAllB: Float = 0.0
+                var b = 0
+                while b <= 256 {
+                    let a = frameMags[t][b]
+                    let bVal = frameMags[t - 1][b]
+                    dotAll += a * bVal
+                    normAllA += a * a
+                    normAllB += bVal * bVal
+                    b += 1
+                }
+                let denomAll = sqrtf(normAllA) * sqrtf(normAllB)
+                var cosSimAll: Float = 0.0
+                if 1e-6 < denomAll {
+                    cosSimAll = dotAll / denomAll
+                }
+                if 0.99 < cosSimAll {
+                    cosAllOver99Count += 1
+                }
+
+                centroidDiffs.append(abs(frameCentroids[t] - frameCentroids[t - 1]))
+            }
+            t += 1
+        }
+
+        centroidDiffs.sort()
+        var medDiff: Float = 0.0
+        if centroidDiffs.isEmpty != true {
+            medDiff = centroidDiffs[centroidDiffs.count / 2]
+        }
+        var cosRatio: Float = 0.0
+        if 0 < voicedPairs {
+            cosRatio = Float(cosOver99Count) / Float(voicedPairs)
+        }
+        var cosAllRatio: Float = 0.0
+        if 0 < voicedPairs {
+            cosAllRatio = Float(cosAllOver99Count) / Float(voicedPairs)
+        }
+        print("  [詳細内訳] 有声対=\(voicedPairs), 200-4000Hz余弦>0.99=\(String(format: "%.3f", cosRatio)) (\(cosOver99Count)/\(voicedPairs)), 全帯域余弦>0.99=\(String(format: "%.3f", cosAllRatio)) (\(cosAllOver99Count)/\(voicedPairs)), 重心変化中央値=\(String(format: "%.1f", medDiff)) Hz")
+        return (cosRatio: cosRatio, centroidMedian: medDiff, voicedCount: voicedPairs)
+    }
+
+    /// 設計仕様書（design_waveform_grad.md）に基づく詳細音響客観指標計測:
+    /// （窓 512、ホップ 160、Hann、平均振幅が全体の 55 パーセンタイルを超えるフレームを有声）
+    /// - 有声隣接余弦 0.99 超過割合
+    /// - 200–4000 Hz 重心変化中央値
+    /// - 200–1500 Hz フォルマント帯重心変化中央値
+    public static func measureObjectiveAcousticMetricsDetail(pcm: [Float]) -> (
+        cosRatio: Float,
+        centroidMedian200to4000: Float,
+        centroidMedian200to1500: Float,
+        voicedCount: Int
+    ) {
+        if pcm.isEmpty {
+            return (0.0, 0.0, 0.0, 0)
+        }
+        let winSize = 512
+        let hopSize = 160
+        let frameCount = max(1, (pcm.count - winSize) / hopSize)
+        let sampleRate: Float = 16000.0
+
+        var hann = [Float](repeating: 0.0, count: winSize)
+        var n = 0
+        while n < winSize {
+            hann[n] = 0.5 * (1.0 - cosf((2.0 * Float.pi * Float(n)) / Float(winSize)))
+            n += 1
+        }
+
+        let extractor = MelSpectrogramExtractor(
+            sampleRate: sampleRate,
+            melChannels: AudioConfig.melChannels,
+            hopSize: hopSize,
+            frameSize: winSize,
+            fftSize: winSize
+        )
+
+        var frameAmplitudes = [Float](repeating: 0.0, count: frameCount)
+        var frameMags = [[Float]](repeating: [Float](repeating: 0.0, count: 257), count: frameCount)
+        var frameCentroids4k = [Float](repeating: 0.0, count: frameCount)
+        var frameCentroids1k5 = [Float](repeating: 0.0, count: frameCount)
+
+        let binHz = sampleRate / Float(winSize)
+        let kMin = 7     // ~218.75 Hz
+        let kMax4k = 128 // ~4000 Hz
+        let kMax1k5 = 48 // ~1500 Hz
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var realBuf = [Float](repeating: 0.0, count: winSize)
+            var imagBuf = [Float](repeating: 0.0, count: winSize)
+
+            var ampSum: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let pcmIdx = sampleStart + s
+                var sampleVal: Float = 0.0
+                if pcmIdx < pcm.count {
+                    sampleVal = pcm[pcmIdx]
+                }
+                ampSum += abs(sampleVal)
+                realBuf[s] = sampleVal * hann[s]
+                imagBuf[s] = 0.0
+                s += 1
+            }
+            frameAmplitudes[f] = ampSum / Float(winSize)
+
+            extractor.computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var num4k: Float = 0.0
+            var den4k: Float = 0.0
+            var num1k5: Float = 0.0
+            var den1k5: Float = 0.0
+
+            var b = 0
+            while b <= 256 {
+                let r = realBuf[b]
+                let im = imagBuf[b]
+                let mag = sqrtf(r * r + im * im)
+                frameMags[f][b] = mag
+                let freq = Float(b) * binHz
+                if kMin <= b && b <= kMax4k {
+                    num4k += freq * mag
+                    den4k += mag
+                }
+                if kMin <= b && b <= kMax1k5 {
+                    num1k5 += freq * mag
+                    den1k5 += mag
+                }
+                b += 1
+            }
+
+            if 1e-6 < den4k {
+                frameCentroids4k[f] = num4k / den4k
+            }
+            if 1e-6 < den1k5 {
+                frameCentroids1k5[f] = num1k5 / den1k5
+            }
+            f += 1
+        }
+
+        let sortedAmps = frameAmplitudes.sorted()
+        var p55Idx = Int(Float(frameCount) * 0.55)
+        if frameCount <= p55Idx {
+            p55Idx = frameCount - 1
+        }
+        let threshold55 = sortedAmps[p55Idx]
+
+        var voicedPairs = 0
+        var cosOver99Count = 0
+        var centroidDiffs4k: [Float] = []
+        var centroidDiffs1k5: [Float] = []
+
+        var t = 1
+        while t < frameCount {
+            let isVoicedCurr = (threshold55 < frameAmplitudes[t])
+            let isVoicedPrev = (threshold55 < frameAmplitudes[t - 1])
+            if isVoicedCurr && isVoicedPrev {
+                voicedPairs += 1
+
+                var dot: Float = 0.0
+                var normA: Float = 0.0
+                var normB: Float = 0.0
+                var k = kMin
+                while k <= kMax4k {
+                    let a = frameMags[t][k]
+                    let b = frameMags[t - 1][k]
+                    dot += a * b
+                    normA += a * a
+                    normB += b * b
+                    k += 1
+                }
+                let denom = sqrtf(normA) * sqrtf(normB)
+                var cosSim: Float = 0.0
+                if 1e-6 < denom {
+                    cosSim = dot / denom
+                }
+                if 0.99 < cosSim {
+                    cosOver99Count += 1
+                }
+
+                centroidDiffs4k.append(abs(frameCentroids4k[t] - frameCentroids4k[t - 1]))
+                centroidDiffs1k5.append(abs(frameCentroids1k5[t] - frameCentroids1k5[t - 1]))
+            }
+            t += 1
+        }
+
+        centroidDiffs4k.sort()
+        var medDiff4k: Float = 0.0
+        if centroidDiffs4k.isEmpty != true {
+            medDiff4k = centroidDiffs4k[centroidDiffs4k.count / 2]
+        }
+
+        centroidDiffs1k5.sort()
+        var medDiff1k5: Float = 0.0
+        if centroidDiffs1k5.isEmpty != true {
+            medDiff1k5 = centroidDiffs1k5[centroidDiffs1k5.count / 2]
+        }
+
+        var cosRatio: Float = 0.0
+        if 0 < voicedPairs {
+            cosRatio = Float(cosOver99Count) / Float(voicedPairs)
+        }
+
+        print("  [詳細内訳] 有声対=\(voicedPairs), 余弦>0.99=\(String(format: "%.3f", cosRatio)), 200-4000Hz重心変化中央値=\(String(format: "%.1f", medDiff4k)) Hz, 200-1500Hz重心変化中央値=\(String(format: "%.1f", medDiff1k5)) Hz")
+        return (
+            cosRatio: cosRatio,
+            centroidMedian200to4000: medDiff4k,
+            centroidMedian200to1500: medDiff1k5,
+            voicedCount: voicedPairs
+        )
+    }
+
+#if canImport(MLX)
+    /// 波形損失勾配受入ゲート（ゲート 1〜4）の自動評価テスト
+    func testWaveformGradGates() throws {
+        let weightsPath = "Models/weights.json"
+        let vocoderWeightsPath = "Models/vocoder_weights.json"
+        guard FileManager.default.fileExists(atPath: weightsPath),
+              FileManager.default.fileExists(atPath: vocoderWeightsPath) else {
+            print("重みファイルが存在しません")
+            return
+        }
+
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: weightsPath))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+
+        let vocData = try Data(contentsOf: URL(fileURLWithPath: vocoderWeightsPath))
+        let vocWeights = try JSONDecoder().decode(NeuralVocoderWeights.self, from: vocData)
+
+        let network = MLXSpikingAcousticNetwork(weights: weights)
+        let vocoder = MLXNeuralVocoder(weights: vocWeights)
+        let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+        let text = "水をマレーシアから買わなくてはならないのです。"
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        guard FileManager.default.fileExists(atPath: wavPath) else {
+            print("BASIC5000_0001.wav が存在しません: \(wavPath)")
+            return
+        }
+
+        let wavReader = WavAudioReader()
+        let rawPCM = try wavReader.loadWav16k(from: wavPath)
+        var peak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawPCM.count {
+            let a = abs(rawPCM[pIdx])
+            if peak < a { peak = a }
+            pIdx += 1
+        }
+        var pcm16k = rawPCM
+        if 0.01 < peak {
+            let normFactor = 0.85 / peak
+            var s = 0
+            while s < pcm16k.count {
+                pcm16k[s] = pcm16k[s] * normFactor
+                s += 1
+            }
+        }
+
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let pitchTracker = PitchTracker()
+
+        var effectiveAlign: UtteranceAlignment? = nil
+        let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        if FileManager.default.fileExists(atPath: corpusAlignPath) {
+            if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                effectiveAlign = alignMap["BASIC5000_0001"]
+            }
+        }
+
+        guard let pair = engine.prepareTrainingPair(
+            text: text,
+            pcm16k: pcm16k,
+            melExtractor: melExtractor,
+            pitchTracker: pitchTracker,
+            alignment: effectiveAlign,
+            useScaledDuration: false
+        ) else {
+            XCTFail("prepareTrainingPair 失敗")
+            return
+        }
+
+        let res = WaveformGradGateEvaluator.evaluate(
+            network: network,
+            vocoder: vocoder,
+            features: pair.features,
+            targets: pair.targets,
+            targetAudio: pair.targetAudio,
+            waveformLossWeight: 0.15,
+            bpttWindow: 1
+        )
+
+        let strPass1: String
+        switch res.gate1Passed {
+        case true: strPass1 = "PASS"
+        case false: strPass1 = "FAIL"
+        }
+        let strPass2: String
+        switch res.gate2Passed {
+        case true: strPass2 = "PASS"
+        case false: strPass2 = "FAIL"
+        }
+        let strPass3: String
+        switch res.gate3Passed {
+        case true: strPass3 = "PASS"
+        case false: strPass3 = "FAIL"
+        }
+        let strPass4: String
+        switch res.gate4Passed {
+        case true: strPass4 = "PASS"
+        case false: strPass4 = "FAIL"
+        }
+        let strAllPassed: String
+        switch res.allPassed {
+        case true: strAllPassed = "ALL PASSED"
+        case false: strAllPassed = "FAILED"
+        }
+
+        print("==================================================")
+        print("波形損失勾配受入ゲート（ゲート 1〜4）検証結果:")
+        print("  区間開始フレーム: \(res.segStart)")
+        print("  ゲート 1 (スライス最大絶対差): \(res.maxSliceDiff) -> \(strPass1)")
+        print("  ゲート 2 (STFT損失): 教師=\(res.teacherSTFTLoss) vs 予測=\(res.predSTFTLoss) -> \(strPass2)")
+        print("  ゲート 3 (Mel勾配平均絶対値): tanh=\(res.melGradMeanAbsTanh), preTanh=\(res.melGradMeanAbsPreTanh), 飽和率=\(res.outputSaturationRatio), usePreTanh=\(res.usePreTanh) -> \(strPass3)")
+        print("  ゲート 4 (wOut 勾配ノルム比率): Mel=\(res.wOutMelGradNorm), Wave=\(res.wOutWaveGradNorm), 比率=\(res.gradNormRatio), 推奨係数=\(res.recommendedWeight) -> \(strPass4)")
+        print("  総合判定: \(strAllPassed)")
+        print("==================================================")
+
+        XCTAssertTrue(res.gate1Passed, "ゲート 1 (スライス整合性) に失敗")
+        XCTAssertTrue(res.gate2Passed, "ゲート 2 (ボコーダ教師STFT損失 < 予測STFT損失) に失敗")
+        XCTAssertTrue(res.gate3Passed, "ゲート 3 (Mel勾配平均絶対値 > 1e-4) に失敗")
+        XCTAssertTrue(res.gate4Passed, "ゲート 4 (wOut 勾配ノルム比率 0.2〜5.0) に失敗")
+        XCTAssertTrue(res.allPassed, "受入ゲート総合判定に失敗")
+    }
+#endif
 }
 
 

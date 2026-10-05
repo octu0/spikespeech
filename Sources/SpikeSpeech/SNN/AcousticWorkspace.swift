@@ -39,6 +39,9 @@ public final class AcousticWorkspace: @unchecked Sendable {
     /// 各層のニューロン状態
     public var layerStates: [LIFState]
 
+    /// CfC 各層の隠れ状態バッファ [numLayers][maxHiddenDim]
+    public var cfcStates: [[Float]]
+
     /// 時間畳み込み（フレーム間混合）電流作業バッファ
     public var convCurrents: [Float]
 
@@ -64,12 +67,15 @@ public final class AcousticWorkspace: @unchecked Sendable {
         self.zeroFloats = [Float](repeating: 0.0, count: maxHiddenDim)
 
         var states: [LIFState] = []
+        var cfc: [[Float]] = []
         var l = 0
         while l < safeLayers {
             states.append(LIFState(size: maxHiddenDim))
+            cfc.append([Float](repeating: 0.0, count: maxHiddenDim))
             l += 1
         }
         self.layerStates = states
+        self.cfcStates = cfc
     }
 
     /// 発話間の境界でニューロン状態および積算バッファを初期化する際、ヒープ割り当てを発生させずにポインタ直接操作でバルククリアする。
@@ -78,6 +84,14 @@ public final class AcousticWorkspace: @unchecked Sendable {
         var l = 0
         while l < numLayers {
             layerStates[l].reset()
+            if l < cfcStates.count {
+                let hDim = min(maxHiddenDim, cfcStates[l].count)
+                cfcStates[l].withUnsafeMutableBufferPointer { dst in
+                    zeroFloats.withUnsafeBufferPointer { src in
+                        dst.baseAddress!.update(from: src.baseAddress!, count: hDim)
+                    }
+                }
+            }
             l += 1
         }
 

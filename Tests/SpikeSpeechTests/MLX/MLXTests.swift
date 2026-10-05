@@ -110,6 +110,107 @@ final class MLXTests: XCTestCase {
         XCTAssertTrue(diff < 1e-4, "L1 Loss の計算が不正確です: \(lossVal)")
     }
 
+    func testMultiResolutionSTFTLossWithPhaseAndGradient() {
+        let nSamples = 1024
+        var pData = [Float](repeating: 0.0, count: nSamples)
+        var tData = [Float](repeating: 0.0, count: nSamples)
+        var s = 0
+        while s < nSamples {
+            pData[s] = sinf(Float(s) * 0.1) * 0.5
+            tData[s] = sinf(Float(s) * 0.12) * 0.5
+            s += 1
+        }
+        let pArr = MLXArray(pData, [1, nSamples])
+        let tArr = MLXArray(tData, [1, nSamples])
+
+        let loss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: pArr, target: tArr)
+        let lossVal = loss.item(Float.self)
+        XCTAssertTrue(0.0 < lossVal, "STFT 損失が正の値ではありません: \(lossVal)")
+        XCTAssertTrue(lossVal.isFinite, "STFT 損失が有限値ではありません: \(lossVal)")
+
+        let selfLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: pArr, target: pArr).item(Float.self)
+        XCTAssertTrue(selfLoss.isFinite, "自己 STFT 損失が有限値ではありません: \(selfLoss)")
+        XCTAssertTrue(selfLoss < lossVal, "自己 STFT 損失が他者損失より小さくありません: self=\(selfLoss), cross=\(lossVal)")
+
+        let gradFn = grad { p in
+            MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: p, target: tArr)
+        }
+        let g = gradFn(pArr)
+        let gArr = g.asArray(Float.self)
+        var hasNonZero = false
+        var allFinite = true
+        var i = 0
+        while i < gArr.count {
+            if gArr[i].isFinite != true {
+                allFinite = false
+                break
+            }
+            if 1e-6 < abs(gArr[i]) {
+                hasNonZero = true
+            }
+            i += 1
+        }
+        XCTAssertTrue(allFinite, "STFT 損失の勾配に NaN/Inf が含まれます")
+        XCTAssertTrue(hasNonZero, "STFT 損失の勾配が全て 0 です")
+    }
+
+    func testSNNWithVocoderWaveformLoss() throws {
+        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
+        let vocoderURL = URL(fileURLWithPath: "Models/vocoder_weights.json")
+        if FileManager.default.fileExists(atPath: weightsURL.path) != true || FileManager.default.fileExists(atPath: vocoderURL.path) != true {
+            return
+        }
+        let wData = try Data(contentsOf: weightsURL)
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: wData)
+        let vData = try Data(contentsOf: vocoderURL)
+        let vocWeights = try JSONDecoder().decode(NeuralVocoderWeights.self, from: vData)
+
+        let network = MLXSpikingAcousticNetwork(weights: weights)
+        let vocoder = MLXNeuralVocoder(weights: vocWeights)
+
+        let testWeight: Float = 0.15
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            vocoder: vocoder,
+            waveformLossWeight: testWeight,
+            learningRate: 0.001
+        )
+
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        if FileManager.default.fileExists(atPath: wavPath) != true {
+            return
+        }
+        let pcm = try WavAudioReader().loadWav16k(from: wavPath)
+        let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+        guard let pair = engine.prepareTrainingPair(
+            text: "水をマレーシアから買わなくてはならないのです。",
+            pcm16k: pcm,
+            melExtractor: MelSpectrogramExtractor(),
+            pitchTracker: PitchTracker()
+        ) else {
+            XCTFail("prepareTrainingPair 失敗")
+            return
+        }
+
+        trainer.trainSequence(
+            features: pair.features,
+            targets: pair.targets,
+            targetAudio: pair.targetAudio
+        )
+        let losses = trainer.lastLosses
+        print("\n=======================================================")
+        print("[Waveform Loss Ratio Test]")
+        print("  totalLoss: \(losses.totalLoss)")
+        print("  melL1:     \(losses.melL1)")
+        print("  waveTerm:  \(losses.waveTerm) (coef: \(testWeight))")
+        let ratio = losses.waveTerm / max(1e-6, losses.melL1)
+        print("  waveTerm / melL1 比率: \(ratio) (受入基準: 0.5 〜 2.0)")
+        print("=======================================================\n")
+
+        XCTAssertTrue(losses.totalLoss.isFinite, "totalLoss が有限値ではありません")
+        XCTAssertTrue(0.0 < losses.waveTerm, "waveTerm が 0 以下です")
+    }
+
     // MARK: - 4. BPTT 最適化ループによる損失減少検証
 
     func testBPTTTrainingLossDecreases() {
@@ -437,5 +538,216 @@ final class MLXTests: XCTestCase {
         XCTAssertEqual(name1, "weights.ep01.json")
         XCTAssertEqual(name10, "weights.ep10.json")
     }
+
+    func testBPTTTrainerWaveformBoundaryArraysCheck() {
+        let network = MLXSpikingAcousticNetwork(
+            numLayers: 1,
+            inputDim: 199,
+            maxHiddenDim: 32,
+            outputDim: 64,
+            timeSteps: 2,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
+        )
+        let vocoder = MLXNeuralVocoder(config: NeuralVocoderConfig(hiddenChannels: 32))
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            vocoder: vocoder,
+            waveformLossWeight: 0.15,
+            learningRate: 0.001
+        )
+
+        let fArr = MLXArray.zeros([1, 16, 199])
+        let tArr = MLXArray.zeros([1, 16, 64])
+        let mArr = MLXArray.ones([1, 16])
+        let targetWave = MLXArray.zeros([1, 5120])
+
+        // 4要素のみ渡された場合（targetWaveform はあるが segIndices がないケース）に
+        // arrays[4] 境界外クラッシュを起こさず安全に Mel 損失で完走することを検証
+        let loss = trainer.trainBatch(
+            features: fArr,
+            targets: tArr,
+            mask: mArr,
+            targetWaveform: targetWave,
+            segIndices: nil
+        )
+        XCTAssertTrue(loss.isFinite, "4要素 arrays 呼び出しで損失が有限値ではありません: \(loss)")
+        XCTAssertTrue(0.0 <= loss, "損失が 0 未満です: \(loss)")
+    }
+
+    // MARK: - 15. CfC 音響モデル MLX / Pure Swift 学習前数値一致度の検証
+
+    func testCfCMLXAndPureSwiftNumericalConsistency() {
+        let inputDim = 256
+        let hiddenDim = 256
+        let outputDim = 64
+        let numLayers = 4
+        let seqLen = 12
+
+        let weights = SpikingNetworkWeights.initCfCWeights(
+            inputDim: inputDim,
+            hiddenDim: hiddenDim,
+            outputDim: outputDim,
+            numLayers: numLayers,
+            seed: 2026
+        )
+
+        let mlxNet = MLXSpikingAcousticNetwork(weights: weights)
+        let swiftDecoder = SpikingAcousticDecoder(weights: weights)
+
+        // 入力系列の生成（決定論的擬似乱数）
+        var inputSeq: [[Float]] = []
+        var flatInput: [Float] = []
+        flatInput.reserveCapacity(seqLen * inputDim)
+
+        var rng: UInt64 = 987654321
+        var t = 0
+        while t < seqLen {
+            var frame: [Float] = []
+            frame.reserveCapacity(inputDim)
+            var c = 0
+            while c < inputDim {
+                rng ^= rng << 13
+                rng ^= rng >> 7
+                rng ^= rng << 17
+                let val = (Float(rng & 0x00FFFFFF) / Float(0x01000000) * 2.0 - 1.0) * 0.5
+                frame.append(val)
+                flatInput.append(val)
+                c += 1
+            }
+            inputSeq.append(frame)
+            t += 1
+        }
+
+        // MLX 順伝播
+        let mlxInput = MLXArray(flatInput, [1, seqLen, inputDim])
+        let mlxPred = mlxNet.forward(features: mlxInput, bpttWindow: 16)
+        eval(mlxPred)
+        let mlxMelFlat = mlxPred.asArray(Float.self)
+
+        // Pure Swift 順伝播
+        let workspace = AcousticWorkspace(maxHiddenDim: hiddenDim, outputDim: outputDim, numLayers: numLayers)
+        let swiftMelSeq = swiftDecoder.decodeSequence(featuresSeq: inputSeq, workspace: workspace)
+
+        XCTAssertEqual(swiftMelSeq.count, seqLen)
+
+        // 最大絶対誤差の計算
+        var maxDiff: Float = 0.0
+        t = 0
+        while t < seqLen {
+            var c = 0
+            while c < outputDim {
+                let mlxVal = mlxMelFlat[(t * outputDim) + c]
+                let swiftVal = swiftMelSeq[t][c]
+                let diff = abs(mlxVal - swiftVal)
+                if maxDiff < diff {
+                    maxDiff = diff
+                }
+                c += 1
+            }
+            t += 1
+        }
+
+        print("[CfC Consistency Test] Maximum Mel absolute diff between MLX and Pure Swift: \(maxDiff)")
+        XCTAssertTrue(maxDiff < 1.0e-4, "学習前の MLX と Pure Swift のメル最大絶対差が 1e-4 以上です: \(maxDiff)")
+    }
+
+    // MARK: - 16. CfC 音響モデルの構造・形状（4層、幅256、出力64）の検証
+
+    func testCfCNetworkShape() {
+        let inputDim = 256
+        let hiddenDim = 256
+        let outputDim = 64
+        let numLayers = 4
+
+        let weights = SpikingNetworkWeights.initCfCWeights(
+            inputDim: inputDim,
+            hiddenDim: hiddenDim,
+            outputDim: outputDim,
+            numLayers: numLayers,
+            seed: 2026
+        )
+
+        XCTAssertTrue(weights.isCfC, "isCfC が true に設定されていません")
+        XCTAssertEqual(weights.inputDim, inputDim)
+        XCTAssertEqual(weights.maxHiddenDim, hiddenDim)
+        XCTAssertEqual(weights.outputDim, outputDim)
+        XCTAssertEqual(weights.numLayers, numLayers)
+
+        guard let wfList = weights.cfcWf,
+              let bfList = weights.cfcBf,
+              let wgList = weights.cfcWg,
+              let bgList = weights.cfcBg else {
+            XCTFail("CfC 重み配列が nil です")
+            return
+        }
+
+        XCTAssertEqual(wfList.count, numLayers)
+        XCTAssertEqual(bfList.count, numLayers)
+        XCTAssertEqual(wgList.count, numLayers)
+        XCTAssertEqual(bgList.count, numLayers)
+
+        let xhDim = inputDim + hiddenDim
+        var l = 0
+        while l < numLayers {
+            XCTAssertEqual(wfList[l].count, hiddenDim * xhDim, "層 \(l) の W_f 要素数が一致しません")
+            XCTAssertEqual(wgList[l].count, hiddenDim * xhDim, "層 \(l) の W_g 要素数が一致しません")
+            XCTAssertEqual(bfList[l].count, hiddenDim, "層 \(l) の b_f 要素数が一致しません")
+            XCTAssertEqual(bgList[l].count, hiddenDim, "層 \(l) の b_g 要素数が一致しません")
+            l += 1
+        }
+
+        XCTAssertEqual(weights.wOut.count, outputDim * hiddenDim)
+        XCTAssertEqual(weights.bOut.count, outputDim)
+
+        let mlxNet = MLXSpikingAcousticNetwork(weights: weights)
+        XCTAssertTrue(mlxNet.isCfC)
+        XCTAssertEqual(mlxNet.cfcWf.count, numLayers)
+        XCTAssertEqual(mlxNet.cfcBf.count, numLayers)
+        XCTAssertEqual(mlxNet.cfcWg.count, numLayers)
+        XCTAssertEqual(mlxNet.cfcBg.count, numLayers)
+
+        l = 0
+        while l < numLayers {
+            XCTAssertEqual(mlxNet.cfcWf[l].shape, [xhDim, hiddenDim])
+            XCTAssertEqual(mlxNet.cfcBf[l].shape, [hiddenDim])
+            XCTAssertEqual(mlxNet.cfcWg[l].shape, [xhDim, hiddenDim])
+            XCTAssertEqual(mlxNet.cfcBg[l].shape, [hiddenDim])
+            l += 1
+        }
+        XCTAssertEqual(mlxNet.wOut.shape, [hiddenDim, outputDim])
+        XCTAssertEqual(mlxNet.bOut.shape, [outputDim])
+
+        // 順伝播の入出力形状検証
+        let dummyIn = MLXArray.zeros([1, 10, inputDim])
+        let dummyOut = mlxNet.forward(features: dummyIn)
+        XCTAssertEqual(dummyOut.shape, [1, 10, outputDim])
+
+        // 系列長 0 のエッジケース
+        let emptyIn = MLXArray.zeros([1, 0, inputDim])
+        let emptyOut = mlxNet.forward(features: emptyIn)
+        XCTAssertEqual(emptyOut.shape, [1, 0, outputDim])
+
+        // Pure Swift 側での系列長 0 および任意サイズエッジケース
+        let workspace = AcousticWorkspace(maxHiddenDim: hiddenDim, outputDim: outputDim, numLayers: numLayers)
+        let decoder = SpikingAcousticDecoder(weights: weights)
+        let swiftEmpty = decoder.decodeSequence(featuresSeq: [], workspace: workspace)
+        XCTAssertTrue(swiftEmpty.isEmpty)
+
+        // 非8の倍数次元での SIMD テールループ境界安全性の検証
+        let oddWeights = SpikingNetworkWeights.initCfCWeights(
+            inputDim: 30,
+            hiddenDim: 30,
+            outputDim: 10,
+            numLayers: 2,
+            seed: 123
+        )
+        let oddDecoder = SpikingAcousticDecoder(weights: oddWeights)
+        let oddWorkspace = AcousticWorkspace(maxHiddenDim: 30, outputDim: 10, numLayers: 2)
+        let oddSeq = [[Float](repeating: 0.1, count: 30), [Float](repeating: 0.2, count: 30)]
+        let oddOut = oddDecoder.decodeSequence(featuresSeq: oddSeq, workspace: oddWorkspace)
+        XCTAssertEqual(oddOut.count, 2)
+        XCTAssertEqual(oddOut[0].count, 10)
+    }
 }
+
 

@@ -90,7 +90,7 @@ extension SpikeSpeechEngine {
         pitchTracker: PitchTracker,
         alignment: UtteranceAlignment? = nil,
         useScaledDuration: Bool = true
-    ) -> (features: [[Float]], targets: [[Float]])? {
+    ) -> (features: [[Float]], targets: [[Float]], targetAudio: [Float])? {
         if pcm16k.isEmpty {
             return nil
         }
@@ -361,7 +361,124 @@ extension SpikeSpeechEngine {
             trf += 1
         }
 
-        return (features: features, targets: alignedMel)
+        // 3. 教師波形を教師 Mel と同じ音素境界の上へ載せる（設計書 3 項）
+        let hopSize = AudioConfig.hopSize
+        let totalSamples = totalFrames * hopSize
+        var alignedWaveform = [Float](repeating: 0.0, count: totalSamples)
+
+        func placeSegment(
+            srcStartSample: Int,
+            srcSampleCount: Int,
+            dstStartSample: Int,
+            dstSampleCount: Int
+        ) {
+            if dstSampleCount <= 0 {
+                return
+            }
+            if srcSampleCount <= 0 || pcm16k.isEmpty {
+                return
+            }
+            switch (dstSampleCount == srcSampleCount, srcSampleCount <= 1, dstSampleCount <= 1) {
+            case (true, _, _):
+                var i = 0
+                while i < dstSampleCount {
+                    let dIdx = dstStartSample + i
+                    if alignedWaveform.count <= dIdx {
+                        break
+                    }
+                    let sIdx = min(pcm16k.count - 1, max(0, srcStartSample + i))
+                    alignedWaveform[dIdx] = pcm16k[sIdx]
+                    i += 1
+                }
+            case (_, true, _):
+                let sIdx = min(pcm16k.count - 1, max(0, srcStartSample))
+                let val = pcm16k[sIdx]
+                var i = 0
+                while i < dstSampleCount {
+                    let dIdx = dstStartSample + i
+                    if alignedWaveform.count <= dIdx {
+                        break
+                    }
+                    alignedWaveform[dIdx] = val
+                    i += 1
+                }
+            case (_, _, true):
+                if dstStartSample < alignedWaveform.count {
+                    let sIdx = min(pcm16k.count - 1, max(0, srcStartSample + (srcSampleCount / 2)))
+                    alignedWaveform[dstStartSample] = pcm16k[sIdx]
+                }
+            case (false, false, false):
+                let maxDst = Float(dstSampleCount - 1)
+                let maxSrc = Float(srcSampleCount - 1)
+                var d = 0
+                while d < dstSampleCount {
+                    let dIdx = dstStartSample + d
+                    if alignedWaveform.count <= dIdx {
+                        break
+                    }
+                    let pos = (Float(d) / maxDst) * maxSrc
+                    var s0 = Int(pos)
+                    if srcSampleCount <= s0 {
+                        s0 = srcSampleCount - 1
+                    }
+                    if s0 < 0 {
+                        s0 = 0
+                    }
+                    var s1 = s0 + 1
+                    if srcSampleCount <= s1 {
+                        s1 = srcSampleCount - 1
+                    }
+                    let alpha = pos - Float(s0)
+                    let idx0 = min(pcm16k.count - 1, max(0, srcStartSample + s0))
+                    let idx1 = min(pcm16k.count - 1, max(0, srcStartSample + s1))
+                    alignedWaveform[dIdx] = (1.0 - alpha) * pcm16k[idx0] + alpha * pcm16k[idx1]
+                    d += 1
+                }
+            }
+        }
+
+        // 先頭無音区間の波形配置
+        let leadDstSamples = leadSil * hopSize
+        let leadSrcSamples = effectiveLeadSilence * hopSize
+        placeSegment(
+            srcStartSample: 0,
+            srcSampleCount: leadSrcSamples,
+            dstStartSample: 0,
+            dstSampleCount: leadDstSamples
+        )
+
+        // 発話本体区間の音素境界単位の波形配置
+        var curSrcSampleOffset = effectiveLeadSilence * hopSize
+        var curDstSampleOffset = leadSil * hopSize
+        var wPhIdx = 0
+        while wPhIdx < bodyPhoneCount {
+            let sDur = srcDurs[wPhIdx]
+            let dDur = Int(linguisticFeatures.durations[1 + wPhIdx])
+            let sSamples = sDur * hopSize
+            let dSamples = dDur * hopSize
+            placeSegment(
+                srcStartSample: curSrcSampleOffset,
+                srcSampleCount: sSamples,
+                dstStartSample: curDstSampleOffset,
+                dstSampleCount: dSamples
+            )
+            curSrcSampleOffset += sSamples
+            curDstSampleOffset += dSamples
+            wPhIdx += 1
+        }
+
+        // 末尾無音区間の波形配置
+        let trailDstSamples = trailSil * hopSize
+        let maxAvailableTrailSamples = max(0, pcm16k.count - curSrcSampleOffset)
+        let trailSrcSamples = min(maxAvailableTrailSamples, effectiveTrailSilence * hopSize)
+        placeSegment(
+            srcStartSample: curSrcSampleOffset,
+            srcSampleCount: trailSrcSamples,
+            dstStartSample: curDstSampleOffset,
+            dstSampleCount: trailDstSamples
+        )
+
+        return (features: features, targets: alignedMel, targetAudio: alignedWaveform)
     }
 
     /// テキストと実音声波形から韻律予測器（Duration & F0）学習用サンプルを抽出する

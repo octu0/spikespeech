@@ -39,6 +39,12 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// リードアウト出力バイアス
     public let bOut: [Float]
 
+    /// CfC 層パラメータ（各層 [maxHiddenDim * (inputDim + maxHiddenDim)]）
+    public let cfcWf: [[Float]]?
+    public let cfcBf: [[Float]]?
+    public let cfcWg: [[Float]]?
+    public let cfcBg: [[Float]]?
+
     /// 学習・獲得された語彙知識（単語表記、読み、品詞、アクセント核、コスト）
     /// なぜ重みとともに記録するか:
     /// ソースコード内に辞書データをハードコードすることを排し、教師データから学習した
@@ -65,7 +71,25 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     /// 総層数
     public var numLayers: Int {
+        switch cfcWf {
+        case .some(let wf):
+            if wf.isEmpty != true {
+                return wf.count
+            }
+        case .none:
+            break
+        }
         return 1 + wLayers.count
+    }
+
+    /// CfC モデルであるかどうかのフラグ
+    public var isCfC: Bool {
+        switch cfcWf {
+        case .some(let wf):
+            return wf.isEmpty != true
+        case .none:
+            return false
+        }
     }
 
     public init(
@@ -86,7 +110,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         lexicon: [LexiconEntry] = [],
         prosodyWeights: ProsodyWeights? = nil,
         phonemeAverageDurations: [Int32: Float]? = nil,
-        meanFramesPerMora: Float? = nil
+        meanFramesPerMora: Float? = nil,
+        cfcWf: [[Float]]? = nil,
+        cfcBf: [[Float]]? = nil,
+        cfcWg: [[Float]]? = nil,
+        cfcBg: [[Float]]? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -106,12 +134,17 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.prosodyWeights = prosodyWeights
         self.phonemeAverageDurations = phonemeAverageDurations
         self.meanFramesPerMora = meanFramesPerMora
+        self.cfcWf = cfcWf
+        self.cfcBf = cfcBf
+        self.cfcWg = cfcWg
+        self.cfcBg = cfcBg
     }
 
     private enum CodingKeys: String, CodingKey {
         case inputDim, maxHiddenDim, outputDim, timeSteps, lifConfig
         case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wConv, wOut, bOut
         case lexicon, prosodyWeights, phonemeAverageDurations, meanFramesPerMora
+        case cfcWf, cfcBf, cfcWg, cfcBg
     }
 
     public init(from decoder: Decoder) throws {
@@ -203,6 +236,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             self.phonemeAverageDurations = nil
         }
         self.meanFramesPerMora = try container.decodeIfPresent(Float.self, forKey: .meanFramesPerMora)
+        self.cfcWf = try container.decodeIfPresent([[Float]].self, forKey: .cfcWf)
+        self.cfcBf = try container.decodeIfPresent([[Float]].self, forKey: .cfcBf)
+        self.cfcWg = try container.decodeIfPresent([[Float]].self, forKey: .cfcWg)
+        self.cfcBg = try container.decodeIfPresent([[Float]].self, forKey: .cfcBg)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -231,6 +268,10 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             try container.encode(dict, forKey: .phonemeAverageDurations)
         }
         try container.encodeIfPresent(meanFramesPerMora, forKey: .meanFramesPerMora)
+        try container.encodeIfPresent(cfcWf, forKey: .cfcWf)
+        try container.encodeIfPresent(cfcBf, forKey: .cfcBf)
+        try container.encodeIfPresent(cfcWg, forKey: .cfcWg)
+        try container.encodeIfPresent(cfcBg, forKey: .cfcBg)
     }
 
     /// 語彙知識を付与した新しい重みインスタンスを生成する
@@ -255,7 +296,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: newLexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
@@ -279,7 +324,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: newProsodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
@@ -305,7 +354,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: newTable,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
@@ -331,7 +384,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: newRate
+            meanFramesPerMora: newRate,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
@@ -357,7 +414,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
@@ -407,14 +468,15 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
         )
     }
 
     /// phonePos (ch 196) 列重みを指定スケール倍し、パルス (ch 199) 列重みを 0 にクリアした重みインスタンスを生成する。
-    /// なぜこの変換を行うか:
-    /// 1. phonePos の注入電流（振幅 3.0 × wIn L2）を母音 one-hot 電流と揃え、音素進行に伴うフォルマントの時間移動を膜電位に駆動させるため。
-    /// 2. ch 199 からのクリック電流を遮断し、layer0.reset() の純粋な状態リセットゲートとしてのみ機能させるため。
     public func withPhonePosScaledAndPulseZeroed(scale196: Float) -> SpikingNetworkWeights {
         var newWIn = self.wIn
         var h = 0
@@ -447,7 +509,218 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             lexicon: self.lexicon,
             prosodyWeights: self.prosodyWeights,
             phonemeAverageDurations: self.phonemeAverageDurations,
-            meanFramesPerMora: self.meanFramesPerMora
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
+        )
+    }
+
+    /// wIn 重みを更新した新しい重みインスタンスを生成する
+    public func withWIn(_ newWIn: [Float]) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: newWIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg
+        )
+    }
+
+    /// CfC パラメータを更新した新しい重みインスタンスを生成する
+    public func withCfCParameters(
+        cfcWf: [[Float]],
+        cfcBf: [[Float]],
+        cfcWg: [[Float]],
+        cfcBg: [[Float]],
+        wOut: [Float]? = nil,
+        bOut: [Float]? = nil
+    ) -> SpikingNetworkWeights {
+        let effectiveWOut: [Float]
+        switch wOut {
+        case .some(let w):
+            effectiveWOut = w
+        case .none:
+            effectiveWOut = self.wOut
+        }
+        let effectiveBOut: [Float]
+        switch bOut {
+        case .some(let b):
+            effectiveBOut = b
+        case .none:
+            effectiveBOut = self.bOut
+        }
+
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: effectiveWOut,
+            bOut: effectiveBOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: cfcWf,
+            cfcBf: cfcBf,
+            cfcWg: cfcWg,
+            cfcBg: cfcBg
+        )
+    }
+
+    /// 閉形式連続時間層（CfC）重みを新規に決定論的初期化する
+    public static func initCfCWeights(
+        inputDim: Int = 256,
+        hiddenDim: Int = 256,
+        outputDim: Int = 64,
+        numLayers: Int = 4,
+        seed: UInt64 = 42,
+        wIn: [Float]? = nil,
+        lexicon: [LexiconEntry] = [],
+        prosodyWeights: ProsodyWeights? = nil,
+        phonemeAverageDurations: [Int32: Float]? = nil,
+        meanFramesPerMora: Float? = 16.0,
+        bOutInit: [Float]? = nil
+    ) -> SpikingNetworkWeights {
+        var rngState = seed
+        let xhDim = inputDim + hiddenDim
+        let scaleXh = sqrt(6.0 / Float(xhDim + hiddenDim))
+        let scaleOut = sqrt(6.0 / Float(hiddenDim + outputDim))
+
+        func nextUniform(scale: Float) -> Float {
+            rngState ^= rngState << 13
+            rngState ^= rngState >> 7
+            rngState ^= rngState << 17
+            let u01 = Float(rngState & 0x00FFFFFF) / Float(0x01000000)
+            return (u01 * 2.0 - 1.0) * scale
+        }
+
+        var generatedWIn: [Float]
+        switch wIn {
+        case .some(let providedWIn) where providedWIn.count == hiddenDim * inputDim:
+            generatedWIn = providedWIn
+        default:
+            generatedWIn = [Float](repeating: 0.0, count: hiddenDim * inputDim)
+            let scaleIn = sqrt(2.0 / Float(inputDim))
+            var k = 0
+            while k < generatedWIn.count {
+                generatedWIn[k] = nextUniform(scale: scaleIn)
+                k += 1
+            }
+            if 196 < inputDim {
+                var p196SumSq: Float = 0.0
+                var h = 0
+                while h < hiddenDim {
+                    let val = generatedWIn[(h * inputDim) + 196]
+                    p196SumSq += val * val
+                    h += 1
+                }
+                let currentNorm = sqrtf(p196SumSq)
+                if currentNorm < 1.0 {
+                    let mult: Float = 1.0 / max(1e-6, currentNorm)
+                    h = 0
+                    while h < hiddenDim {
+                        generatedWIn[(h * inputDim) + 196] *= mult
+                        h += 1
+                    }
+                }
+            }
+            if AudioConfig.pulseChannel < inputDim {
+                var h = 0
+                while h < hiddenDim {
+                    generatedWIn[(h * inputDim) + AudioConfig.pulseChannel] = 0.0
+                    h += 1
+                }
+            }
+        }
+
+        var wF: [[Float]] = []
+        var bF: [[Float]] = []
+        var wG: [[Float]] = []
+        var bG: [[Float]] = []
+
+        var l = 0
+        while l < numLayers {
+            var layerWf = [Float](repeating: 0.0, count: hiddenDim * xhDim)
+            var layerWg = [Float](repeating: 0.0, count: hiddenDim * xhDim)
+            var i = 0
+            while i < layerWf.count {
+                layerWf[i] = nextUniform(scale: scaleXh)
+                layerWg[i] = nextUniform(scale: scaleXh)
+                i += 1
+            }
+            wF.append(layerWf)
+            bF.append([Float](repeating: 0.0, count: hiddenDim))
+            wG.append(layerWg)
+            bG.append([Float](repeating: 0.0, count: hiddenDim))
+            l += 1
+        }
+
+        var wOut = [Float](repeating: 0.0, count: outputDim * hiddenDim)
+        var i = 0
+        while i < wOut.count {
+            wOut[i] = nextUniform(scale: scaleOut)
+            i += 1
+        }
+
+        let bOut: [Float]
+        switch bOutInit {
+        case .some(let initB):
+            bOut = initB
+        case .none:
+            bOut = [Float](repeating: 0.0, count: outputDim)
+        }
+
+        return SpikingNetworkWeights(
+            inputDim: inputDim,
+            maxHiddenDim: hiddenDim,
+            outputDim: outputDim,
+            timeSteps: 1,
+            lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.1),
+            wIn: generatedWIn,
+            wRec: [Float](repeating: 0.0, count: hiddenDim * hiddenDim),
+            bH: [Float](repeating: 0.0, count: hiddenDim),
+            wLayers: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim * hiddenDim), count: max(0, numLayers - 1)),
+            bHLayers: [[Float]](repeating: [Float](repeating: 0.0, count: hiddenDim), count: max(0, numLayers - 1)),
+            gammaRMS: [[Float]](repeating: [Float](repeating: 1.0, count: hiddenDim), count: max(0, numLayers - 1)),
+            wConv: [],
+            wOut: wOut,
+            bOut: bOut,
+            lexicon: lexicon,
+            prosodyWeights: prosodyWeights,
+            phonemeAverageDurations: phonemeAverageDurations,
+            meanFramesPerMora: meanFramesPerMora,
+            cfcWf: wF,
+            cfcBf: bF,
+            cfcWg: wG,
+            cfcBg: bG
         )
     }
 

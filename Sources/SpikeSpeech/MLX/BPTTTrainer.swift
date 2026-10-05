@@ -43,6 +43,22 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     /// リードアウトバイアス
     public var bOut: MLXArray
 
+    /// CfC 層パラメータ
+    public var cfcWf: [MLXArray]
+    public var cfcBf: [MLXArray]
+    public var cfcWg: [MLXArray]
+    public var cfcBg: [MLXArray]
+    public var isCfC: Bool
+
+    /// 韻律モデル重み（F0・継続時間）
+    public var prosodyWeights: ProsodyWeights?
+
+    /// 音素平均フレーム数テーブル
+    public var phonemeAverageDurations: [Int32: Float]?
+
+    /// 1モーラあたりの平均フレーム数
+    public var meanFramesPerMora: Float?
+
     /// 学習・獲得された語彙知識（単語表記、読み、品詞、アクセント核、コスト）
     /// なぜネットワーク内で保持するか:
     /// BPTT 学習時および重みエクスポート時に、獲得された語彙知識が消失・初期化されることを防ぐため。
@@ -65,6 +81,14 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         self.timeSteps = timeSteps
         self.lifConfig = lifConfig
         self.lexicon = lexicon
+        self.prosodyWeights = nil
+        self.phonemeAverageDurations = nil
+        self.meanFramesPerMora = nil
+        self.cfcWf = []
+        self.cfcBf = []
+        self.cfcWg = []
+        self.cfcBg = []
+        self.isCfC = false
 
         let scaleIn = sqrt(2.0 / Float(inputDim))
         let scaleRec = 0.1 / sqrt(Float(maxHiddenDim))
@@ -130,6 +154,57 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
     /// 行優先配列から MLX の行優先形状に適合させるため転置を適用する。
     public func importWeights(from weights: SpikingNetworkWeights) {
         self.lexicon = weights.lexicon
+        self.prosodyWeights = weights.prosodyWeights
+        self.phonemeAverageDurations = weights.phonemeAverageDurations
+        self.meanFramesPerMora = weights.meanFramesPerMora
+        self.isCfC = weights.isCfC
+        if weights.isCfC {
+            let hSize = weights.maxHiddenDim
+            if weights.wIn.count == hSize * weights.inputDim {
+                self.wIn = MLXArray(weights.wIn, [hSize, weights.inputDim]).transposed()
+            }
+            self.wOut = MLXArray(weights.wOut, [weights.outputDim, hSize]).transposed()
+            self.bOut = MLXArray(weights.bOut, [weights.outputDim])
+
+            var wfList: [MLXArray] = []
+            var bfList: [MLXArray] = []
+            var wgList: [MLXArray] = []
+            var bgList: [MLXArray] = []
+            var arraysToEval: [MLXArray] = [self.wIn, self.wOut, self.bOut]
+
+            if let wfArr = weights.cfcWf,
+               let bfArr = weights.cfcBf,
+               let wgArr = weights.cfcWg,
+               let bgArr = weights.cfcBg {
+                let numL = min(wfArr.count, bfArr.count, wgArr.count, bgArr.count)
+                var l = 0
+                while l < numL {
+                    let inDim = wfArr[l].count / max(1, hSize)
+                    let wf = MLXArray(wfArr[l], [hSize, inDim]).transposed()
+                    let bf = MLXArray(bfArr[l], [hSize])
+                    let wg = MLXArray(wgArr[l], [hSize, inDim]).transposed()
+                    let bg = MLXArray(bgArr[l], [hSize])
+
+                    wfList.append(wf)
+                    bfList.append(bf)
+                    wgList.append(wg)
+                    bgList.append(bg)
+
+                    arraysToEval.append(wf)
+                    arraysToEval.append(bf)
+                    arraysToEval.append(wg)
+                    arraysToEval.append(bg)
+                    l += 1
+                }
+            }
+            self.cfcWf = wfList
+            self.cfcBf = bfList
+            self.cfcWg = wgList
+            self.cfcBg = bgList
+            eval(arraysToEval)
+            return
+        }
+
         let hSize = weights.maxHiddenDim
         self.wIn = MLXArray(weights.wIn, [hSize, weights.inputDim]).transposed()
         self.wRec = MLXArray(weights.wRec, [hSize, hSize]).transposed()
@@ -177,6 +252,66 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
 
     /// 学習済みパラメータを純粋推論用の多層重み構造体へエクスポートする
     public func exportWeights() -> SpikingNetworkWeights {
+        if isCfC {
+            var arraysToEval: [MLXArray] = [self.wIn, self.wOut, self.bOut]
+            var l = 0
+            while l < cfcWf.count {
+                arraysToEval.append(cfcWf[l])
+                arraysToEval.append(cfcBf[l])
+                arraysToEval.append(cfcWg[l])
+                arraysToEval.append(cfcBg[l])
+                l += 1
+            }
+            eval(arraysToEval)
+
+            var exportedWf: [[Float]] = []
+            var exportedBf: [[Float]] = []
+            var exportedWg: [[Float]] = []
+            var exportedBg: [[Float]] = []
+            l = 0
+            while l < cfcWf.count {
+                exportedWf.append(cfcWf[l].transposed().asArray(Float.self))
+                exportedBf.append(cfcBf[l].asArray(Float.self))
+                exportedWg.append(cfcWg[l].transposed().asArray(Float.self))
+                exportedBg.append(cfcBg[l].asArray(Float.self))
+                l += 1
+            }
+
+            var exportedWIn = self.wIn.transposed().asArray(Float.self)
+            if AudioConfig.pulseChannel < inputDim {
+                var h = 0
+                while h < maxHiddenDim {
+                    exportedWIn[(h * inputDim) + AudioConfig.pulseChannel] = 0.0
+                    h += 1
+                }
+            }
+
+            return SpikingNetworkWeights(
+                inputDim: inputDim,
+                maxHiddenDim: maxHiddenDim,
+                outputDim: outputDim,
+                timeSteps: 1,
+                lifConfig: lifConfig,
+                wIn: exportedWIn,
+                wRec: [Float](repeating: 0.0, count: maxHiddenDim * maxHiddenDim),
+                bH: [Float](repeating: 0.0, count: maxHiddenDim),
+                wLayers: [],
+                bHLayers: [],
+                gammaRMS: [],
+                wConv: [],
+                wOut: self.wOut.transposed().asArray(Float.self),
+                bOut: self.bOut.asArray(Float.self),
+                lexicon: self.lexicon,
+                prosodyWeights: self.prosodyWeights,
+                phonemeAverageDurations: self.phonemeAverageDurations,
+                meanFramesPerMora: self.meanFramesPerMora,
+                cfcWf: exportedWf,
+                cfcBf: exportedBf,
+                cfcWg: exportedWg,
+                cfcBg: exportedBg
+            )
+        }
+
         var arraysToEval: [MLXArray] = [self.wIn, self.wRec, self.bH, self.wOut, self.bOut]
         var l = 0
         while l < wLayers.count {
@@ -225,17 +360,68 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
             wConv: wc,
             wOut: self.wOut.transposed().asArray(Float.self),
             bOut: self.bOut.asArray(Float.self),
-            lexicon: self.lexicon
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora
         )
     }
 
-    /// 音響系列の多層 SNN 順伝播計算を実行する。
-    /// 層0 の再帰結合と上位ブロックのフレーム間時間畳み込み（1D Depthwise Conv）および RMSNorm 残差加算により、
-    /// Mel スペクトログラムの横縞・平坦倍音化を根本から排し、滑らかなフォルマント軌跡を形成する。
+    /// 閉形式連続時間層（CfC）順伝播計算を実行する。
+    /// 幅 256、4層。
+    /// f = W_f [x, h] + b_f
+    /// g = tanh(W_g [x, h] + b_g)
+    /// decay = sigmoid(f)
+    /// h = decay * h + (1 - decay) * g
+    public func forwardCfC(features: MLXArray) -> MLXArray {
+        let batchSize = features.shape[0]
+        let seqLen = features.shape[1]
+        if seqLen <= 0 {
+            return MLXArray.zeros([batchSize, 0, outputDim])
+        }
+        let numL = cfcWf.count
+
+        var currentInput = features
+        var l = 0
+        while l < numL {
+            let wf = cfcWf[l]
+            let bf = cfcBf[l]
+            let wg = cfcWg[l]
+            let bg = cfcBg[l]
+            let hDim = wf.shape[1]
+
+            var h = MLXArray.zeros([batchSize, hDim])
+            var hSeq: [MLXArray] = []
+            hSeq.reserveCapacity(seqLen)
+
+            var t = 0
+            while t < seqLen {
+                let xt = currentInput[0..., t, 0...]
+                let xh = concatenated([xt, h], axis: -1)
+                let f = matmul(xh, wf) + bf
+                let zg = matmul(xh, wg) + bg
+                let g = tanh(zg)
+                let decay = MLX.sigmoid(f)
+                h = (decay * h) + ((1.0 - decay) * g)
+                hSeq.append(h)
+                t += 1
+            }
+
+            currentInput = stacked(hSeq, axis: 1)
+            l += 1
+        }
+
+        return matmul(currentInput, self.wOut) + self.bOut
+    }
+
+    /// 音響系列の多層 SNN / CfC 順伝播計算を実行する。
     public func forward(
         features: MLXArray,
         bpttWindow: Int = 16
     ) -> MLXArray {
+        if isCfC {
+            return forwardCfC(features: features)
+        }
         let batchSize = features.shape[0]
         let seqLen = features.shape[1]
         let hSize = maxHiddenDim
@@ -406,15 +592,27 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     public let network: MLXSpikingAcousticNetwork
     public let optimizer: AdamW
     public let bpttWindow: Int
+    public let vocoder: MLXNeuralVocoder?
+    public let waveformLossWeight: Float
+    public let usePreTanh: Bool
+    public var lastLosses: (totalLoss: Float, melL1: Float, waveTerm: Float) = (0.0, 0.0, 0.0)
     private let lossAndGrad: (MLXSpikingAcousticNetwork, [MLXArray]) -> ([MLXArray], ModuleParameters)
 
     public init(
         network: MLXSpikingAcousticNetwork,
+        vocoder: MLXNeuralVocoder? = nil,
+        waveformLossWeight: Float = 0.0,
+        usePreTanh: Bool = false,
         learningRate: Float = 0.003,
         bpttWindow: Int = 16,
         weightDecay: Float = 1.0e-4
     ) {
         self.network = network
+        self.vocoder = vocoder
+        self.waveformLossWeight = waveformLossWeight
+        self.usePreTanh = usePreTanh
+        vocoder?.freeze()
+
         // なぜ AdamW を採用し weightDecay 1e-4 を指定するか:
         // オンライン学習における再帰重み・出力重みの過大成長と膜電位クランプ飽和を防ぎ、
         // コサイン減衰スケジューラと整合する正則化を decoupled に効かせるため。
@@ -456,8 +654,65 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                 target: tArr,
                 mask: mArr
             )
-            let totalLoss = l1Loss + (deltaLoss * 0.5)
-            return [totalLoss]
+            var totalLoss = l1Loss + (deltaLoss * 0.5)
+            var waveTerm = MLXArray(0.0)
+
+            if let voc = vocoder, 0.0 < waveformLossWeight, 4 <= arrays.count, 195 <= fArr.dim(-1) {
+                let targetWave = arrays[3]
+                let segFrames = 32
+                let hopSize = AudioConfig.hopSize
+                let segSamples = segFrames * hopSize
+                if 5 <= arrays.count {
+                    let segIdx = arrays[4]
+                    let predSegment = pred[0..., segIdx, 0...]
+                    let f0Segment = fArr[0..., segIdx, 194..<195]
+                    let voicedSegment = fArr[0..., segIdx, 192..<193]
+                    let vocInput = concatenated([predSegment, f0Segment, voicedSegment], axis: -1)
+                    let predWave: MLXArray
+                    switch usePreTanh {
+                    case true:
+                        predWave = voc.forwardPreTanh(vocInput)
+                    case false:
+                        predWave = voc(vocInput)
+                    }
+                    let waveLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: predWave, target: targetWave)
+                    waveTerm = MLXArray(waveformLossWeight) * waveLoss
+                    totalLoss = totalLoss + waveTerm
+                } else {
+                    let totalSamples = targetWave.dim(-1)
+                    let numSegs = totalSamples / segSamples
+                    if 0 < numSegs {
+                        var waveLossSum = MLXArray(0.0)
+                        var k = 0
+                        while k < numSegs {
+                            let segStart = k * segFrames
+                            let segEnd = segStart + segFrames
+                            let predSegment = pred[0..., segStart..<segEnd, 0...]
+                            let f0Segment = fArr[0..., segStart..<segEnd, 194..<195]
+                            let voicedSegment = fArr[0..., segStart..<segEnd, 192..<193]
+                            let vocInput = concatenated([predSegment, f0Segment, voicedSegment], axis: -1)
+                            let predWave: MLXArray
+                            switch usePreTanh {
+                            case true:
+                                predWave = voc.forwardPreTanh(vocInput)
+                            case false:
+                                predWave = voc(vocInput)
+                            }
+                            let sampleStart = k * segSamples
+                            let sampleEnd = sampleStart + segSamples
+                            let targetWaveSeg = targetWave[0..., sampleStart..<sampleEnd]
+                            let waveLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: predWave, target: targetWaveSeg)
+                            waveLossSum = waveLossSum + waveLoss
+                            k += 1
+                        }
+                        let avgWaveLoss = waveLossSum / Float(numSegs)
+                        waveTerm = MLXArray(waveformLossWeight) * avgWaveLoss
+                        totalLoss = totalLoss + waveTerm
+                    }
+                }
+            }
+
+            return [totalLoss, l1Loss, waveTerm]
         }
     }
 
@@ -478,6 +733,18 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
 
     /// 各重み行列のフロベニウスノルムを算出し、学習中の重み肥大化・発散を診断する。
     public func weightNorms() -> (wIn: Float, wRec: Float, wOut: Float, wLayer0: Float) {
+        if network.isCfC {
+            eval(network.wOut)
+            let nOut = sqrt(sum(network.wOut * network.wOut).item(Float.self))
+            var nWf0: Float = 0.0
+            var nWg0: Float = 0.0
+            if 0 < network.cfcWf.count {
+                eval(network.cfcWf[0], network.cfcWg[0])
+                nWf0 = sqrt(sum(network.cfcWf[0] * network.cfcWf[0]).item(Float.self))
+                nWg0 = sqrt(sum(network.cfcWg[0] * network.cfcWg[0]).item(Float.self))
+            }
+            return (wIn: nWf0, wRec: nWg0, wOut: nOut, wLayer0: 0.0)
+        }
         eval(network.wIn, network.wRec, network.wOut)
         let nIn = sqrt(sum(network.wIn * network.wIn).item(Float.self))
         let nRec = sqrt(sum(network.wRec * network.wRec).item(Float.self))
@@ -509,29 +776,51 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     public func trainBatch(
         features: MLXArray,
         targets: MLXArray,
-        mask: MLXArray? = nil
+        mask: MLXArray? = nil,
+        targetWaveform: MLXArray? = nil,
+        segIndices: MLXArray? = nil
     ) -> Float {
-        let maskArray = mask ?? MLXArray.ones([features.shape[0], features.shape[1]])
-        let (lossVals, grads) = self.lossAndGrad(network, [features, targets, maskArray])
-        let lossVal = lossVals[0]
-        var safeGrads = grads
-        if let recG = safeGrads[unwrapping: "wRec"] {
-            let recNorm = sqrt(sum(recG * recG))
-            let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (recNorm + 1e-6))
-            safeGrads[unwrapping: "wRec"] = recG * scale
+        let maskArray: MLXArray
+        switch mask {
+        case .some(let m):
+            maskArray = m
+        case .none:
+            maskArray = MLXArray.ones([features.shape[0], features.shape[1]])
         }
-        if let inG = safeGrads[unwrapping: "wIn"] {
-            let inNorm = sqrt(sum(inG * inG))
-            let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (inNorm + 1e-6))
-            safeGrads[unwrapping: "wIn"] = inG * scale
+        var inArrays = [features, targets, maskArray]
+        if let tw = targetWaveform {
+            inArrays.append(tw)
+            if let si = segIndices {
+                inArrays.append(si)
+            }
+        }
+        let (lossVals, grads) = self.lossAndGrad(network, inArrays)
+        let lossVal = lossVals[0]
+        let l1Val = lossVals[1]
+        let waveVal = lossVals[2]
+        var safeGrads = grads
+        if network.isCfC != true {
+            if let recG = safeGrads[unwrapping: "wRec"] {
+                let recNorm = sqrt(sum(recG * recG))
+                let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (recNorm + 1e-6))
+                safeGrads[unwrapping: "wRec"] = recG * scale
+            }
+            if let inG = safeGrads[unwrapping: "wIn"] {
+                let inNorm = sqrt(sum(inG * inG))
+                let scale = minimum(MLXArray(1.0), MLXArray(2.0) / (inNorm + 1e-6))
+                safeGrads[unwrapping: "wIn"] = inG * scale
+            }
         }
         let (clippedGrads, _) = clipGradNorm(gradients: safeGrads, maxNorm: 5.0)
 
         optimizer.update(model: network, gradients: clippedGrads)
-        eval(network, optimizer, lossVal)
+        eval(network, optimizer, lossVal, l1Val, waveVal)
         Stream.gpu.synchronize()
 
         let lossResult = lossVal.item(Float.self)
+        let l1Result = l1Val.item(Float.self)
+        let waveResult = waveVal.item(Float.self)
+        self.lastLosses = (totalLoss: lossResult, melL1: l1Result, waveTerm: waveResult)
         Memory.clearCache()
         return lossResult
     }
@@ -562,7 +851,13 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             return [totalLoss]
         }
 
-        let maskArray = mask ?? MLXArray.ones([features.shape[0], features.shape[1]])
+        let maskArray: MLXArray
+        switch mask {
+        case .some(let m):
+            maskArray = m
+        case .none:
+            maskArray = MLXArray.ones([features.shape[0], features.shape[1]])
+        }
         let (lossVals, grads) = lg(network, [features, targets, maskArray])
         eval(lossVals[0])
 
@@ -579,7 +874,8 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     /// 単一発話の系列学習ヘルパー
     public func trainSequence(
         features: [[Float]],
-        targets: [[Float]]
+        targets: [[Float]],
+        targetAudio: [Float]? = nil
     ) -> Float {
         let rawLen = min(features.count, targets.count)
         if rawLen <= 0 {
@@ -610,6 +906,23 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             t += 1
         }
 
+        var targetWaveArr: MLXArray? = nil
+        let segFrames = 32
+        let hopSize = AudioConfig.hopSize
+        let segSamples = segFrames * hopSize
+        let numSegments = rawLen / segFrames
+        if let audio = targetAudio, vocoder != nil, 0.0 < waveformLossWeight, 0 < numSegments, 195 <= inDim {
+            let totalSamples = numSegments * segSamples
+            var segAudio = [Float](repeating: 0.0, count: totalSamples)
+            let copyLimit = min(totalSamples, audio.count)
+            var s = 0
+            while s < copyLimit {
+                segAudio[s] = audio[s]
+                s += 1
+            }
+            targetWaveArr = MLXArray(segAudio, [1, totalSamples])
+        }
+
         return autoreleasepool {
             let fArr = MLXArray(flatFeat, [1, alignedLen, inDim])
             let tArr = MLXArray(flatTgt, [1, alignedLen, outDim])
@@ -618,9 +931,13 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             return trainBatch(
                 features: fArr,
                 targets: tArr,
-                mask: mArr
+                mask: mArr,
+                targetWaveform: targetWaveArr,
+                segIndices: nil
             )
         }
     }
 }
+
+public typealias MLXCfCAcousticNetwork = MLXSpikingAcousticNetwork
 #endif

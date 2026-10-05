@@ -63,6 +63,10 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
             return []
         }
 
+        if weights.isCfC {
+            return decodeSequenceCfC(featuresSeq: featuresSeq, workspace: workspace)
+        }
+
         let inDim = weights.inputDim
         let hMax = weights.maxHiddenDim
         let tSteps = weights.timeSteps
@@ -654,4 +658,200 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
 
         return result
     }
+
+
+    @inline(__always)
+    public static func sigmoid(_ z: Float) -> Float {
+        if z < -20.0 {
+            return expf(z)
+        }
+        if 20.0 < z {
+            return 1.0
+        }
+        return 1.0 / (1.0 + expf(-z))
+    }
+
+    /// 閉形式連続時間層（CfC）推論パス
+    ///
+    /// 各層の入力を x、直前フレームの状態を h とする。幅 256。
+    /// f = W_f [x, h] + b_f
+    /// g = tanh(W_g [x, h] + b_g)
+    /// decay = sigmoid(f)
+    /// h = decay * h + (1 - decay) * g
+    /// 4層を積む。第1層の x は 256 次元の言語特徴。第 2 層以降の x は前層の h。
+    /// 最終層の h を線形層で 64 次元の対数メルにする。
+    @discardableResult
+    public func decodeSequenceCfC(
+        featuresSeq: [[Float]],
+        workspace: AcousticWorkspace
+    ) -> [[Float]] {
+        let totalFrames = featuresSeq.count
+        if totalFrames <= 0 {
+            return []
+        }
+        guard let wfList = weights.cfcWf,
+              let bfList = weights.cfcBf,
+              let wgList = weights.cfcWg,
+              let bgList = weights.cfcBg else {
+            return []
+        }
+
+        let numL = min(wfList.count, bfList.count, wgList.count, bgList.count)
+        if numL <= 0 {
+            return []
+        }
+
+        workspace.reset()
+
+        let hDim = weights.maxHiddenDim
+        let outDim = weights.outputDim
+
+        var currentInput = featuresSeq
+
+        var l = 0
+        while l < numL {
+            let inDim = currentInput[0].count
+            let xhDim = inDim + hDim
+            let wf = wfList[l]
+            let bf = bfList[l]
+            let wg = wgList[l]
+            let bg = bgList[l]
+
+            var hSeq = [[Float]](repeating: [Float](repeating: 0.0, count: hDim), count: totalFrames)
+            var h: [Float]
+            if l < workspace.cfcStates.count && workspace.cfcStates[l].count == hDim {
+                h = workspace.cfcStates[l]
+            } else {
+                h = [Float](repeating: 0.0, count: hDim)
+            }
+            var xh = [Float](repeating: 0.0, count: xhDim)
+
+            wf.withUnsafeBufferPointer { wfBuf in
+                bf.withUnsafeBufferPointer { bfBuf in
+                    wg.withUnsafeBufferPointer { wgBuf in
+                        bg.withUnsafeBufferPointer { bgBuf in
+                            let wfPtr = wfBuf.baseAddress!
+                            let bfPtr = bfBuf.baseAddress!
+                            let wgPtr = wgBuf.baseAddress!
+                            let bgPtr = bgBuf.baseAddress!
+
+                            var t = 0
+                            while t < totalFrames {
+                                let xRow = currentInput[t]
+                                xh.withUnsafeMutableBufferPointer { xhBuf in
+                                    let xhPtr = xhBuf.baseAddress!
+                                    xRow.withUnsafeBufferPointer { xBuf in
+                                        xhPtr.update(from: xBuf.baseAddress!, count: inDim)
+                                    }
+                                    h.withUnsafeBufferPointer { hBuf in
+                                        (xhPtr + inDim).update(from: hBuf.baseAddress!, count: hDim)
+                                    }
+
+                                    var i = 0
+                                    while i < hDim {
+                                        let wOffset = i * xhDim
+                                        var accF = SIMD8<Float>(repeating: 0.0)
+                                        var accG = SIMD8<Float>(repeating: 0.0)
+                                        var k = 0
+                                        while k + 8 <= xhDim {
+                                            let xhVec = SIMD8<Float>(
+                                                xhPtr[k + 0], xhPtr[k + 1], xhPtr[k + 2], xhPtr[k + 3],
+                                                xhPtr[k + 4], xhPtr[k + 5], xhPtr[k + 6], xhPtr[k + 7]
+                                            )
+                                            let wfVec = SIMD8<Float>(
+                                                wfPtr[wOffset + k + 0], wfPtr[wOffset + k + 1], wfPtr[wOffset + k + 2], wfPtr[wOffset + k + 3],
+                                                wfPtr[wOffset + k + 4], wfPtr[wOffset + k + 5], wfPtr[wOffset + k + 6], wfPtr[wOffset + k + 7]
+                                            )
+                                            let wgVec = SIMD8<Float>(
+                                                wgPtr[wOffset + k + 0], wgPtr[wOffset + k + 1], wgPtr[wOffset + k + 2], wgPtr[wOffset + k + 3],
+                                                wgPtr[wOffset + k + 4], wgPtr[wOffset + k + 5], wgPtr[wOffset + k + 6], wgPtr[wOffset + k + 7]
+                                            )
+                                            accF = accF + (wfVec * xhVec)
+                                            accG = accG + (wgVec * xhVec)
+                                            k += 8
+                                        }
+
+                                        var scalarF: Float = 0.0
+                                        var scalarG: Float = 0.0
+                                        while k < xhDim {
+                                            let xhVal = xhPtr[k]
+                                            scalarF += wfPtr[wOffset + k] * xhVal
+                                            scalarG += wgPtr[wOffset + k] * xhVal
+                                            k += 1
+                                        }
+
+                                        let f = (accF[0] + accF[1] + accF[2] + accF[3] + accF[4] + accF[5] + accF[6] + accF[7]) + scalarF + bfPtr[i]
+                                        let zg = (accG[0] + accG[1] + accG[2] + accG[3] + accG[4] + accG[5] + accG[6] + accG[7]) + scalarG + bgPtr[i]
+
+                                        let g = tanhf(zg)
+                                        let decay = Self.sigmoid(f)
+                                        let hNew = (decay * h[i]) + ((1.0 - decay) * g)
+                                        h[i] = hNew
+                                        hSeq[t][i] = hNew
+                                        i += 1
+                                    }
+                                }
+                                t += 1
+                            }
+                        }
+                    }
+                }
+            }
+
+            if l < workspace.cfcStates.count && workspace.cfcStates[l].count == hDim {
+                workspace.cfcStates[l] = h
+            }
+            currentInput = hSeq
+            l += 1
+        }
+
+        // 終段線形射影: 最上位層の h -> 対数メル (outDim = 64)
+        var outMel = [[Float]](repeating: [Float](repeating: 0.0, count: outDim), count: totalFrames)
+        weights.wOut.withUnsafeBufferPointer { wOutBuf in
+            weights.bOut.withUnsafeBufferPointer { bOutBuf in
+                let wOutPtr = wOutBuf.baseAddress!
+                let bOutPtr = bOutBuf.baseAddress!
+
+                var t = 0
+                while t < totalFrames {
+                    let hRow = currentInput[t]
+                    hRow.withUnsafeBufferPointer { hBuf in
+                        let hPtr = hBuf.baseAddress!
+                        var c = 0
+                        while c < outDim {
+                            let wOffset = c * hDim
+                            var accOut = SIMD8<Float>(repeating: 0.0)
+                            var k = 0
+                            while k + 8 <= hDim {
+                                let hVec = SIMD8<Float>(
+                                    hPtr[k + 0], hPtr[k + 1], hPtr[k + 2], hPtr[k + 3],
+                                    hPtr[k + 4], hPtr[k + 5], hPtr[k + 6], hPtr[k + 7]
+                                )
+                                let wVec = SIMD8<Float>(
+                                    wOutPtr[wOffset + k + 0], wOutPtr[wOffset + k + 1], wOutPtr[wOffset + k + 2], wOutPtr[wOffset + k + 3],
+                                    wOutPtr[wOffset + k + 4], wOutPtr[wOffset + k + 5], wOutPtr[wOffset + k + 6], wOutPtr[wOffset + k + 7]
+                                )
+                                accOut = accOut + (hVec * wVec)
+                                k += 8
+                            }
+                            var scalarOut: Float = 0.0
+                            while k < hDim {
+                                scalarOut += wOutPtr[wOffset + k] * hPtr[k]
+                                k += 1
+                            }
+                            let melVal = (accOut[0] + accOut[1] + accOut[2] + accOut[3] + accOut[4] + accOut[5] + accOut[6] + accOut[7]) + scalarOut + bOutPtr[c]
+                            outMel[t][c] = melVal
+                            c += 1
+                        }
+                    }
+                    t += 1
+                }
+            }
+        }
+
+        return outMel
+    }
 }
+
+public typealias CfCAcousticDecoder = SpikingAcousticDecoder
+

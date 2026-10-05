@@ -218,11 +218,11 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
         self.importWeights(from: weights)
     }
 
-    /// 順伝播計算: 入力特徴量テンソル [B, T, inCh] から HiFi-GAN MRF 畳み込みネットワークにより直接時間領域波形 [B, T * 160] を生成
-    /// なぜ古典正弦波音源や手書きパルスの加算を完全撤廃するか:
-    /// 入力特徴量（Mel, F0, Voiced）から直接実音声 PCM 波形への写像をエンドツーエンドで学習し、
-    /// 人工的な電子ビープ音やモデム音を根絶して人間の生々しい肉声を純粋に合成するため。
-    public func callAsFunction(_ input: MLXArray) -> MLXArray {
+    /// 終段波形生成の tanh 直前の線形値 [B, T * 160] を出力する
+    /// なぜ tanh 直前の値を出力可能にするか:
+    /// 音響 SNN との結合学習において、大振幅波形による tanh の飽和（勾配消失）を回避し、
+    /// STFT 損失の勾配を予測 Mel へ確実に届けるため（推論時は callAsFunction で tanh を維持する）。
+    public func forwardPreTanh(_ input: MLXArray) -> MLXArray {
         let lrelu = LeakyReLU(negativeSlope: 0.1)
 
         // 1. 初段畳み込み: [B, T, inCh] -> [B, T, hCh]
@@ -253,10 +253,15 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
         let mrf3 = h3 + (0.5 * (r5 + r6))
 
         // 5. 終段波形出力 1D 畳み込み層: [B, T * 160, 1] -> squeeze -> [B, T * 160]
-        // なぜ正弦波やパルスの直接加算を完全撤廃し、純粋なニューラル波形生成（HiFi-GAN MRF）とするか:
-        // 人工的な電子ビープ音・モデム音・発振音を根絶し、Mel スペクトルおよび F0 特徴量から
-        // 畳み込みネットワークの受容野結合によって人間の自然で生々しい肉声波形を直接生成するため。
-        let sum = convPost(mrf3).squeezed(axes: [-1])
+        return convPost(mrf3).squeezed(axes: [-1])
+    }
+
+    /// 順伝播計算: 入力特徴量テンソル [B, T, inCh] から HiFi-GAN MRF 畳み込みネットワークにより直接時間領域波形 [B, T * 160] を生成
+    /// なぜ古典正弦波音源や手書きパルスの加算を完全撤廃するか:
+    /// 入力特徴量（Mel, F0, Voiced）から直接実音声 PCM 波形への写像をエンドツーエンドで学習し、
+    /// 人工的な電子ビープ音やモデム音を根絶して人間の生々しい肉声を純粋に合成するため。
+    public func callAsFunction(_ input: MLXArray) -> MLXArray {
+        let sum = forwardPreTanh(input)
         return tanh(sum)
     }
 
@@ -455,12 +460,24 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
                     let pWindowed = pStacked * hannWindow
                     let tWindowed = tStacked * hannWindow
 
-                    let pMag = abs(MLXFFT.rfft(pWindowed, axis: -1))
-                    let tMag = abs(MLXFFT.rfft(tWindowed, axis: -1))
+                    let pFFT = MLXFFT.rfft(pWindowed, axis: -1)
+                    let tFFT = MLXFFT.rfft(tWindowed, axis: -1)
+
+                    let pMag = abs(pFFT)
+                    let tMag = abs(tFFT)
 
                     let scLoss = mean(abs(pMag - tMag)) / (mean(tMag) + 1e-3)
                     let logLoss = mean(abs(log(pMag + 1e-3) - log(tMag + 1e-3)))
-                    stftLoss = stftLoss + (scLoss + logLoss)
+
+                    let pReal = pFFT.realPart()
+                    let pImag = pFFT.imaginaryPart()
+                    let tReal = tFFT.realPart()
+                    let tImag = tFFT.imaginaryPart()
+
+                    let cosPhase = clip((pReal * tReal + pImag * tImag) / ((pMag + 1e-4) * (tMag + 1e-4)), min: -1.0, max: 1.0)
+                    let phaseLoss = 0.1 * mean(1.0 - cosPhase)
+
+                    stftLoss = stftLoss + (scLoss + logLoss + phaseLoss)
                 }
             }
             wIdx += 1
