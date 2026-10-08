@@ -333,7 +333,7 @@ final class AblationAnalysisTests: XCTestCase {
         vocoder.reset()
         let tenkiText = "今日はいい天気です"
         let samplesTenki = engine.synthesize(text: tenkiText)
-        let path5 = "\(outputDir)/tts_tenki.wav"
+        let path5 = "\(outputDir)/test_ablate_tenki.wav"
         try WavEncoder.encode(samples: samplesTenki, sampleRate: AudioConfig.sampleRate).write(to: URL(fileURLWithPath: path5))
         print("[TTS Tenki] 生成完了: \(path5)")
 
@@ -346,7 +346,7 @@ final class AblationAnalysisTests: XCTestCase {
             ("2. ablate_recon_mel_pred_f0.wav (SNN Recon Mel + Pred F0)", path2),
             ("3. ablate_tts.wav (TTS Standard: Pred Mel + Pred F0)", path3),
             ("4. ablate_tts_teacher_f0.wav (TTS Teacher F0: SNN Mel w/ Teacher F0)", path4),
-            ("5. tts_tenki.wav (TTS Standard: 今日はいい天気です)", path5)
+            ("5. test_ablate_tenki.wav (TTS Standard: 今日はいい天気です)", path5)
         ]
 
         print("\n=======================================================")
@@ -3791,6 +3791,36 @@ final class AblationAnalysisTests: XCTestCase {
         XCTAssertTrue(centroid1k5B < 22.0, "プローブ B の 200–1500 Hz 重心は 22 Hz 未満であること（実測: \(centroid1k5B) Hz）")
         XCTAssertTrue(0 < rawSamplesA.count, "プローブ A サンプルが空でないこと")
         XCTAssertTrue(0 < rawSamplesB.count, "プローブ B サンプルが空でないこと")
+    }
+
+    /// design_envelope_keep19.md の「0. 作業前」受入条件 4 の事前検証テスト
+    /// 水の包絡変化が 40–46 Hz、水の一致割合が 0.48–0.54、copy の包絡変化が 70–78 Hz、copy の一致割合が 0.24–0.30
+    func testEnvelopeDeltaPreflightValidation() throws {
+        let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
+        let ep19Weights = try SpikingNetworkWeights.load(from: ep19URL)
+        let ep19Engine = SpikeSpeechEngine(weights: ep19Weights)
+        let mizuPCM = ep19Engine.synthesize(text: "水をマレーシアから買わなくてはならないのです。")
+        let tenkiPCM = ep19Engine.synthesize(text: "今日はいい天気です")
+
+        let reader = WavAudioReader()
+        let copyPCM = try reader.loadWav16k(from: ".tmp/wave15/copy_BASIC5000_0001.wav")
+
+        let mizuEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: mizuPCM)
+        let tenkiEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: tenkiPCM)
+        let copyEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: copyPCM)
+
+        print("[Envelope Delta Preflight Check]")
+        print("  水 (ep19):   包絡変化 = \(String(format: "%.2f", mizuEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", mizuEnv.matchRatio)), 有声対 = \(mizuEnv.voicedPairs)")
+        print("  天気 (ep19): 包絡変化 = \(String(format: "%.2f", tenkiEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", tenkiEnv.matchRatio)), 有声対 = \(tenkiEnv.voicedPairs)")
+        print("  copy:        包絡変化 = \(String(format: "%.2f", copyEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", copyEnv.matchRatio)), 有声対 = \(copyEnv.voicedPairs)")
+
+        // 水の包絡変化が 40–46 Hz、水の一致割合が 0.48–0.54
+        XCTAssertTrue(40.0 <= mizuEnv.centroidMedian && mizuEnv.centroidMedian <= 46.0, "作業前水の包絡変化は 40–46 Hz であること（実測: \(mizuEnv.centroidMedian) Hz）")
+        XCTAssertTrue(0.48 <= mizuEnv.matchRatio && mizuEnv.matchRatio <= 0.54, "作業前水の一致割合は 0.48–0.54 であること（実測: \(mizuEnv.matchRatio)）")
+
+        // copy の包絡変化が 70–78 Hz、copy の一致割合が 0.24–0.30
+        XCTAssertTrue(70.0 <= copyEnv.centroidMedian && copyEnv.centroidMedian <= 78.0, "copy の包絡変化は 70–78 Hz であること（実測: \(copyEnv.centroidMedian) Hz）")
+        XCTAssertTrue(0.24 <= copyEnv.matchRatio && copyEnv.matchRatio <= 0.30, "copy の一致割合は 0.24–0.30 であること（実測: \(copyEnv.matchRatio)）")
     }
 }
 

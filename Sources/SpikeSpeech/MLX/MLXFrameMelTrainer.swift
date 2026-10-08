@@ -4,7 +4,7 @@ import MLX
 import MLXNN
 import MLXOptimizers
 
-/// FrameMel モデルの 5 損失値コンテナ
+/// FrameMel モデルの損失値コンテナ（5つの基本損失 + PostNet後メルフレーム差損失）
 public struct FrameMelLosses: Sendable {
     public let totalLoss: Float
     public let decMelL1: Float
@@ -12,6 +12,7 @@ public struct FrameMelLosses: Sendable {
     public let voicedF0MSE: Float
     public let energyMSE: Float
     public let durMSE: Float
+    public let deltaMelL1: Float
 
     public init(
         totalLoss: Float,
@@ -19,7 +20,8 @@ public struct FrameMelLosses: Sendable {
         postMelL1: Float,
         voicedF0MSE: Float,
         energyMSE: Float,
-        durMSE: Float
+        durMSE: Float,
+        deltaMelL1: Float = 0.0
     ) {
         self.totalLoss = totalLoss
         self.decMelL1 = decMelL1
@@ -27,6 +29,7 @@ public struct FrameMelLosses: Sendable {
         self.voicedF0MSE = voicedF0MSE
         self.energyMSE = energyMSE
         self.durMSE = durMSE
+        self.deltaMelL1 = deltaMelL1
     }
 }
 
@@ -39,21 +42,25 @@ public struct FrameMelLosses: Sendable {
 public final class MLXFrameMelTrainer: @unchecked Sendable {
     public let model: MLXFrameMelModel
     public let optimizer: Adam
+    public var deltaLossWeight: Float
     public private(set) var lastLosses: FrameMelLosses
 
     public init(
         model: MLXFrameMelModel = MLXFrameMelModel(),
-        learningRate: Float = 0.001
+        learningRate: Float = 0.001,
+        deltaLossWeight: Float = 1.0
     ) {
         self.model = model
         self.optimizer = Adam(learningRate: learningRate)
+        self.deltaLossWeight = deltaLossWeight
         self.lastLosses = FrameMelLosses(
             totalLoss: 0.0,
             decMelL1: 0.0,
             postMelL1: 0.0,
             voicedF0MSE: 0.0,
             energyMSE: 0.0,
-            durMSE: 0.0
+            durMSE: 0.0,
+            deltaMelL1: 0.0
         )
     }
 
@@ -79,14 +86,15 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     ) -> FrameMelLosses {
         let phoneCount = phoneIds.count
         let totalFrames = targetMel.count
-        if phoneCount < 3 || totalFrames <= 0 {
+        if phoneCount < 3 || totalFrames <= 1 {
             return FrameMelLosses(
                 totalLoss: 0.0,
                 decMelL1: 0.0,
                 postMelL1: 0.0,
                 voicedF0MSE: 0.0,
                 energyMSE: 0.0,
-                durMSE: 0.0
+                durMSE: 0.0,
+                deltaMelL1: 0.0
             )
         }
 
@@ -179,6 +187,36 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let targetEnergyBatch = MLXArray(targetEnergy, [1, totalFrames, 1])
         let targetMelArr = MLXArray(targetMelFlat, [1, totalFrames, 64])
 
+        // 母音 (ID 5, 6, 7, 8, 9) の内側フレーム差マスク (totalFrames - 1)
+        var deltaMask = [Float](repeating: 0.0, count: totalFrames - 1)
+        var curFOffset = 0
+        p = 0
+        while p < phoneCount {
+            let pid = Int(phoneIds[p])
+            let dur = targetDurations[p]
+            var isVowel = false
+            switch pid {
+            case 5, 6, 7, 8, 9:
+                isVowel = true
+            default:
+                break
+            }
+            if isVowel && 3 < dur {
+                var f = 2
+                while f <= (dur - 2) {
+                    let t = curFOffset + f
+                    if t < totalFrames {
+                        deltaMask[t - 1] = 1.0
+                    }
+                    f += 1
+                }
+            }
+            curFOffset += dur
+            p += 1
+        }
+        let deltaMaskArr = MLXArray(deltaMask, [1, totalFrames - 1, 1])
+
+        let dWeight = self.deltaLossWeight
         let lg = valueAndGrad(model: model) { (m: MLXFrameMelModel, _) -> [MLXArray] in
             // 1. 音素エンコーダ
             let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr)
@@ -209,8 +247,16 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let decLoss = mean(abs(decMel - targetMelArr))
             let postLoss = mean(abs(postMel - targetMelArr))
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss
-            return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss]
+            // 7. PostNet 後対数メルフレーム差損失 (母音内部のみ)
+            let predDelta = postMel[0..., 1..<totalFrames, 0...] - postMel[0..., 0..<(totalFrames - 1), 0...]
+            let targetDelta = targetMelArr[0..., 1..<totalFrames, 0...] - targetMelArr[0..., 0..<(totalFrames - 1), 0...]
+            let deltaDiff = abs(predDelta - targetDelta)
+            let maskedDelta = deltaDiff * deltaMaskArr
+            let maskSum = sum(deltaMaskArr)
+            let deltaLoss = sum(maskedDelta) / maximum(maskSum * 64.0, MLXArray(1.0))
+
+            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight))
+            return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, deltaLoss]
         }
 
         let (lossVals, grads) = lg(model, [])
@@ -229,7 +275,8 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             postMelL1: lossVals[2].item(Float.self),
             voicedF0MSE: lossVals[3].item(Float.self),
             energyMSE: lossVals[4].item(Float.self),
-            durMSE: lossVals[5].item(Float.self)
+            durMSE: lossVals[5].item(Float.self),
+            deltaMelL1: lossVals[6].item(Float.self)
         )
         self.lastLosses = losses
         return losses

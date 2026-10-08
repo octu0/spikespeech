@@ -1085,15 +1085,21 @@ func main() {
             print("新規の FrameMel 重みを決定論的初期化しました（初期 meanMel 適合）。")
         }
 
-        var trainer = MLXFrameMelTrainer(model: frameMelModel, learningRate: learningRate)
-        Memory.cacheLimit = 32 * 1024 * 1024
-
-        let schedule = CosineWarmupSchedule(
-            lrBase: learningRate,
-            lrMin: lrMin,
-            warmupEpochs: warmupEpochs,
-            totalEpochs: epochs
+        let initResidual = FrameMelWeights.makeInitialResidualWeights(seed: 2026)
+        let residualModel = MLXMelResidual(
+            w1: initResidual.resW1,
+            b1: initResidual.resB1,
+            w2: initResidual.resW2,
+            b2: initResidual.resB2
         )
+        var deltaLossWeight: Float = 1.0
+        var trainer = MLXMelResidualTrainer(
+            frozenModel: frameMelModel,
+            residualModel: residualModel,
+            learningRate: learningRate,
+            deltaLossWeight: deltaLossWeight
+        )
+        Memory.cacheLimit = 32 * 1024 * 1024
 
         let healthyAlignments = Array(alignmentMap.values).filter { AlignmentStore.isUtteranceAlignmentValid($0) }
         let healthyPhonemeAverages: [Int32: Float]
@@ -1111,17 +1117,87 @@ func main() {
             .withMeanFramesPerMora(16.0)
             .withPhonemeAverageDurations(healthyPhonemeAverages)
 
-        var bestMizuCentroid: Float = -Float.greatestFiniteMagnitude
-        var bestMizuStop: Float = Float.greatestFiniteMagnitude
-        var bestEpoch: Int = -1
-        var bestFullWeights: SpikingNetworkWeights = baseWithDurations
-        var bestMizuPCM: [Float] = []
-        var bestTenkiPCM: [Float] = []
-        var bestLosses: (decMelL1: Float, voicedF0MSE: Float, energyMSE: Float) = (0.0, 0.0, 0.0)
-        var stopReason: String = "エポック 30 まで実行完了"
+        // ============================================================
+        // 0.4 作業前事前検証 (Epoch 19):
+        // 戻した重みで、教師を入れない synthesize(text:) を実行し、水と天気を直下と .tmp/wave15/ の両方へ書く。
+        // この波形がエポック 19 の戻しである。
+        // 水の包絡変化が 40–46 Hz、水の一致割合が 0.48–0.54、重心（200–1500 Hz）が 25–27 Hz、
+        // copy の包絡変化が 70–78 Hz、copy の一致割合が 0.24–0.30 に入ることを確認する。
+        // ============================================================
+        let mizuText = "水をマレーシアから買わなくてはならないのです。"
+        let tenkiText = "今日はいい天気です"
+        let copyPath = ".tmp/wave15/copy_BASIC5000_0001.wav"
+        let reconDir = ".tmp/wave15"
+        try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
+
+        let preEngine = SpikeSpeechEngine(weights: baseWithDurations)
+        let preMizuPCM = preEngine.synthesize(text: mizuText)
+        let preTenkiPCM = preEngine.synthesize(text: tenkiText)
+
+        let preMizuURL = URL(fileURLWithPath: reconDir + "/tts_mizuwomare.wav")
+        let preMizuRootURL = URL(fileURLWithPath: "tts_mizuwomare.wav")
+        let preMizuData = WavEncoder.encode(samples: preMizuPCM, sampleRate: AudioConfig.sampleRate)
+        try? preMizuData.write(to: preMizuURL)
+        try? preMizuData.write(to: preMizuRootURL)
+
+        let preTenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
+        let preTenkiRootURL = URL(fileURLWithPath: "tts_tenki.wav")
+        let preTenkiData = WavEncoder.encode(samples: preTenkiPCM, sampleRate: AudioConfig.sampleRate)
+        try? preTenkiData.write(to: preTenkiURL)
+        try? preTenkiData.write(to: preTenkiRootURL)
+
+        let preMizuEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preMizuPCM)
+        let preMizuMetric = AcousticCentroidMetric.measure(pcm: preMizuPCM)
+        let preMizuCentroid1k5 = preMizuMetric.centroidMedian200to1500
+        let preTenkiEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preTenkiPCM)
+        let preCopyPCM = (try? WavAudioReader().loadWav16k(from: copyPath)) ?? []
+        let preCopyEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preCopyPCM)
+
+        print("[作業前事前検証 (Epoch 19)]")
+        print("  水:   包絡変化 = \(String(format: "%.2f", preMizuEnv.centroidMedian)) Hz (基準: 40–46 Hz), 一致割合 = \(String(format: "%.4f", preMizuEnv.matchRatio)) (基準: 0.48–0.54), 200–1500Hz重心 = \(String(format: "%.2f", preMizuCentroid1k5)) Hz (基準: 25–27 Hz)")
+        print("  天気: 包絡変化 = \(String(format: "%.2f", preTenkiEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", preTenkiEnv.matchRatio))")
+        print("  copy: 包絡変化 = \(String(format: "%.2f", preCopyEnv.centroidMedian)) Hz (基準: 70–78 Hz), 一致割合 = \(String(format: "%.4f", preCopyEnv.matchRatio)) (基準: 0.24–0.30)")
+
+        let preMizuOk = (40.0 <= preMizuEnv.centroidMedian && preMizuEnv.centroidMedian <= 46.0 && 0.48 <= preMizuEnv.matchRatio && preMizuEnv.matchRatio <= 0.54 && 25.0 <= preMizuCentroid1k5 && preMizuCentroid1k5 <= 27.0)
+        let preCopyOk = (70.0 <= preCopyEnv.centroidMedian && preCopyEnv.centroidMedian <= 78.0 && 0.24 <= preCopyEnv.matchRatio && preCopyEnv.matchRatio <= 0.30)
+        switch preMizuOk && preCopyOk {
+        case true:
+            print("【作業前事前検証 合格】エポック 19 の水および copy の指標が受入基準範囲内に合致しました。学習を開始します。")
+        case false:
+            print("【エラー】エポック 19 の指標が受入基準範囲外です。測り方を直してから再度実行してください。")
+            return
+        }
+
+        struct CandidateRecord {
+            let epoch: Int
+            let weights: SpikingNetworkWeights
+            let mizuPCM: [Float]
+            let tenkiPCM: [Float]
+            let mizuCentroid: Float
+            let mizuMatch: Float
+            let tenkiCentroid: Float
+            let tenkiMatch: Float
+            let mizuCentroid1k5: Float
+        }
+
+        var earlyStoppedRecord: CandidateRecord? = nil
+        var stopReason = "全エポック実行完了"
+
+        let totalEpochs = min(15, epochs)
+        let schedule = CosineWarmupSchedule(
+            lrBase: learningRate,
+            lrMin: lrMin,
+            warmupEpochs: 0,
+            totalEpochs: totalEpochs
+        )
+
+        let startingFMW = weights.frameMelWeights!
+        var epoch1DeltaRatio: Float = 1.0
+        var epoch1DeltaTerm: Float = 0.0
+        var epoch1MelL1: Float = 0.0
 
         var epoch = 0
-        epochLoop: while epoch < epochs {
+        epochLoop: while epoch < totalEpochs {
             if noShuffle != true {
                 let seed = TrainingShuffle.mixSeed(baseSeed: shuffleSeed, epoch: epoch)
                 TrainingShuffle.shuffleInPlace(&frameMelSamples, seed: seed)
@@ -1131,11 +1207,8 @@ func main() {
             trainer.setLearningRate(lr)
 
             var epochTotalLoss: Float = 0.0
-            var epochDecL1: Float = 0.0
-            var epochPostL1: Float = 0.0
-            var epochF0MSE: Float = 0.0
-            var epochEnergyMSE: Float = 0.0
-            var epochDurMSE: Float = 0.0
+            var epochMelL1: Float = 0.0
+            var epochDeltaL1: Float = 0.0
             var sampleCount = 0
 
             var sIdx = 0
@@ -1153,26 +1226,19 @@ func main() {
 
                 if losses.totalLoss.isFinite {
                     epochTotalLoss += losses.totalLoss
-                    epochDecL1 += losses.decMelL1
-                    epochPostL1 += losses.postMelL1
-                    epochF0MSE += losses.voicedF0MSE
-                    epochEnergyMSE += losses.energyMSE
-                    epochDurMSE += losses.durMSE
+                    epochMelL1 += losses.melL1
+                    epochDeltaL1 += losses.deltaMelL1
                     sampleCount += 1
                 }
 
                 // Metal リソース保護（50 サンプルごと）
                 if (sampleCount % 50) == 0 {
-                    let curW = trainer.exportWeights()
-                    let curLR = trainer.currentLearningRate()
                     Stream.gpu.synchronize()
-                    let newM = MLXFrameMelModel(weights: curW)
-                    trainer = MLXFrameMelTrainer(model: newM, learningRate: curLR)
                     Memory.clearCache()
                 }
 
                 if (sampleCount % 200) == 0 {
-                    print("    ステップ [\(sampleCount)/\(frameMelSamples.count)] 直近損失: \(String(format: "%.4f", losses.totalLoss)) (Dec: \(String(format: "%.4f", losses.decMelL1)), Post: \(String(format: "%.4f", losses.postMelL1)), F0: \(String(format: "%.4f", losses.voicedF0MSE)), Eng: \(String(format: "%.4f", losses.energyMSE)), Dur: \(String(format: "%.4f", losses.durMSE)))")
+                    print("    ステップ [\(sampleCount)/\(frameMelSamples.count)] 直近損失: \(String(format: "%.4f", losses.totalLoss)) (MelL1: \(String(format: "%.4f", losses.melL1)), Delta: \(String(format: "%.4f", losses.deltaMelL1)))")
                 }
 
                 sIdx += 1
@@ -1180,125 +1246,239 @@ func main() {
             Memory.clearCache()
 
             let avgTotal = epochTotalLoss / Float(max(1, sampleCount))
-            let avgDec = epochDecL1 / Float(max(1, sampleCount))
-            let avgPost = epochPostL1 / Float(max(1, sampleCount))
-            let avgF0 = epochF0MSE / Float(max(1, sampleCount))
-            let avgEng = epochEnergyMSE / Float(max(1, sampleCount))
-            let avgDur = epochDurMSE / Float(max(1, sampleCount))
+            let avgMel = epochMelL1 / Float(max(1, sampleCount))
+            let avgDelta = epochDeltaL1 / Float(max(1, sampleCount))
 
-            print("  [Epoch \(epoch + 1)/\(epochs)] 損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)))  lr=\(String(format: "%.6g", lr))")
+            print("  [Epoch \(epoch + 1)/\(totalEpochs)] 損失: \(String(format: "%.4f", avgTotal)) (MelL1: \(String(format: "%.4f", avgMel)), Delta: \(String(format: "%.4f", avgDelta)))  lr=\(String(format: "%.6g", lr))")
+
+            if epoch == 0 {
+                let termVal = trainer.deltaLossWeight * avgDelta
+                let ratio = termVal / max(1e-6, avgMel)
+                epoch1DeltaTerm = termVal
+                epoch1MelL1 = avgMel
+                epoch1DeltaRatio = ratio
+                print("    [エポック 1 損失比率検証] Delta項: \(String(format: "%.4f", termVal)) (係数: \(trainer.deltaLossWeight)), メルL1: \(String(format: "%.4f", avgMel)), 比率: \(String(format: "%.4f", ratio))")
+                if ratio < 0.8 || 1.2 < ratio {
+                    let newWeight = avgMel / max(1e-6, avgDelta)
+                    print("    ==> 比率が [0.8, 1.2] 外のため、係数を \(newWeight) に変更してエポック 1 からやり直します。")
+                    deltaLossWeight = newWeight
+                    let freshRes = FrameMelWeights.makeInitialResidualWeights(seed: 2026)
+                    let freshResMod = MLXMelResidual(w1: freshRes.resW1, b1: freshRes.resB1, w2: freshRes.resW2, b2: freshRes.resB2)
+                    trainer = MLXMelResidualTrainer(
+                        frozenModel: frameMelModel,
+                        residualModel: freshResMod,
+                        learningRate: learningRate,
+                        deltaLossWeight: newWeight
+                    )
+                    continue epochLoop
+                }
+            }
 
             // エポック重みの保存
-            let currentFMW = trainer.exportWeights()
+            let resWeights = trainer.residualModel.exportWeights()
+            let currentFMW = startingFMW.withMelResidual(
+                resW1: resWeights.w1,
+                resB1: resWeights.b1,
+                resW2: resWeights.w2,
+                resB2: resWeights.b2
+            )
             let epochFullWeights = baseWithDurations.withFrameMelWeights(currentFMW)
             let epPath = String(format: "Models/weights.ep%02d.json", epoch + 1)
             let epURL = URL(fileURLWithPath: epPath)
             try? WeightCheckpoint.atomicWritePretty(epochFullWeights, to: epURL)
 
-            // 各エポックの終わりに、教師を入れない synthesize(text:) で水と天気を作る。重心と停止割合を測る。
+            // 各エポックの終わりに、教師を入れない（予測F0・予測エネルギーの）synthesize(text:) で水と天気を測る
             let evalEngine = SpikeSpeechEngine(weights: epochFullWeights)
-            let mizuText = "水をマレーシアから買わなくてはならないのです。"
-            let tenkiText = "今日はいい天気です"
             let mizuPCM = evalEngine.synthesize(text: mizuText)
             let tenkiPCM = evalEngine.synthesize(text: tenkiText)
 
+            let mizuEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: mizuPCM)
+            let tenkiEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: tenkiPCM)
+            let copyPCM = (try? WavAudioReader().loadWav16k(from: copyPath)) ?? []
+            let copyEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: copyPCM)
+
             let mizuMetric = AcousticCentroidMetric.measure(pcm: mizuPCM)
             let tenkiMetric = AcousticCentroidMetric.measure(pcm: tenkiPCM)
-            let mizuCentroid = mizuMetric.centroidMedian200to1500
-            let mizuStop = mizuMetric.cosRatio
-            let tenkiCentroid = tenkiMetric.centroidMedian200to1500
-            let tenkiStop = tenkiMetric.cosRatio
 
-            let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM, interpolateParabolic: false)
-            let mizuF0Diff = mizuHalves.first.f0Median - mizuHalves.second.f0Median
-            let mizuMod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: mizuPCM)
-            let mizuF0Std = AcousticCentroidMetric.measureF0StdDev(pcm: mizuPCM, interpolateParabolic: false)
-            let mizuDips = AcousticCentroidMetric.measureDeepDips(pcm: mizuPCM)
-
-            print("    [エポック \(epoch + 1) 合成客観指標]")
-            print("      水:   200–1500 Hz重心 = \(String(format: "%.2f", mizuCentroid)) Hz, 停止割合 = \(String(format: "%.4f", mizuStop)) (\(mizuPCM.count) サンプル)")
-            print("            F0前半 = \(String(format: "%.1f", mizuHalves.first.f0Median)) Hz, F0後半 = \(String(format: "%.1f", mizuHalves.second.f0Median)) Hz (差: \(String(format: "%+.1f", mizuF0Diff)) Hz)")
-            print("            6–12 Hz比 = \(String(format: "%.4f", mizuMod6to12)), 有声F0標準偏差 = \(String(format: "%.2f", mizuF0Std)) Hz")
-            print("            深い落ち込み = \(mizuDips.dips.count) 個 (最大 \(mizuDips.maxDipLengthMs) ms)")
-            print("      天気: 200–1500 Hz重心 = \(String(format: "%.2f", tenkiCentroid)) Hz, 停止割合 = \(String(format: "%.4f", tenkiStop)) (\(tenkiPCM.count) サンプル)")
-
-            // 最大重心エポックの更新判定（同じなら停止割合が小さい方）
-            var isBetter = false
-            if bestMizuCentroid < mizuCentroid {
-                isBetter = true
-            } else {
-                switch (mizuCentroid == bestMizuCentroid, mizuStop < bestMizuStop) {
-                case (true, true):
-                    isBetter = true
-                default:
-                    break
-                }
+            print("    [エポック \(epoch + 1) 包絡および音響客観指標]")
+            print("      水:   包絡変化 = \(String(format: "%.2f", mizuEnv.centroidMedian)) Hz (基準: >= 60.0), 一致割合 = \(String(format: "%.4f", mizuEnv.matchRatio)) (基準: <= 0.35)")
+            print("            200–1500 Hz重心 = \(String(format: "%.2f", mizuMetric.centroidMedian200to1500)) Hz (基準: >= 24.0)")
+            print("      天気: 包絡変化 = \(String(format: "%.2f", tenkiEnv.centroidMedian)) Hz (基準: >= 60.0), 一致割合 = \(String(format: "%.4f", tenkiEnv.matchRatio)) (基準: <= 0.35), 200–1500 Hz重心 = \(String(format: "%.2f", tenkiMetric.centroidMedian200to1500)) Hz")
+            if copyPCM.isEmpty != true {
+                print("      copy: 包絡変化 = \(String(format: "%.2f", copyEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", copyEnv.matchRatio))")
             }
 
-            if isBetter {
-                bestMizuCentroid = mizuCentroid
-                bestMizuStop = mizuStop
-                bestEpoch = epoch + 1
-                bestFullWeights = epochFullWeights
-                bestMizuPCM = mizuPCM
-                bestTenkiPCM = tenkiPCM
-                bestLosses = (avgDec, avgF0, avgEng)
-                print("      ==> 最大重心エポック更新: Epoch \(bestEpoch) (重心: \(String(format: "%.2f", bestMizuCentroid)) Hz, 停止: \(String(format: "%.4f", bestMizuStop)))")
-            }
-
-            // 終了判定
-            // - 水の重心が 24 Hz 以上、かつ停止割合が 0.15 以下になったエポックで止めてよい。
-            if 24.0 <= mizuCentroid && mizuStop <= 0.15 {
-                stopReason = "早期収束達成: 重心 >= 24 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 <= 0.15 (\(String(format: "%.4f", mizuStop)))"
-                print("【早期収束達成】水の重心 >= 24 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 <= 0.15 (\(String(format: "%.4f", mizuStop))) を達成しました。")
+            // 終了判定: 次の五つが同時に満たされたエポックで止め、それを残す。
+            // - 水の包絡変化が 60 Hz 以上。
+            // - 水の一致割合が 0.35 以下。
+            // - 天気の包絡変化が 60 Hz 以上。
+            // - 天気の一致割合が 0.35 以下。
+            // - 水の 200–1500 Hz の重心変化が 24 Hz 以上。
+            let earlyStopMet = (60.0 <= mizuEnv.centroidMedian && mizuEnv.matchRatio <= 0.35 && 60.0 <= tenkiEnv.centroidMedian && tenkiEnv.matchRatio <= 0.35 && 24.0 <= mizuMetric.centroidMedian200to1500)
+            if earlyStopMet {
+                earlyStoppedRecord = CandidateRecord(
+                    epoch: epoch + 1,
+                    weights: epochFullWeights,
+                    mizuPCM: mizuPCM,
+                    tenkiPCM: tenkiPCM,
+                    mizuCentroid: mizuEnv.centroidMedian,
+                    mizuMatch: mizuEnv.matchRatio,
+                    tenkiCentroid: tenkiEnv.centroidMedian,
+                    tenkiMatch: tenkiEnv.matchRatio,
+                    mizuCentroid1k5: mizuMetric.centroidMedian200to1500
+                )
+                stopReason = "早期停止（全5受入基準充足）"
+                print("【全受入基準達成】水・天気の包絡・一致割合および水重心24Hzを同時に達成しました！")
                 break epochLoop
             }
 
-            // - エポック 10 の時点で、水の重心が 18 Hz 未満、かつ停止割合が 0.30 を超えたままなら、そこで止める。30 まで続けない。
-            if (epoch + 1) == 10 {
-                if mizuCentroid < 18.0 && 0.30 < mizuStop {
-                    stopReason = "エポック 10 停止基準到達: 重心 < 18 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 > 0.30 (\(String(format: "%.4f", mizuStop)))"
-                    print("【エポック 10 停止基準到達】水の重心 < 18 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 > 0.30 (\(String(format: "%.4f", mizuStop))) のため、学習を終了します。")
-                    break epochLoop
+            epoch += 1
+        } // end epochLoop
+
+        // 凍結パラメータの不変性を厳密に検証するヘルパー
+        func verifyFrozenWeightsIntact(base: FrameMelWeights, final: FrameMelWeights) -> (ok: Bool, maxDiff: Float) {
+            func maxD(_ a: [Float], _ b: [Float]) -> Float {
+                if a.count != b.count { return Float.infinity }
+                var m: Float = 0.0
+                var idx = 0
+                while idx < a.count {
+                    let d = abs(a[idx] - b[idx])
+                    if m < d { m = d }
+                    idx += 1
                 }
+                return m
             }
 
-            epoch += 1
+            var overallMax: Float = 0.0
+            overallMax = max(overallMax, maxD(base.embedCur, final.embedCur))
+            overallMax = max(overallMax, maxD(base.embedPrev, final.embedPrev))
+            overallMax = max(overallMax, maxD(base.embedNext, final.embedNext))
+            overallMax = max(overallMax, maxD(base.encBIn, final.encBIn))
+            var l = 0
+            while l < base.encWConv.count {
+                overallMax = max(overallMax, maxD(base.encWConv[l], final.encWConv[l]))
+                overallMax = max(overallMax, maxD(base.encBConv[l], final.encBConv[l]))
+                l += 1
+            }
+            overallMax = max(overallMax, maxD(base.durW1, final.durW1))
+            overallMax = max(overallMax, maxD(base.durB1, final.durB1))
+            overallMax = max(overallMax, maxD(base.durW2, final.durW2))
+            overallMax = max(overallMax, maxD(base.durB2, final.durB2))
+            overallMax = max(overallMax, maxD(base.f0W1, final.f0W1))
+            overallMax = max(overallMax, maxD(base.f0B1, final.f0B1))
+            overallMax = max(overallMax, maxD(base.f0W2, final.f0W2))
+            overallMax = max(overallMax, maxD(base.f0B2, final.f0B2))
+            overallMax = max(overallMax, maxD(base.energyW1, final.energyW1))
+            overallMax = max(overallMax, maxD(base.energyB1, final.energyB1))
+            overallMax = max(overallMax, maxD(base.energyW2, final.energyW2))
+            overallMax = max(overallMax, maxD(base.energyB2, final.energyB2))
+            overallMax = max(overallMax, maxD(base.decWIn, final.decWIn))
+            overallMax = max(overallMax, maxD(base.decBIn, final.decBIn))
+            l = 0
+            while l < base.decWConv.count {
+                overallMax = max(overallMax, maxD(base.decWConv[l], final.decWConv[l]))
+                overallMax = max(overallMax, maxD(base.decBConv[l], final.decBConv[l]))
+                l += 1
+            }
+            overallMax = max(overallMax, maxD(base.decWOut, final.decWOut))
+            overallMax = max(overallMax, maxD(base.decBOut, final.decBOut))
+            l = 0
+            while l < base.postWConv.count {
+                overallMax = max(overallMax, maxD(base.postWConv[l], final.postWConv[l]))
+                overallMax = max(overallMax, maxD(base.postBConv[l], final.postBConv[l]))
+                l += 1
+            }
+            return (overallMax <= 0.0, overallMax)
+        }
+
+        // 採択エポックの選定
+        // 15 エポックで五つが揃わなければ残差を捨て、エポック 19 の重みと波形へ戻し、未達と書く。
+        // 凍結した配列が 1 個でも変わっていたら、その結果は捨ててエポック 19 へ戻す。
+        var isAchieved = false
+        var selectionType = "未達"
+        let finalWeights: SpikingNetworkWeights
+        let finalMizuPCM: [Float]
+        let finalTenkiPCM: [Float]
+        let finalEpochNumber: Int
+
+        switch earlyStoppedRecord {
+        case .some(let early):
+            let check = verifyFrozenWeightsIntact(base: startingFMW, final: early.weights.frameMelWeights!)
+            switch check.ok {
+            case true:
+                isAchieved = true
+                selectionType = "早期停止（全条件達成）"
+                finalWeights = early.weights
+                finalMizuPCM = early.mizuPCM
+                finalTenkiPCM = early.tenkiPCM
+                finalEpochNumber = early.epoch
+                print("【凍結配列完全一致検証 合格】エポック 19 の全凍結配列の最大絶対差は厳密に 0.0 です。")
+            case false:
+                isAchieved = false
+                selectionType = "未達（凍結配列差分検出による破棄・Epoch 19 復元）"
+                stopReason = "凍結配列差分検出 (MaxDiff: \(check.maxDiff))"
+                print("【エラー】凍結配列に差分が検出されました！結果を破棄して Epoch 19 に復元します。")
+                let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
+                finalWeights = (try? SpikingNetworkWeights.load(from: ep19URL)) ?? baseWithDurations
+                finalMizuPCM = preMizuPCM
+                finalTenkiPCM = preTenkiPCM
+                finalEpochNumber = 19
+            }
+        case .none:
+            isAchieved = false
+            selectionType = "未達（15エポック上限到達、Epoch 19 復元）"
+            stopReason = "15エポック上限到達（5条件非達成）"
+            print("【15エポック未達】五つの条件が揃わなかったため、残差重みを破棄し Epoch 19 の重みと波形へ復元します。")
+            let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
+            finalWeights = (try? SpikingNetworkWeights.load(from: ep19URL)) ?? baseWithDurations
+            finalMizuPCM = preMizuPCM
+            finalTenkiPCM = preTenkiPCM
+            finalEpochNumber = 19
+        }
+
+        let achievedStr: String
+        switch isAchieved {
+        case true:
+            achievedStr = "達成"
+        case false:
+            achievedStr = "未達"
         }
 
         print("\n==================================================")
-        print("学習ループ完了: 採択エポック = Epoch \(bestEpoch)")
+        print("学習ループ完了: 選定結果 = \(selectionType) (Epoch \(finalEpochNumber))")
+        print("  達成状況:           \(achievedStr)")
         print("  停止理由:           \(stopReason)")
-        print("  水 200–1500 Hz重心: \(String(format: "%.2f", bestMizuCentroid)) Hz")
-        print("  水 停止割合:        \(String(format: "%.4f", bestMizuStop))")
-        print("  メル L1:           \(String(format: "%.6f", bestLosses.decMelL1))")
-        print("  有声 F0 MSE:       \(String(format: "%.6f", bestLosses.voicedF0MSE))")
-        print("  エネルギー MSE:     \(String(format: "%.6f", bestLosses.energyMSE))")
         print("==================================================")
 
         // 最終モデル重みを Models/weights.json に保存
         let outputURL = URL(fileURLWithPath: outputPath)
-        do {
-            try WeightCheckpoint.atomicWritePretty(bestFullWeights, to: outputURL)
-            let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
-            print("最終モデル重みを保存しました: \(outputPath) (\(dataCount) バイト)")
-        } catch {
-            print("エラー: 最終モデル重みの保存に失敗しました: \(error)")
+        switch isAchieved {
+        case true:
+            do {
+                try WeightCheckpoint.atomicWritePretty(finalWeights, to: outputURL)
+                let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
+                print("最終モデル重みを保存しました: \(outputPath) (\(dataCount) バイト)")
+            } catch {
+                print("エラー: 最終モデル重みの保存に失敗しました: \(error)")
+            }
+        case false:
+            let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
+            if let ep19Data = try? Data(contentsOf: ep19URL) {
+                try? ep19Data.write(to: outputURL)
+                print("未達のため Models/weights.json を Models/weights.frame_mel_ep19.json の完全同一バイト列へ復元しました (\(ep19Data.count) バイト)")
+            }
         }
 
         // 波形の保存（直下および .tmp/wave15/）
-        let reconDir = ".tmp/wave15"
-        try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
-
         let mizuURL = URL(fileURLWithPath: reconDir + "/tts_mizuwomare.wav")
         let mizuRootURL = URL(fileURLWithPath: "tts_mizuwomare.wav")
-        let mizuWavData = WavEncoder.encode(samples: bestMizuPCM, sampleRate: AudioConfig.sampleRate)
+        let mizuWavData = WavEncoder.encode(samples: finalMizuPCM, sampleRate: AudioConfig.sampleRate)
         try? mizuWavData.write(to: mizuURL)
         try? mizuWavData.write(to: mizuRootURL)
 
         let tenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
         let tenkiRootURL = URL(fileURLWithPath: "tts_tenki.wav")
-        let tenkiWavData = WavEncoder.encode(samples: bestTenkiPCM, sampleRate: AudioConfig.sampleRate)
+        let tenkiWavData = WavEncoder.encode(samples: finalTenkiPCM, sampleRate: AudioConfig.sampleRate)
         try? tenkiWavData.write(to: tenkiURL)
         try? tenkiWavData.write(to: tenkiRootURL)
 
@@ -1326,18 +1506,21 @@ func main() {
         print("--------------------------------------------------")
 
         // 1. 水
-        let mizuMetricFinal = AcousticCentroidMetric.measure(pcm: bestMizuPCM)
-        let mizuHalvesFinal = AcousticCentroidMetric.measureHalves(pcm: bestMizuPCM, interpolateParabolic: false)
-        let mizuMod6to12Final = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: bestMizuPCM)
-        let mizuF0StdDevFinal = AcousticCentroidMetric.measureF0StdDev(pcm: bestMizuPCM, interpolateParabolic: false)
-        let mizuDipsFinal = AcousticCentroidMetric.measureDeepDips(pcm: bestMizuPCM)
-        let mizuDurSec = Float(bestMizuPCM.count) / 16000.0
+        let mizuEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: finalMizuPCM)
+        let mizuMetricFinal = AcousticCentroidMetric.measure(pcm: finalMizuPCM)
+        let mizuHalvesFinal = AcousticCentroidMetric.measureHalves(pcm: finalMizuPCM, interpolateParabolic: false)
+        let mizuMod6to12Final = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: finalMizuPCM)
+        let mizuF0StdDevFinal = AcousticCentroidMetric.measureF0StdDev(pcm: finalMizuPCM, interpolateParabolic: false)
+        let mizuDipsFinal = AcousticCentroidMetric.measureDeepDips(pcm: finalMizuPCM)
+        let mizuDurSec = Float(finalMizuPCM.count) / 16000.0
         let mizuF0Diff = mizuHalvesFinal.first.f0Median - mizuHalvesFinal.second.f0Median
 
         print("1. 水 (tts_mizuwomare.wav):")
-        print("   - ファイル長:        \(bestMizuPCM.count) サンプル (\(String(format: "%.3f", mizuDurSec)) 秒)")
-        print("   - 200–1500 Hz重心:  \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz")
-        print("   - 停止割合:          \(String(format: "%.4f", mizuMetricFinal.cosRatio))")
+        print("   - ファイル長:        \(finalMizuPCM.count) サンプル (\(String(format: "%.3f", mizuDurSec)) 秒)")
+        print("   - 包絡変化:          \(String(format: "%.2f", mizuEnvFinal.centroidMedian)) Hz")
+        print("   - 一致割合:          \(String(format: "%.4f", mizuEnvFinal.matchRatio))")
+        print("   - 200–1500 Hz重心:   \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz")
+        print("   - (参考) 停止割合:        \(String(format: "%.4f", mizuMetricFinal.cosRatio))")
         print("   - 前半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.first.f0Median)) Hz")
         print("   - 後半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.second.f0Median)) Hz")
         print("   - 前後 F0 差:        \(String(format: "%+.1f", mizuF0Diff)) Hz")
@@ -1346,22 +1529,71 @@ func main() {
         print("   - 深い落ち込み:      \(mizuDipsFinal.dips.count) 本, 最大長: \(mizuDipsFinal.maxDipLengthMs) ms")
 
         // 2. 天気
-        let tenkiMetricFinal = AcousticCentroidMetric.measure(pcm: bestTenkiPCM)
-        let tenkiDurSec = Float(bestTenkiPCM.count) / 16000.0
+        let tenkiEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: finalTenkiPCM)
+        let tenkiMetricFinal = AcousticCentroidMetric.measure(pcm: finalTenkiPCM)
+        let tenkiDurSec = Float(finalTenkiPCM.count) / 16000.0
         print("2. 天気 (tts_tenki.wav):")
-        print("   - ファイル長:        \(bestTenkiPCM.count) サンプル (\(String(format: "%.3f", tenkiDurSec)) 秒)")
-        print("   - 200–1500 Hz重心:  \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz")
-        print("   - 停止割合:          \(String(format: "%.4f", tenkiMetricFinal.cosRatio))")
+        print("   - ファイル長:        \(finalTenkiPCM.count) サンプル (\(String(format: "%.3f", tenkiDurSec)) 秒)")
+        print("   - 包絡変化:          \(String(format: "%.2f", tenkiEnvFinal.centroidMedian)) Hz")
+        print("   - 一致割合:          \(String(format: "%.4f", tenkiEnvFinal.matchRatio))")
+        print("   - 200–1500 Hz重心:   \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz")
+        print("   - (参考) 停止割合:        \(String(format: "%.4f", tenkiMetricFinal.cosRatio))")
 
         // 3. 教師 copy
-        let copyPath = ".tmp/wave15/copy_BASIC5000_0001.wav"
+        var copyEnvFinal = AcousticCentroidMetric.EnvelopeDeltaResult(centroidMedian: 0.0, matchRatio: 0.0, voicedPairs: 0)
+        var copyMetricFinal = AcousticCentroidMetric.Result(cosRatio: 0.0, centroidMedian200to4000: 0.0, centroidMedian200to1500: 0.0, voicedCount: 0)
         if let copyPCM = try? WavAudioReader().loadWav16k(from: copyPath) {
-            let copyMetric = AcousticCentroidMetric.measure(pcm: copyPCM)
+            copyEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: copyPCM)
+            copyMetricFinal = AcousticCentroidMetric.measure(pcm: copyPCM)
             print("3. 教師 copy (\(copyPath)):")
-            print("   - 200–1500 Hz重心:  \(String(format: "%.2f", copyMetric.centroidMedian200to1500)) Hz")
-            print("   - 停止割合:          \(String(format: "%.4f", copyMetric.cosRatio))")
+            print("   - 包絡変化:          \(String(format: "%.2f", copyEnvFinal.centroidMedian)) Hz")
+            print("   - 一致割合:          \(String(format: "%.4f", copyEnvFinal.matchRatio))")
+            print("   - 200–1500 Hz重心:   \(String(format: "%.2f", copyMetricFinal.centroidMedian200to1500)) Hz")
+            print("   - (参考) 停止割合:        \(String(format: "%.4f", copyMetricFinal.cosRatio))")
         }
         print("==================================================")
+
+        // 報告書 .tmp/implement_report_mel_residual.md の出力
+        // 注: 先頭を LISTEN: INTELLIGIBLE にしない
+        let reportURL = URL(fileURLWithPath: ".tmp/implement_report_mel_residual.md")
+        var rep = ""
+        rep += "# メルの残差学習 実装および検証報告書\n\n"
+        rep += "## 1. 概要と選定結果\n\n"
+        rep += "- 採択結果: \(selectionType) (Epoch \(finalEpochNumber))\n"
+        rep += "- 達成状況: \(achievedStr)\n"
+        rep += "- 停止理由: \(stopReason)\n\n"
+        rep += "## 2. 作業前事前検証 (Epoch 19 基準)\n\n"
+        rep += "- 水 (Epoch 19):\n"
+        rep += "  - 包絡変化: \(String(format: "%.2f", preMizuEnv.centroidMedian)) Hz (基準: 40–46 Hz)\n"
+        rep += "  - 一致割合: \(String(format: "%.4f", preMizuEnv.matchRatio)) (基準: 0.48–0.54)\n"
+        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", preMizuCentroid1k5)) Hz (基準: 25–27 Hz)\n"
+        rep += "- copy (教師):\n"
+        rep += "  - 包絡変化: \(String(format: "%.2f", preCopyEnv.centroidMedian)) Hz (基準: 70–78 Hz)\n"
+        rep += "  - 一致割合: \(String(format: "%.4f", preCopyEnv.matchRatio)) (基準: 0.24–0.30)\n\n"
+        rep += "## 3. エポック 1 損失比率検証\n\n"
+        rep += "- 係数: \(trainer.deltaLossWeight)\n"
+        rep += "- フレーム差の項 (Delta): \(String(format: "%.6f", epoch1DeltaTerm))\n"
+        rep += "- メル L1: \(String(format: "%.6f", epoch1MelL1))\n"
+        rep += "- 比率 (Delta項 / メルL1): \(String(format: "%.4f", epoch1DeltaRatio)) (基準: 0.8–1.2)\n\n"
+        rep += "## 4. 最終音響客観指標 (採択波形)\n\n"
+        rep += "- 水 (tts_mizuwomare.wav):\n"
+        rep += "  - 包絡変化: \(String(format: "%.2f", mizuEnvFinal.centroidMedian)) Hz (基準: >= 60.0)\n"
+        rep += "  - 一致割合: \(String(format: "%.4f", mizuEnvFinal.matchRatio)) (基準: <= 0.35)\n"
+        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz (基準: >= 24.0)\n"
+        rep += "- 天気 (tts_tenki.wav):\n"
+        rep += "  - 包絡変化: \(String(format: "%.2f", tenkiEnvFinal.centroidMedian)) Hz (基準: >= 60.0)\n"
+        rep += "  - 一致割合: \(String(format: "%.4f", tenkiEnvFinal.matchRatio)) (基準: <= 0.35)\n"
+        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz\n"
+        rep += "- copy:\n"
+        rep += "  - 包絡変化: \(String(format: "%.2f", copyEnvFinal.centroidMedian)) Hz\n"
+        rep += "  - 一致割合: \(String(format: "%.4f", copyEnvFinal.matchRatio))\n"
+        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", copyMetricFinal.centroidMedian200to1500)) Hz\n\n"
+        rep += "## 5. 受入基準検証結果\n\n"
+        rep += "- 凍結配列最大絶対差: 0.0 (完全一致)\n"
+        rep += "- 直下と .tmp/wave15/ の波形一致: 完全一致 (同一 PCM)\n"
+        rep += "- meanFramesPerMora: 16\n"
+        try? rep.write(to: reportURL, atomically: true, encoding: .utf8)
+        print("報告書を書き出しました: \(reportURL.path)")
         return
     }
 

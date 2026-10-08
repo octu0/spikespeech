@@ -41,10 +41,14 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
     public var postConv3: Conv1d
     public var postConv4: Conv1d
 
-    public override init() {
+    // 5. メル残差 (Mel Residual: 2層時間畳み込み)
+    public var melResidual: MLXMelResidual?
+
+    public init(decoderKernel: Int) {
         let hiddenDim = 256
         let melDim = 64
         let vocabSize = 64
+        let decPad = decoderKernel / 2
 
         // エンコーダ
         self.embedCur = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
@@ -70,10 +74,10 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
 
         // デコーダ
         self.decIn = Conv1d(inputChannels: 260, outputChannels: hiddenDim, kernelSize: 1, stride: 1, padding: 0)
-        self.decConv0 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
-        self.decConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
-        self.decConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
-        self.decConv3 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
+        self.decConv0 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: decoderKernel, stride: 1, padding: decPad)
+        self.decConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: decoderKernel, stride: 1, padding: decPad)
+        self.decConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: decoderKernel, stride: 1, padding: decPad)
+        self.decConv3 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: decoderKernel, stride: 1, padding: decPad)
         self.decOut = Conv1d(inputChannels: hiddenDim, outputChannels: melDim, kernelSize: 1, stride: 1, padding: 0)
 
         // PostNet
@@ -86,8 +90,13 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         super.init()
     }
 
+    public override convenience init() {
+        self.init(decoderKernel: 17)
+    }
+
     public convenience init(weights: FrameMelWeights) {
-        self.init()
+        let k = weights.decWConv[0].count / (256 * 256)
+        self.init(decoderKernel: k)
         self.importWeights(from: weights)
     }
 
@@ -128,11 +137,20 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         updateConv(energyConv1, w: weights.energyW1, b: weights.energyB1, inC: 257, outC: 128, k: 5)
         updateConv(energyConv2, w: weights.energyW2, b: weights.energyB2, inC: 128, outC: 1, k: 1)
 
+        let decK = weights.decWConv[0].count / (256 * 256)
+        let decPad = decK / 2
+        if decConv0.weight.shape[1] != decK {
+            decConv0 = Conv1d(inputChannels: 256, outputChannels: 256, kernelSize: decK, stride: 1, padding: decPad)
+            decConv1 = Conv1d(inputChannels: 256, outputChannels: 256, kernelSize: decK, stride: 1, padding: decPad)
+            decConv2 = Conv1d(inputChannels: 256, outputChannels: 256, kernelSize: decK, stride: 1, padding: decPad)
+            decConv3 = Conv1d(inputChannels: 256, outputChannels: 256, kernelSize: decK, stride: 1, padding: decPad)
+        }
+
         updateConv(decIn, w: weights.decWIn, b: weights.decBIn, inC: 260, outC: 256, k: 1)
-        updateConv(decConv0, w: weights.decWConv[0], b: weights.decBConv[0], inC: 256, outC: 256, k: 17)
-        updateConv(decConv1, w: weights.decWConv[1], b: weights.decBConv[1], inC: 256, outC: 256, k: 17)
-        updateConv(decConv2, w: weights.decWConv[2], b: weights.decBConv[2], inC: 256, outC: 256, k: 17)
-        updateConv(decConv3, w: weights.decWConv[3], b: weights.decBConv[3], inC: 256, outC: 256, k: 17)
+        updateConv(decConv0, w: weights.decWConv[0], b: weights.decBConv[0], inC: 256, outC: 256, k: decK)
+        updateConv(decConv1, w: weights.decWConv[1], b: weights.decBConv[1], inC: 256, outC: 256, k: decK)
+        updateConv(decConv2, w: weights.decWConv[2], b: weights.decBConv[2], inC: 256, outC: 256, k: decK)
+        updateConv(decConv3, w: weights.decWConv[3], b: weights.decBConv[3], inC: 256, outC: 256, k: decK)
         updateConv(decOut, w: weights.decWOut, b: weights.decBOut, inC: 256, outC: 64, k: 1)
 
         updateConv(postConv0, w: weights.postWConv[0], b: weights.postBConv[0], inC: 64, outC: 256, k: 5)
@@ -140,6 +158,13 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         updateConv(postConv2, w: weights.postWConv[2], b: weights.postBConv[2], inC: 256, outC: 256, k: 5)
         updateConv(postConv3, w: weights.postWConv[3], b: weights.postBConv[3], inC: 256, outC: 256, k: 5)
         updateConv(postConv4, w: weights.postWConv[4], b: weights.postBConv[4], inC: 256, outC: 64, k: 5)
+
+        switch (weights.resW1, weights.resB1, weights.resW2, weights.resB2) {
+        case (.some(let w1), .some(let b1), .some(let w2), .some(let b2)):
+            self.melResidual = MLXMelResidual(w1: w1, b1: b1, w2: w2, b2: b2)
+        default:
+            self.melResidual = nil
+        }
 
         eval(trainableParameters())
     }
@@ -189,6 +214,21 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         let pc3 = getConv(postConv3)
         let pc4 = getConv(postConv4)
 
+        let (rw1, rb1, rw2, rb2): ([Float]?, [Float]?, [Float]?, [Float]?)
+        switch melResidual {
+        case .some(let res):
+            let exp = res.exportWeights()
+            rw1 = exp.w1
+            rb1 = exp.b1
+            rw2 = exp.w2
+            rb2 = exp.b2
+        case .none:
+            rw1 = nil
+            rb1 = nil
+            rw2 = nil
+            rb2 = nil
+        }
+
         return FrameMelWeights(
             embedCur: getArr(embedCur.weight),
             embedPrev: getArr(embedPrev.weight),
@@ -215,7 +255,11 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
             decWOut: dOut.w,
             decBOut: dOut.b,
             postWConv: [pc0.w, pc1.w, pc2.w, pc3.w, pc4.w],
-            postBConv: [pc0.b, pc1.b, pc2.b, pc3.b, pc4.b]
+            postBConv: [pc0.b, pc1.b, pc2.b, pc3.b, pc4.b],
+            resW1: rw1,
+            resB1: rb1,
+            resW2: rw2,
+            resB2: rb2
         )
     }
 
@@ -277,6 +321,74 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
 
         let postMel = decMel + residual
         return (decMel: decMel, postMel: postMel)
+    }
+
+    /// メル残差順伝播（残差モジュールが存在する場合のみ）
+    public func forwardResidual(condition: MLXArray) -> MLXArray? {
+        return melResidual?.forward(condition: condition)
+    }
+}
+
+/// フォルマント残差予測モデル（2層時間畳み込み MLX 実装）
+///
+/// 設計仕様（design_mel_residual.md）:
+/// 残差は 2 層。入力はデコーダと同じ 260 次元。
+/// 1 層目はカーネル 3、padding 1、260 から 256、Leaky ReLU。初期化スケールは sqrt(2 / (3 * 260))。
+/// 2 層目はカーネル 1、padding 0、256 から 64 で、重みとバイアスはすべて 0 で始める。
+public final class MLXMelResidual: Module, @unchecked Sendable {
+    public var resConv1: Conv1d
+    public var resConv2: Conv1d
+
+    public override init() {
+        let inDim = 260
+        let hiddenDim = 256
+        let melDim = 64
+        self.resConv1 = Conv1d(inputChannels: inDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+        self.resConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: melDim, kernelSize: 1, stride: 1, padding: 0)
+        super.init()
+        self.initWeights()
+    }
+
+    public init(w1: [Float], b1: [Float], w2: [Float], b2: [Float]) {
+        let inDim = 260
+        let hiddenDim = 256
+        let melDim = 64
+        self.resConv1 = Conv1d(inputChannels: inDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+        self.resConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: melDim, kernelSize: 1, stride: 1, padding: 0)
+        super.init()
+        self.importWeights(w1: w1, b1: b1, w2: w2, b2: b2)
+    }
+
+    public func initWeights(seed: UInt64 = 2026) {
+        let initW = FrameMelWeights.makeInitialResidualWeights(seed: seed)
+        self.importWeights(w1: initW.resW1, b1: initW.resB1, w2: initW.resW2, b2: initW.resB2)
+    }
+
+    public func importWeights(w1: [Float], b1: [Float], w2: [Float], b2: [Float]) {
+        var p1 = ModuleParameters()
+        p1[unwrapping: "weight"] = MLXArray(w1, [256, 3, 260])
+        p1[unwrapping: "bias"] = MLXArray(b1, [256])
+        self.resConv1.update(parameters: p1)
+
+        var p2 = ModuleParameters()
+        p2[unwrapping: "weight"] = MLXArray(w2, [64, 1, 256])
+        p2[unwrapping: "bias"] = MLXArray(b2, [64])
+        self.resConv2.update(parameters: p2)
+    }
+
+    public func exportWeights() -> (w1: [Float], b1: [Float], w2: [Float], b2: [Float]) {
+        let w1 = self.resConv1.weight.asArray(Float.self)
+        let b1 = self.resConv1.bias?.asArray(Float.self) ?? [Float](repeating: 0.0, count: 256)
+        let w2 = self.resConv2.weight.asArray(Float.self)
+        let b2 = self.resConv2.bias?.asArray(Float.self) ?? [Float](repeating: 0.0, count: 64)
+        return (w1, b1, w2, b2)
+    }
+
+    public func forward(condition: MLXArray) -> MLXArray {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        let h = lrelu(resConv1(condition))
+        let res = resConv2(h)
+        return res
     }
 }
 #endif

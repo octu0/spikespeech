@@ -485,12 +485,14 @@ public final class FrameMelModel: @unchecked Sendable {
             }
         }
 
-        // 4層の前後 8 フレーム (kernel 17, padding 8) 時間畳み込み
+        // 4層の時間畳み込み (kernel 17, padding 8 または kernel 5, padding 2)
         var layerBuf = [Float](repeating: 0.0, count: totalFrames * hiddenDim)
         var l = 0
         while l < 4 {
             let wConv = weights.decWConv[l]
             let bConv = weights.decBConv[l]
+            let decKernel = wConv.count / (hiddenDim * hiddenDim)
+            let decPad = decKernel / 2
             hStates.withUnsafeBufferPointer { pIn in
                 layerBuf.withUnsafeMutableBufferPointer { pOut in
                     wConv.withUnsafeBufferPointer { pW in
@@ -501,8 +503,8 @@ public final class FrameMelModel: @unchecked Sendable {
                                 T: totalFrames,
                                 inC: hiddenDim,
                                 outC: hiddenDim,
-                                kernel: 17,
-                                padding: 8,
+                                kernel: decKernel,
+                                padding: decPad,
                                 weights: pW.baseAddress!,
                                 bias: pB.baseAddress!,
                                 activation: .leakyRelu
@@ -819,7 +821,22 @@ public final class FrameMelModel: @unchecked Sendable {
         }
 
         // 7. デコーダ推論 + PostNet
-        let (_, postMel) = decodeMel(decoderCondition: decCondition, totalFrames: totalFrames)
+        let (_, basePostMel) = decodeMel(decoderCondition: decCondition, totalFrames: totalFrames)
+
+        // 7.1 残差加算 (残差重みがある場合)
+        var finalPostMel = basePostMel
+        if let resFlat = computeMelResidual(condition: decCondition, totalFrames: totalFrames) {
+            var t = 0
+            while t < totalFrames {
+                let row = t * 64
+                var c = 0
+                while c < 64 {
+                    finalPostMel[t][c] = basePostMel[t][c] + resFlat[row + c]
+                    c += 1
+                }
+                t += 1
+            }
+        }
 
         // 8. ボコーダ用 F0 (Hz) の復元
         var f0Hz = [Float](repeating: 0.0, count: totalFrames)
@@ -834,6 +851,67 @@ public final class FrameMelModel: @unchecked Sendable {
             t += 1
         }
 
-        return (mel: postMel, f0Contour: f0Hz, voicedFlags: voicedFlags, energyContour: predEnergy, durations: finalDurs.map { Int32($0) })
+        return (mel: finalPostMel, f0Contour: f0Hz, voicedFlags: voicedFlags, energyContour: predEnergy, durations: finalDurs.map { Int32($0) })
+    }
+
+    /// 2層時間畳み込みによるメル残差の計算（Pure Swift 実装）
+    /// 入力: decoderCondition [totalFrames * 260]
+    /// 出力: flatResidual [totalFrames * 64]
+    public func computeMelResidual(condition: [Float], totalFrames: Int) -> [Float]? {
+        let inDim = 260
+        let hiddenDim = 256
+        let melDim = 64
+        switch (weights.resW1, weights.resB1, weights.resW2, weights.resB2) {
+        case (.some(let w1), .some(let b1), .some(let w2), .some(let b2)):
+            if w1.count != (hiddenDim * 3 * inDim) || b1.count != hiddenDim || w2.count != (melDim * 1 * hiddenDim) || b2.count != melDim {
+                return nil
+            }
+            var hBuf = [Float](repeating: 0.0, count: totalFrames * hiddenDim)
+            condition.withUnsafeBufferPointer { pIn in
+                hBuf.withUnsafeMutableBufferPointer { pOut in
+                    w1.withUnsafeBufferPointer { pW in
+                        b1.withUnsafeBufferPointer { pB in
+                            Self.conv1d(
+                                input: pIn.baseAddress!,
+                                output: pOut.baseAddress!,
+                                T: totalFrames,
+                                inC: inDim,
+                                outC: hiddenDim,
+                                kernel: 3,
+                                padding: 1,
+                                weights: pW.baseAddress!,
+                                bias: pB.baseAddress!,
+                                activation: .leakyRelu
+                            )
+                        }
+                    }
+                }
+            }
+
+            var outBuf = [Float](repeating: 0.0, count: totalFrames * melDim)
+            hBuf.withUnsafeBufferPointer { pIn in
+                outBuf.withUnsafeMutableBufferPointer { pOut in
+                    w2.withUnsafeBufferPointer { pW in
+                        b2.withUnsafeBufferPointer { pB in
+                            Self.conv1d(
+                                input: pIn.baseAddress!,
+                                output: pOut.baseAddress!,
+                                T: totalFrames,
+                                inC: hiddenDim,
+                                outC: melDim,
+                                kernel: 1,
+                                padding: 0,
+                                weights: pW.baseAddress!,
+                                bias: pB.baseAddress!,
+                                activation: .none
+                            )
+                        }
+                    }
+                }
+            }
+            return outBuf
+        default:
+            return nil
+        }
     }
 }

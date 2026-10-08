@@ -44,6 +44,12 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
     public let postWConv: [[Float]]    // 5 layers
     public let postBConv: [[Float]]    // 5 layers
 
+    // 5. メル残差 (Mel Residual: 2層 1D 畳み込み)
+    public let resW1: [Float]?         // [256 * 3 * 260]
+    public let resB1: [Float]?         // [256]
+    public let resW2: [Float]?         // [64 * 1 * 256]
+    public let resB2: [Float]?         // [64]
+
     public init(
         embedCur: [Float],
         embedPrev: [Float],
@@ -70,7 +76,11 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
         decWOut: [Float],
         decBOut: [Float],
         postWConv: [[Float]],
-        postBConv: [[Float]]
+        postBConv: [[Float]],
+        resW1: [Float]? = nil,
+        resB1: [Float]? = nil,
+        resW2: [Float]? = nil,
+        resB2: [Float]? = nil
     ) {
         self.embedCur = embedCur
         self.embedPrev = embedPrev
@@ -98,6 +108,92 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
         self.decBOut = decBOut
         self.postWConv = postWConv
         self.postBConv = postBConv
+        self.resW1 = resW1
+        self.resB1 = resB1
+        self.resW2 = resW2
+        self.resB2 = resB2
+    }
+
+    /// 残差重みを追加・更新した新しいインスタンスを生成
+    public func withMelResidual(
+        resW1: [Float]?,
+        resB1: [Float]?,
+        resW2: [Float]?,
+        resB2: [Float]?
+    ) -> FrameMelWeights {
+        return FrameMelWeights(
+            embedCur: self.embedCur,
+            embedPrev: self.embedPrev,
+            embedNext: self.embedNext,
+            encBIn: self.encBIn,
+            encWConv: self.encWConv,
+            encBConv: self.encBConv,
+            durW1: self.durW1,
+            durB1: self.durB1,
+            durW2: self.durW2,
+            durB2: self.durB2,
+            f0W1: self.f0W1,
+            f0B1: self.f0B1,
+            f0W2: self.f0W2,
+            f0B2: self.f0B2,
+            energyW1: self.energyW1,
+            energyB1: self.energyB1,
+            energyW2: self.energyW2,
+            energyB2: self.energyB2,
+            decWIn: self.decWIn,
+            decBIn: self.decBIn,
+            decWConv: self.decWConv,
+            decBConv: self.decBConv,
+            decWOut: self.decWOut,
+            decBOut: self.decBOut,
+            postWConv: self.postWConv,
+            postBConv: self.postBConv,
+            resW1: resW1,
+            resB1: resB1,
+            resW2: resW2,
+            resB2: resB2
+        )
+    }
+
+    /// 残差重みを破棄しエポック 19 と同一キー構成へ戻す
+    public func withoutMelResidual() -> FrameMelWeights {
+        return withMelResidual(resW1: nil, resB1: nil, resW2: nil, resB2: nil)
+    }
+
+    /// 設計仕様に基づく残差パラメータの初期化
+    /// - 1 層目: 入力 260, 出力 256, カーネル 3. 初期化スケール sqrt(2 / (3 * 260))
+    /// - 2 層目: 入力 256, 出力 64, カーネル 1. 重み・バイアスともに 0
+    public static func makeInitialResidualWeights(
+        seed: UInt64 = 2026
+    ) -> (resW1: [Float], resB1: [Float], resW2: [Float], resB2: [Float]) {
+        var rngState = seed
+        func nextUniform(scale: Float) -> Float {
+            rngState ^= rngState << 13
+            rngState ^= rngState >> 7
+            rngState ^= rngState << 17
+            let u01 = Float(rngState & 0x00FFFFFF) / Float(0x01000000)
+            return (u01 * 2.0 - 1.0) * scale
+        }
+
+        let inDim = 260
+        let hiddenDim = 256
+        let melDim = 64
+        let kernel1 = 3
+
+        let scale1 = sqrtf(2.0 / Float(kernel1 * inDim))
+        let count1 = hiddenDim * kernel1 * inDim
+        var w1 = [Float](repeating: 0.0, count: count1)
+        var i = 0
+        while i < count1 {
+            w1[i] = nextUniform(scale: scale1)
+            i += 1
+        }
+        let b1 = [Float](repeating: 0.0, count: hiddenDim)
+
+        let w2 = [Float](repeating: 0.0, count: melDim * 1 * hiddenDim)
+        let b2 = [Float](repeating: 0.0, count: melDim)
+
+        return (resW1: w1, resB1: b1, resW2: w2, resB2: b2)
     }
 
     /// 決定論的疑似乱数による初期化重みの生成

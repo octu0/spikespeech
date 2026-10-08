@@ -27,6 +27,197 @@ public enum AcousticCentroidMetric {
         }
     }
 
+    public struct EnvelopeDeltaResult: Sendable {
+        public let centroidMedian: Float
+        public let matchRatio: Float
+        public let voicedPairs: Int
+
+        public init(
+            centroidMedian: Float,
+            matchRatio: Float,
+            voicedPairs: Int
+        ) {
+            self.centroidMedian = centroidMedian
+            self.matchRatio = matchRatio
+            self.voicedPairs = voicedPairs
+        }
+    }
+
+    /// フォルマント包絡のフレーム差および一致割合の計測
+    ///
+    /// 設計仕様（design_envelope_delta.md）に準拠:
+    /// 波形は 16 kHz、int16 を浮動小数へ読む。窓 512、ホップ 160。Hann は 0.5 * (1 - cos(2πi / 512))。
+    /// フレーム数は (サンプル数 - 512) / 160 の整数。
+    /// 各フレームで窓を掛けた 512 点の実数 FFT の振幅を取り、対数を取って逆 FFT でケプストラムにする。
+    /// 先頭 24 点と末尾の対称 23 点だけを残して他を 0 にする。FFT で戻し、実部の指数を包絡とする。
+    /// 300 Hz 以上 3500 Hz 以下のビンだけで包絡の重心を取る。隣り合うフレームの重心の絶対差が包絡変化。
+    /// 有声は、窓を掛ける前のフレーム平均振幅が、ファイル内の 55 パーセンタイルを超えるフレーム。
+    /// 有声どうしの対だけで中央値を取る。中央値はソートした配列の 個数 / 2 番目。
+    /// 一致割合は、同じ有声の対で、300–3500 Hz の包絡ベクトルの余弦が 0.99 を超える割合。
+    public static func measureEnvelopeDelta(pcm: [Float]) -> EnvelopeDeltaResult {
+        let winSize = 512
+        let hopSize = 160
+        if pcm.count < winSize {
+            return EnvelopeDeltaResult(centroidMedian: 0.0, matchRatio: 0.0, voicedPairs: 0)
+        }
+        let frameCount = (pcm.count - winSize) / hopSize
+        if frameCount <= 0 {
+            return EnvelopeDeltaResult(centroidMedian: 0.0, matchRatio: 0.0, voicedPairs: 0)
+        }
+
+        var hann = [Float](repeating: 0.0, count: winSize)
+        var n = 0
+        while n < winSize {
+            hann[n] = 0.5 * (1.0 - cosf((2.0 * Float.pi * Float(n)) / Float(winSize)))
+            n += 1
+        }
+
+        let extractor = MelSpectrogramExtractor(
+            sampleRate: 16000.0,
+            melChannels: AudioConfig.melChannels,
+            hopSize: hopSize,
+            frameSize: winSize,
+            fftSize: winSize
+        )
+
+        var frameAmplitudes = [Float](repeating: 0.0, count: frameCount)
+        var frameEnvelopes = [[Float]](repeating: [Float](repeating: 0.0, count: 103), count: frameCount)
+        var frameCentroids = [Float](repeating: 0.0, count: frameCount)
+
+        let binHz: Float = 16000.0 / Float(winSize)
+
+        var f = 0
+        while f < frameCount {
+            let sampleStart = f * hopSize
+            var realBuf = [Float](repeating: 0.0, count: winSize)
+            var imagBuf = [Float](repeating: 0.0, count: winSize)
+
+            var ampSum: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let sampleVal = pcm[sampleStart + s]
+                ampSum += abs(sampleVal)
+                realBuf[s] = sampleVal * hann[s]
+                imagBuf[s] = 0.0
+                s += 1
+            }
+            frameAmplitudes[f] = ampSum / Float(winSize)
+
+            extractor.computeFFT(real: &realBuf, imag: &imagBuf)
+
+            var logMags = [Float](repeating: 0.0, count: winSize)
+            var k = 0
+            while k < winSize {
+                let r = realBuf[k]
+                let im = imagBuf[k]
+                let mag = sqrtf((r * r) + (im * im))
+                let safeMag = max(1e-12, mag)
+                logMags[k] = logf(safeMag)
+                k += 1
+            }
+
+            // 逆 FFT でケプストラムにする: IFFT(X) = (1/N) * conj(FFT(conj(X)))
+            var realCep = logMags
+            var imagCep = [Float](repeating: 0.0, count: winSize)
+            extractor.computeFFT(real: &realCep, imag: &imagCep)
+
+            k = 0
+            while k < winSize {
+                realCep[k] = realCep[k] / Float(winSize)
+                imagCep[k] = -imagCep[k] / Float(winSize)
+                k += 1
+            }
+
+            // 先頭 24 点 (0..<24) と、末尾の対称 23 点 (489..<512) だけを残して他を 0 にする
+            k = 24
+            while k < (winSize - 23) {
+                realCep[k] = 0.0
+                imagCep[k] = 0.0
+                k += 1
+            }
+
+            // FFT で戻し、実部の指数を包絡とする
+            extractor.computeFFT(real: &realCep, imag: &imagCep)
+
+            var num: Float = 0.0
+            var den: Float = 0.0
+            var b = 10
+            while b <= 112 {
+                let freq = Float(b) * binHz
+                let env = expf(realCep[b])
+                frameEnvelopes[f][b - 10] = env
+                num += freq * env
+                den += env
+                b += 1
+            }
+
+            if 1e-12 < den {
+                frameCentroids[f] = num / den
+            }
+            f += 1
+        }
+
+        let sortedAmps = frameAmplitudes.sorted()
+        var p55Idx = Int(Float(frameCount) * 0.55)
+        if frameCount <= p55Idx {
+            p55Idx = frameCount - 1
+        }
+        let threshold55 = sortedAmps[p55Idx]
+
+        var voicedPairs = 0
+        var cosOver99Count = 0
+        var centroidDiffs: [Float] = []
+
+        var t = 1
+        while t < frameCount {
+            let isVoicedCurr = (threshold55 < frameAmplitudes[t])
+            let isVoicedPrev = (threshold55 < frameAmplitudes[t - 1])
+            if isVoicedCurr && isVoicedPrev {
+                voicedPairs += 1
+                centroidDiffs.append(abs(frameCentroids[t] - frameCentroids[t - 1]))
+
+                var dot: Float = 0.0
+                var normA: Float = 0.0
+                var normB: Float = 0.0
+                var i = 0
+                while i < 103 {
+                    let va = frameEnvelopes[t][i]
+                    let vb = frameEnvelopes[t - 1][i]
+                    dot += va * vb
+                    normA += va * va
+                    normB += vb * vb
+                    i += 1
+                }
+                let denom = sqrtf(normA) * sqrtf(normB)
+                var cosSim: Float = 0.0
+                if 1e-12 < denom {
+                    cosSim = dot / denom
+                }
+                if 0.99 < cosSim {
+                    cosOver99Count += 1
+                }
+            }
+            t += 1
+        }
+
+        centroidDiffs.sort()
+        var medDiff: Float = 0.0
+        if centroidDiffs.isEmpty != true {
+            medDiff = centroidDiffs[centroidDiffs.count / 2]
+        }
+
+        var cosRatio: Float = 0.0
+        if 0 < voicedPairs {
+            cosRatio = Float(cosOver99Count) / Float(voicedPairs)
+        }
+
+        return EnvelopeDeltaResult(
+            centroidMedian: medDiff,
+            matchRatio: cosRatio,
+            voicedPairs: voicedPairs
+        )
+    }
+
     public static func measure(pcm: [Float]) -> Result {
         if pcm.isEmpty {
             return Result(cosRatio: 0.0, centroidMedian200to4000: 0.0, centroidMedian200to1500: 0.0, voicedCount: 0)
