@@ -1,0 +1,282 @@
+#if canImport(MLX)
+import Foundation
+import MLX
+import MLXNN
+import MLXOptimizers
+
+/// SpikeVoice (arXiv:2408.00788) に基づくフレーム単位対数メル学習・推論モデル（MLX 実装）
+public final class MLXFrameMelModel: Module, @unchecked Sendable {
+    // 1. 音素エンコーダ
+    public var embedCur: Embedding
+    public var embedPrev: Embedding
+    public var embedNext: Embedding
+    public var encBIn: MLXArray
+    public var encConv0: Conv1d
+    public var encConv1: Conv1d
+    public var encConv2: Conv1d
+    public var encConv3: Conv1d
+
+    // 2. 分散アダプタ (Variance Adaptor)
+    public var durConv1: Conv1d
+    public var durConv2: Conv1d
+
+    public var f0Conv1: Conv1d
+    public var f0Conv2: Conv1d
+
+    public var energyConv1: Conv1d
+    public var energyConv2: Conv1d
+
+    // 3. メルデコーダ (Mel Decoder)
+    public var decIn: Conv1d
+    public var decConv0: Conv1d
+    public var decConv1: Conv1d
+    public var decConv2: Conv1d
+    public var decConv3: Conv1d
+    public var decOut: Conv1d
+
+    // 4. PostNet
+    public var postConv0: Conv1d
+    public var postConv1: Conv1d
+    public var postConv2: Conv1d
+    public var postConv3: Conv1d
+    public var postConv4: Conv1d
+
+    public override init() {
+        let hiddenDim = 256
+        let melDim = 64
+        let vocabSize = 64
+
+        // エンコーダ
+        self.embedCur = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
+        self.embedPrev = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
+        self.embedNext = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
+        self.encBIn = MLXArray.zeros([hiddenDim])
+        self.encConv0 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+        self.encConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+        self.encConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+        self.encConv3 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
+
+        // 継続時間予測器
+        self.durConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: 128, kernelSize: 3, stride: 1, padding: 1)
+        self.durConv2 = Conv1d(inputChannels: 128, outputChannels: 1, kernelSize: 1, stride: 1, padding: 0)
+
+        // F0 予測器
+        self.f0Conv1 = Conv1d(inputChannels: 257, outputChannels: 128, kernelSize: 5, stride: 1, padding: 2)
+        self.f0Conv2 = Conv1d(inputChannels: 128, outputChannels: 1, kernelSize: 1, stride: 1, padding: 0)
+
+        // エネルギー予測器
+        self.energyConv1 = Conv1d(inputChannels: 257, outputChannels: 128, kernelSize: 5, stride: 1, padding: 2)
+        self.energyConv2 = Conv1d(inputChannels: 128, outputChannels: 1, kernelSize: 1, stride: 1, padding: 0)
+
+        // デコーダ
+        self.decIn = Conv1d(inputChannels: 260, outputChannels: hiddenDim, kernelSize: 1, stride: 1, padding: 0)
+        self.decConv0 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
+        self.decConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
+        self.decConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
+        self.decConv3 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 17, stride: 1, padding: 8)
+        self.decOut = Conv1d(inputChannels: hiddenDim, outputChannels: melDim, kernelSize: 1, stride: 1, padding: 0)
+
+        // PostNet
+        self.postConv0 = Conv1d(inputChannels: melDim, outputChannels: hiddenDim, kernelSize: 5, stride: 1, padding: 2)
+        self.postConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 5, stride: 1, padding: 2)
+        self.postConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 5, stride: 1, padding: 2)
+        self.postConv3 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 5, stride: 1, padding: 2)
+        self.postConv4 = Conv1d(inputChannels: hiddenDim, outputChannels: melDim, kernelSize: 5, stride: 1, padding: 2)
+
+        super.init()
+    }
+
+    public convenience init(weights: FrameMelWeights) {
+        self.init()
+        self.importWeights(from: weights)
+    }
+
+    /// 重み構造体からのインポート
+    public func importWeights(from weights: FrameMelWeights) {
+        func updateConv(_ conv: Conv1d, w: [Float], b: [Float], inC: Int, outC: Int, k: Int) {
+            var p = ModuleParameters()
+            p[unwrapping: "weight"] = MLXArray(w, [outC, k, inC])
+            p[unwrapping: "bias"] = MLXArray(b, [outC])
+            conv.update(parameters: p)
+        }
+
+        var pEmbCur = ModuleParameters()
+        pEmbCur[unwrapping: "weight"] = MLXArray(weights.embedCur, [64, 256])
+        embedCur.update(parameters: pEmbCur)
+
+        var pEmbPrev = ModuleParameters()
+        pEmbPrev[unwrapping: "weight"] = MLXArray(weights.embedPrev, [64, 256])
+        embedPrev.update(parameters: pEmbPrev)
+
+        var pEmbNext = ModuleParameters()
+        pEmbNext[unwrapping: "weight"] = MLXArray(weights.embedNext, [64, 256])
+        embedNext.update(parameters: pEmbNext)
+
+        self.encBIn = MLXArray(weights.encBIn, [256])
+
+        updateConv(encConv0, w: weights.encWConv[0], b: weights.encBConv[0], inC: 256, outC: 256, k: 3)
+        updateConv(encConv1, w: weights.encWConv[1], b: weights.encBConv[1], inC: 256, outC: 256, k: 3)
+        updateConv(encConv2, w: weights.encWConv[2], b: weights.encBConv[2], inC: 256, outC: 256, k: 3)
+        updateConv(encConv3, w: weights.encWConv[3], b: weights.encBConv[3], inC: 256, outC: 256, k: 3)
+
+        updateConv(durConv1, w: weights.durW1, b: weights.durB1, inC: 256, outC: 128, k: 3)
+        updateConv(durConv2, w: weights.durW2, b: weights.durB2, inC: 128, outC: 1, k: 1)
+
+        updateConv(f0Conv1, w: weights.f0W1, b: weights.f0B1, inC: 257, outC: 128, k: 5)
+        updateConv(f0Conv2, w: weights.f0W2, b: weights.f0B2, inC: 128, outC: 1, k: 1)
+
+        updateConv(energyConv1, w: weights.energyW1, b: weights.energyB1, inC: 257, outC: 128, k: 5)
+        updateConv(energyConv2, w: weights.energyW2, b: weights.energyB2, inC: 128, outC: 1, k: 1)
+
+        updateConv(decIn, w: weights.decWIn, b: weights.decBIn, inC: 260, outC: 256, k: 1)
+        updateConv(decConv0, w: weights.decWConv[0], b: weights.decBConv[0], inC: 256, outC: 256, k: 17)
+        updateConv(decConv1, w: weights.decWConv[1], b: weights.decBConv[1], inC: 256, outC: 256, k: 17)
+        updateConv(decConv2, w: weights.decWConv[2], b: weights.decBConv[2], inC: 256, outC: 256, k: 17)
+        updateConv(decConv3, w: weights.decWConv[3], b: weights.decBConv[3], inC: 256, outC: 256, k: 17)
+        updateConv(decOut, w: weights.decWOut, b: weights.decBOut, inC: 256, outC: 64, k: 1)
+
+        updateConv(postConv0, w: weights.postWConv[0], b: weights.postBConv[0], inC: 64, outC: 256, k: 5)
+        updateConv(postConv1, w: weights.postWConv[1], b: weights.postBConv[1], inC: 256, outC: 256, k: 5)
+        updateConv(postConv2, w: weights.postWConv[2], b: weights.postBConv[2], inC: 256, outC: 256, k: 5)
+        updateConv(postConv3, w: weights.postWConv[3], b: weights.postBConv[3], inC: 256, outC: 256, k: 5)
+        updateConv(postConv4, w: weights.postWConv[4], b: weights.postBConv[4], inC: 256, outC: 64, k: 5)
+
+        eval(trainableParameters())
+    }
+
+    /// 純粋重み構造体へのエクスポート
+    public func exportWeights() -> FrameMelWeights {
+        func getArr(_ arr: MLXArray) -> [Float] {
+            return arr.asArray(Float.self)
+        }
+
+        func getConv(_ conv: Conv1d) -> (w: [Float], b: [Float]) {
+            let w = conv.weight.asArray(Float.self)
+            let b: [Float]
+            switch conv.bias {
+            case .some(let bArr):
+                b = bArr.asArray(Float.self)
+            case .none:
+                b = [Float](repeating: 0.0, count: conv.weight.shape[0])
+            }
+            return (w, b)
+        }
+
+        let ec0 = getConv(encConv0)
+        let ec1 = getConv(encConv1)
+        let ec2 = getConv(encConv2)
+        let ec3 = getConv(encConv3)
+
+        let d1 = getConv(durConv1)
+        let d2 = getConv(durConv2)
+
+        let f1 = getConv(f0Conv1)
+        let f2 = getConv(f0Conv2)
+
+        let e1 = getConv(energyConv1)
+        let e2 = getConv(energyConv2)
+
+        let di = getConv(decIn)
+        let dc0 = getConv(decConv0)
+        let dc1 = getConv(decConv1)
+        let dc2 = getConv(decConv2)
+        let dc3 = getConv(decConv3)
+        let dOut = getConv(decOut)
+
+        let pc0 = getConv(postConv0)
+        let pc1 = getConv(postConv1)
+        let pc2 = getConv(postConv2)
+        let pc3 = getConv(postConv3)
+        let pc4 = getConv(postConv4)
+
+        return FrameMelWeights(
+            embedCur: getArr(embedCur.weight),
+            embedPrev: getArr(embedPrev.weight),
+            embedNext: getArr(embedNext.weight),
+            encBIn: getArr(encBIn),
+            encWConv: [ec0.w, ec1.w, ec2.w, ec3.w],
+            encBConv: [ec0.b, ec1.b, ec2.b, ec3.b],
+            durW1: d1.w,
+            durB1: d1.b,
+            durW2: d2.w,
+            durB2: d2.b,
+            f0W1: f1.w,
+            f0B1: f1.b,
+            f0W2: f2.w,
+            f0B2: f2.b,
+            energyW1: e1.w,
+            energyB1: e1.b,
+            energyW2: e2.w,
+            energyB2: e2.b,
+            decWIn: di.w,
+            decBIn: di.b,
+            decWConv: [dc0.w, dc1.w, dc2.w, dc3.w],
+            decBConv: [dc0.b, dc1.b, dc2.b, dc3.b],
+            decWOut: dOut.w,
+            decBOut: dOut.b,
+            postWConv: [pc0.w, pc1.w, pc2.w, pc3.w, pc4.w],
+            postBConv: [pc0.b, pc1.b, pc2.b, pc3.b, pc4.b]
+        )
+    }
+
+    /// 音素エンコーダ順伝播: [1, P] -> [1, P, 256]
+    public func forwardEncoder(cur: MLXArray, prev: MLXArray, next: MLXArray) -> MLXArray {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        var h = embedCur(cur) + embedPrev(prev) + embedNext(next) + encBIn.reshaped([1, 1, 256])
+        h = h + lrelu(encConv0(h))
+        h = h + lrelu(encConv1(h))
+        h = h + lrelu(encConv2(h))
+        h = h + lrelu(encConv3(h))
+        return h
+    }
+
+    /// 継続時間予測: [1, P, 256] -> [1, P]
+    public func forwardDuration(encStates: MLXArray) -> MLXArray {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        let h1 = lrelu(durConv1(encStates))
+        let z = durConv2(h1)
+        let zClamped = clip(z, min: -20.0, max: 20.0)
+        let dur = log(1.0 + exp(zClamped)) + 1.0
+        return dur.squeezed(axis: -1)
+    }
+
+    /// F0 予測: [1, T, 257] -> [1, T, 1]
+    public func forwardF0(frameStates: MLXArray, voicedMask: MLXArray) -> MLXArray {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        let h1 = lrelu(f0Conv1(frameStates))
+        let z = f0Conv2(h1)
+        let sig = MLX.sigmoid(z)
+        let masked = sig * voicedMask
+        return masked
+    }
+
+    /// エネルギー予測: [1, T, 257] -> [1, T, 1]
+    public func forwardEnergy(frameStates: MLXArray) -> MLXArray {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        let h1 = lrelu(energyConv1(frameStates))
+        let z = energyConv2(h1)
+        return MLX.sigmoid(z)
+    }
+
+    /// メルデコーダ + PostNet: [1, T, 260] -> (decMel: [1, T, 64], postMel: [1, T, 64])
+    public func forwardDecoder(condition: MLXArray) -> (decMel: MLXArray, postMel: MLXArray) {
+        let lrelu = LeakyReLU(negativeSlope: 0.1)
+        var h = lrelu(decIn(condition))
+        h = h + lrelu(decConv0(h))
+        h = h + lrelu(decConv1(h))
+        h = h + lrelu(decConv2(h))
+        h = h + lrelu(decConv3(h))
+        let decMel = decOut(h)
+
+        // PostNet
+        let p0 = tanh(postConv0(decMel))
+        let p1 = tanh(postConv1(p0))
+        let p2 = tanh(postConv2(p1))
+        let p3 = tanh(postConv3(p2))
+        let residual = postConv4(p3)
+
+        let postMel = decMel + residual
+        return (decMel: decMel, postMel: postMel)
+    }
+}
+#endif

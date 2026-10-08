@@ -553,12 +553,7 @@ final class ProsodyPredictorTests: XCTestCase {
 
             sIdx += 1
         }
-
-        // 最適化された F0 予測器重みを Models/weights.json に永続化保存
-        let updatedWeights = weights.withProsodyWeights(pWeights)
-        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
-        try WeightCheckpoint.atomicWritePretty(updatedWeights, to: weightsURL)
-        print("[Persistence] 最適化された韻律重みを Models/weights.json に保存完了")
+        // バイアス b2 の調整結果はファイルへ保存しない
     }
 
     /// 受入基準 1, 2, 3 の総合検証（Models/weights.json ロード後）

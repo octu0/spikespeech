@@ -209,20 +209,21 @@ public enum AcousticCentroidMetric {
         }
     }
 
-    /// 設計仕様書に準拠した F0 計測:
+    /// 設計仕様書に準拠した F0 系列計測:
     /// 32 ms の Hann 窓、ホップ 320 サンプル、70–350 Hz の自己相関。
-    /// ピークがゼロ遅れの 0.35 倍未満の窓は捨て、残った F0 の中央値を取る。
-    public static func measureF0Median(
+    /// ピークがゼロ遅れの 0.35 倍未満の窓は捨て、残った有声 F0 の配列を返す。
+    public static func measureF0Values(
         pcm: [Float],
-        sampleRate: Float = 16000.0
-    ) -> Float {
+        sampleRate: Float = 16000.0,
+        interpolateParabolic: Bool = false
+    ) -> [Float] {
         if pcm.isEmpty {
-            return 0.0
+            return []
         }
         let winSize = 512
         let hopSize = 320
         if pcm.count < winSize {
-            return 0.0
+            return []
         }
 
         var hann = [Float](repeating: 0.0, count: winSize)
@@ -270,33 +271,35 @@ public enum AcousticCentroidMetric {
 
                 if 0.35 * r0 <= maxR {
                     var f0: Float = sampleRate / Float(bestLag)
-                    if minLag < bestLag && bestLag < maxLag {
-                        var rPrev: Float = 0.0
-                        var rNext: Float = 0.0
-                        var k = 0
-                        let limitPrev = winSize - (bestLag - 1)
-                        while k < limitPrev {
-                            rPrev += winBuf[k] * winBuf[k + bestLag - 1]
-                            k += 1
-                        }
-                        k = 0
-                        let limitNext = winSize - (bestLag + 1)
-                        while k < limitNext {
-                            rNext += winBuf[k] * winBuf[k + bestLag + 1]
-                            k += 1
-                        }
-                        let denom = 2.0 * (2.0 * maxR - rPrev - rNext)
-                        if 1e-6 < denom {
-                            var delta = (rNext - rPrev) / denom
-                            if delta < -0.5 {
-                                delta = -0.5
+                    if interpolateParabolic {
+                        if minLag < bestLag && bestLag < maxLag {
+                            var rPrev: Float = 0.0
+                            var rNext: Float = 0.0
+                            var k = 0
+                            let limitPrev = winSize - (bestLag - 1)
+                            while k < limitPrev {
+                                rPrev += winBuf[k] * winBuf[k + bestLag - 1]
+                                k += 1
                             }
-                            if 0.5 < delta {
-                                delta = 0.5
+                            k = 0
+                            let limitNext = winSize - (bestLag + 1)
+                            while k < limitNext {
+                                rNext += winBuf[k] * winBuf[k + bestLag + 1]
+                                k += 1
                             }
-                            let fineLag = Float(bestLag) + delta
-                            if 0.0 < fineLag {
-                                f0 = sampleRate / fineLag
+                            let denom = 2.0 * (2.0 * maxR - rPrev - rNext)
+                            if 1e-6 < denom {
+                                var delta = (rNext - rPrev) / denom
+                                if delta < -0.5 {
+                                    delta = -0.5
+                                }
+                                if 0.5 < delta {
+                                    delta = 0.5
+                                }
+                                let fineLag = Float(bestLag) + delta
+                                if 0.0 < fineLag {
+                                    f0 = sampleRate / fineLag
+                                }
                             }
                         }
                     }
@@ -305,18 +308,55 @@ public enum AcousticCentroidMetric {
             }
             start += hopSize
         }
+        return validF0s
+    }
 
-        if validF0s.isEmpty {
+    /// 設計仕様書に準拠した F0 中央値計測
+    public static func measureF0Median(
+        pcm: [Float],
+        sampleRate: Float = 16000.0,
+        interpolateParabolic: Bool = false
+    ) -> Float {
+        var vals = measureF0Values(pcm: pcm, sampleRate: sampleRate, interpolateParabolic: interpolateParabolic)
+        if vals.isEmpty {
             return 0.0
         }
-        validF0s.sort()
-        return validF0s[validF0s.count / 2]
+        vals.sort()
+        return vals[vals.count / 2]
+    }
+
+    /// 設計仕様書に準拠した有声 F0 標準偏差計測
+    public static func measureF0StdDev(
+        pcm: [Float],
+        sampleRate: Float = 16000.0,
+        interpolateParabolic: Bool = false
+    ) -> Float {
+        let vals = measureF0Values(pcm: pcm, sampleRate: sampleRate, interpolateParabolic: interpolateParabolic)
+        if vals.isEmpty {
+            return 0.0
+        }
+        var sum: Float = 0.0
+        var i = 0
+        while i < vals.count {
+            sum += vals[i]
+            i += 1
+        }
+        let mean = sum / Float(vals.count)
+        var sumSq: Float = 0.0
+        i = 0
+        while i < vals.count {
+            let diff = vals[i] - mean
+            sumSq += diff * diff
+            i += 1
+        }
+        return sqrtf(sumSq / Float(vals.count))
     }
 
     /// ファイルをサンプル数の半分で前後に分け、前半と後半の停止割合、200–1500 Hz重心、F0中央値を計測する
     public static func measureHalves(
         pcm: [Float],
-        sampleRate: Float = 16000.0
+        sampleRate: Float = 16000.0,
+        interpolateParabolic: Bool = false
     ) -> (first: SegmentAnalysis, second: SegmentAnalysis) {
         if pcm.isEmpty {
             let zero = SegmentAnalysis(cosRatio: 0.0, centroidMedian200to1500: 0.0, f0Median: 0.0, sampleCount: 0)
@@ -327,7 +367,7 @@ public enum AcousticCentroidMetric {
         let secondPCM = Array(pcm[half..<pcm.count])
 
         let firstMetric = measure(pcm: firstPCM)
-        let firstF0 = measureF0Median(pcm: firstPCM, sampleRate: sampleRate)
+        let firstF0 = measureF0Median(pcm: firstPCM, sampleRate: sampleRate, interpolateParabolic: interpolateParabolic)
         let firstSeg = SegmentAnalysis(
             cosRatio: firstMetric.cosRatio,
             centroidMedian200to1500: firstMetric.centroidMedian200to1500,
@@ -336,7 +376,7 @@ public enum AcousticCentroidMetric {
         )
 
         let secondMetric = measure(pcm: secondPCM)
-        let secondF0 = measureF0Median(pcm: secondPCM, sampleRate: sampleRate)
+        let secondF0 = measureF0Median(pcm: secondPCM, sampleRate: sampleRate, interpolateParabolic: interpolateParabolic)
         let secondSeg = SegmentAnalysis(
             cosRatio: secondMetric.cosRatio,
             centroidMedian200to1500: secondMetric.centroidMedian200to1500,
@@ -346,4 +386,263 @@ public enum AcousticCentroidMetric {
 
         return (firstSeg, secondSeg)
     }
+
+    /// 振幅エンベロープの 6–12 Hz 変調割合の計測:
+    /// ホップ 160、窓 320 の RMS。
+    /// ピークの 0.06 倍と 0.010 の大きい方以上のフレームを本体とし、最初の本体フレームから最後の本体フレームまでを使う。
+    /// 本体の平均を引き、Hann を掛け、実数 FFT する。フレーム間隔は 10 ms。
+    /// 6 Hz 以上 12 Hz 未満のパワー和を、2 Hz 以上 25 Hz 未満のパワー和で割る。
+    public static func measureModulation6to12Ratio(pcm: [Float]) -> Float {
+        let winSize = 320
+        let hopSize = 160
+        if pcm.count < winSize {
+            return 0.0
+        }
+        let totalFrames = max(1, (pcm.count - winSize) / hopSize + 1)
+        var frameRms = [Float](repeating: 0.0, count: totalFrames)
+        var maxRms: Float = 0.0
+
+        var f = 0
+        while f < totalFrames {
+            let start = f * hopSize
+            var sumSq: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let v = pcm[start + s]
+                sumSq += v * v
+                s += 1
+            }
+            let rms = sqrtf(sumSq / Float(winSize))
+            frameRms[f] = rms
+            if maxRms < rms {
+                maxRms = rms
+            }
+            f += 1
+        }
+
+        let threshold = max(0.010, maxRms * 0.06)
+        var firstBody = -1
+        var lastBody = -1
+        var sf = 0
+        while sf < totalFrames {
+            if threshold <= frameRms[sf] {
+                if firstBody < 0 {
+                    firstBody = sf
+                }
+                lastBody = sf
+            }
+            sf += 1
+        }
+
+        if firstBody < 0 || lastBody < firstBody {
+            return 0.0
+        }
+
+        let bodyLen = lastBody - firstBody + 1
+        if bodyLen < 4 {
+            return 0.0
+        }
+
+        var sumBody: Float = 0.0
+        var bIdx = 0
+        while bIdx < bodyLen {
+            sumBody += frameRms[firstBody + bIdx]
+            bIdx += 1
+        }
+        let meanBody = sumBody / Float(bodyLen)
+
+        var winBuf = [Float](repeating: 0.0, count: bodyLen)
+        var n = 0
+        while n < bodyLen {
+            let hann = 0.5 * (1.0 - cosf((2.0 * Float.pi * Float(n)) / Float(bodyLen)))
+            winBuf[n] = (frameRms[firstBody + n] - meanBody) * hann
+            n += 1
+        }
+
+        let halfLen = bodyLen / 2
+        var power2to25: Float = 0.0
+        var power6to12: Float = 0.0
+
+        var k = 0
+        while k <= halfLen {
+            let freq = (Float(k) * 100.0) / Float(bodyLen)
+            let in2to25 = (2.0 <= freq && freq < 25.0)
+            let in6to12 = (6.0 <= freq && freq < 12.0)
+            if in2to25 || in6to12 {
+                var realSum: Float = 0.0
+                var imagSum: Float = 0.0
+                var j = 0
+                let angleStep = (2.0 * Float.pi * Float(k)) / Float(bodyLen)
+                while j < bodyLen {
+                    let angle = angleStep * Float(j)
+                    let v = winBuf[j]
+                    realSum += v * cosf(angle)
+                    imagSum -= v * sinf(angle)
+                    j += 1
+                }
+                let power = (realSum * realSum) + (imagSum * imagSum)
+                if in2to25 {
+                    power2to25 += power
+                }
+                if in6to12 {
+                    power6to12 += power
+                }
+            }
+            k += 1
+        }
+
+        var ratio: Float = 0.0
+        if 1e-12 < power2to25 {
+            ratio = power6to12 / power2to25
+        }
+        return ratio
+    }
+
+    /// 発話本体区間における深いエネルギー落ち込み（閉鎖期・無音トラフ）の検出
+    ///
+    /// なぜ 80ms (8フレーム) 以上の落ち込みを計測するか:
+    /// 音声合成において不自然な途切れや息継ぎ様の無音ギャップ（deep dips）の発生頻度と最大長を客観評価するため。
+    public static func measureDeepDips(
+        pcm: [Float]
+    ) -> (dips: [(startSec: Float, lengthMs: Int, avgRms: Float)], maxDipLengthMs: Int) {
+        if pcm.isEmpty {
+            return ([], 0)
+        }
+        let winSize = 320
+        let hopSize = 160
+        if pcm.count < winSize {
+            return ([], 0)
+        }
+        let totalFrames = max(1, (pcm.count - winSize) / hopSize + 1)
+        var frameRms = [Float](repeating: 0.0, count: totalFrames)
+        var maxRms: Float = 0.0
+
+        var f = 0
+        while f < totalFrames {
+            let start = f * hopSize
+            var sumSq: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let pcmIdx = start + s
+                var v: Float = 0.0
+                if pcmIdx < pcm.count {
+                    v = pcm[pcmIdx] * 32768.0
+                }
+                sumSq += v * v
+                s += 1
+            }
+            let rms = sqrtf(sumSq / Float(winSize))
+            frameRms[f] = rms
+            if maxRms < rms {
+                maxRms = rms
+            }
+            f += 1
+        }
+
+        let bodyThreshold = max(0.010 * 32768.0, maxRms * 0.06)
+        var firstBody = -1
+        var lastBody = -1
+        var sf = 0
+        while sf < totalFrames {
+            if bodyThreshold <= frameRms[sf] {
+                if firstBody < 0 {
+                    firstBody = sf
+                }
+                lastBody = sf
+            }
+            sf += 1
+        }
+
+        let dipThreshold = max(0.008 * 32768.0, maxRms * 0.12)
+        var dips: [(startSec: Float, lengthMs: Int, avgRms: Float)] = []
+        var maxDipLen = 0
+
+        if 0 <= firstBody && firstBody <= lastBody {
+            var curStart = -1
+            var curCount = 0
+            var curSumRms: Float = 0.0
+
+            var bf = firstBody
+            while bf <= lastBody {
+                let rmsVal = frameRms[bf]
+                if rmsVal < dipThreshold {
+                    if curStart < 0 {
+                        curStart = bf
+                        curCount = 0
+                        curSumRms = 0.0
+                    }
+                    curCount += 1
+                    curSumRms += rmsVal
+                } else {
+                    if 0 <= curStart {
+                        if 8 <= curCount {
+                            let avg = curSumRms / Float(curCount)
+                            if avg < 800.0 {
+                                let startSec = Float(curStart * hopSize) / 16000.0
+                                let lenMs = curCount * 10
+                                if maxDipLen < lenMs {
+                                    maxDipLen = lenMs
+                                }
+                                dips.append((startSec: startSec, lengthMs: lenMs, avgRms: avg))
+                            }
+                        }
+                        curStart = -1
+                    }
+                }
+                bf += 1
+            }
+            if 0 <= curStart && 8 <= curCount {
+                let avg = curSumRms / Float(curCount)
+                if avg < 800.0 {
+                    let startSec = Float(curStart * hopSize) / 16000.0
+                    let lenMs = curCount * 10
+                    if maxDipLen < lenMs {
+                        maxDipLen = lenMs
+                    }
+                    dips.append((startSec: startSec, lengthMs: lenMs, avgRms: avg))
+                }
+            }
+        }
+
+        return (dips: dips, maxDipLengthMs: maxDipLen)
+    }
+
+    /// 有声区間 F0 標準偏差の計測 (Hz)
+    public static func measureVoicedF0StdDev(
+        pcm: [Float],
+        sampleRate: Float = 16000.0
+    ) -> Float {
+        if pcm.isEmpty {
+            return 0.0
+        }
+        let tracker = PitchTracker(sampleRate: sampleRate)
+        let res = tracker.track(pcm: pcm)
+        var voicedF0s: [Float] = []
+        var i = 0
+        while i < res.frameCount {
+            if 0.5 <= res.voiced[i] && 70.0 <= res.f0[i] {
+                voicedF0s.append(res.f0[i])
+            }
+            i += 1
+        }
+        if voicedF0s.count <= 1 {
+            return 0.0
+        }
+        var sum: Float = 0.0
+        var j = 0
+        while j < voicedF0s.count {
+            sum += voicedF0s[j]
+            j += 1
+        }
+        let mean = sum / Float(voicedF0s.count)
+        var sumSq: Float = 0.0
+        j = 0
+        while j < voicedF0s.count {
+            let diff = voicedF0s[j] - mean
+            sumSq += diff * diff
+            j += 1
+        }
+        return sqrtf(sumSq / Float(voicedF0s.count))
+    }
 }
+

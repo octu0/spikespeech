@@ -16,6 +16,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     public let workspace: AcousticWorkspace
     public let weights: SpikingNetworkWeights
     public let sampleRate: Float
+    public let frameMelModel: FrameMelModel?
 
     /// 初期化
     public init(
@@ -102,6 +103,12 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             outputDim: effectiveWeights.outputDim,
             numLayers: effectiveWeights.numLayers
         )
+        switch effectiveWeights.frameMelWeights {
+        case .some(let fmw):
+            self.frameMelModel = FrameMelModel(weights: fmw)
+        case .none:
+            self.frameMelModel = nil
+        }
     }
 
     /// 言語特徴量から SNN 入力フレーム特徴量系列を生成する。
@@ -247,11 +254,11 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     }
                     seq[frameIdx][195] = clampedDelta * 1.0
                 }
+                var phonePos: Float = 0.0
+                if 1 < duration {
+                    phonePos = Float(f) / Float(duration - 1)
+                }
                 if 196 < inDim {
-                    var phonePos: Float = 0.0
-                    if 1 < duration {
-                        phonePos = Float(f) / Float(duration - 1)
-                    }
                     seq[frameIdx][196] = 3.0 * phonePos
                 }
                 if 197 < inDim {
@@ -276,6 +283,14 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                     seq[frameIdx][199] = pulse * 1.0
                 }
 
+                // 5. 直後音素 ID ごとの音素内進行度・傾き特徴 (ch 200 ..< 240)
+                if 0 <= effectiveNextPid && effectiveNextPid < 40 {
+                    let nextPosCh = 200 + effectiveNextPid
+                    if nextPosCh < inDim {
+                        seq[frameIdx][nextPosCh] = 3.0 * phonePos
+                    }
+                }
+
                 f += 1
             }
 
@@ -290,7 +305,7 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     /// 各フレームが無音・休止・促音・無声破裂音の閉鎖期（気流遮断）に該当するか判定するマスクを構築する。
     /// なぜ音素アライメント情報から厳密に無音判定を行うか:
     /// 閉鎖期に微小なノイズが漏洩すると耳障りなヒス・濁音感を生むため、物理的原理に基づき完全無音化する。
-    internal func computeFrameSilenceMask(
+    public func computeFrameSilenceMask(
         linguisticFeatures: LinguisticFeatures,
         totalFrames: Int
     ) -> [Bool] {
@@ -405,51 +420,84 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             meanFramesPerMora: voice.meanFramesPerMora
         )
 
-        let totalFrames = linguisticFeatures.totalFrames
-        if totalFrames <= 0 {
-            return []
-        }
+        let totalFrames: Int
+        let melSeq: [[Float]]
+        let vocoderF0: [Float]
+        let vocoderVoiced: [Float]
+        let effectiveLinguisticFeatures: LinguisticFeatures
 
-        // 2. 多層 SNN 音響デコーダー推論（内部状態・膜電位の一貫性を更新し Mel 残差系列を生成）
-        let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures)
-        let snnAcousticSeq = decoder.decodeSequence(
-            featuresSeq: inputSeq,
-            workspace: workspace
-        )
+        switch self.frameMelModel {
+        case .some(let fmm):
+            let f0Scale = (voice.baseF0 / 220.0) * safePitch
+            let res = fmm.synthesizeMelAndF0(
+                linguisticFeatures: linguisticFeatures,
+                meanFramesPerMora: voice.meanFramesPerMora,
+                f0Scale: f0Scale
+            )
+            melSeq = res.mel
+            totalFrames = melSeq.count
+            if totalFrames <= 0 {
+                return []
+            }
+            vocoderF0 = res.f0Contour
+            vocoderVoiced = res.voicedFlags
+            effectiveLinguisticFeatures = LinguisticFeatures(
+                phoneIds: linguisticFeatures.phoneIds,
+                durations: res.durations,
+                f0Contour: res.f0Contour,
+                voicedFlags: res.voicedFlags,
+                energyContour: res.energyContour,
+                totalFrames: totalFrames
+            )
+        case .none:
+            totalFrames = linguisticFeatures.totalFrames
+            if totalFrames <= 0 {
+                return []
+            }
+            effectiveLinguisticFeatures = linguisticFeatures
 
-        // 3. Mel スペクトル系列の供給
-        // なぜ SNN 音響モデル出力をそのままニューラルボコーダーへ供給するか:
-        // SNN は対数 Mel スペクトルを出力するように設計されており、単一パイプラインとして直結することで歪みを防ぐため。
-        let melChannels = AudioConfig.melChannels
-        var melSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
-        var t = 0
-        while t < totalFrames {
-            if t < snnAcousticSeq.count {
-                let outDim = snnAcousticSeq[t].count
-                let copyCount = min(melChannels, outDim)
-                melSeq[t].withUnsafeMutableBufferPointer { melDst in
-                    snnAcousticSeq[t].withUnsafeBufferPointer { acSrc in
-                        melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+            // 2. 多層 SNN 音響デコーダー推論（内部状態・膜電位の一貫性を更新し Mel 残差系列を生成）
+            let inputSeq = encodeLinguisticFeatures(features: linguisticFeatures)
+            let snnAcousticSeq = decoder.decodeSequence(
+                featuresSeq: inputSeq,
+                workspace: workspace
+            )
+
+            // 3. Mel スペクトル系列の供給
+            let melChannels = AudioConfig.melChannels
+            var builtMelSeq = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+            var t = 0
+            while t < totalFrames {
+                if t < snnAcousticSeq.count {
+                    let outDim = snnAcousticSeq[t].count
+                    let copyCount = min(melChannels, outDim)
+                    builtMelSeq[t].withUnsafeMutableBufferPointer { melDst in
+                        snnAcousticSeq[t].withUnsafeBufferPointer { acSrc in
+                            melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                        }
                     }
                 }
+                t += 1
             }
-            t += 1
+            melSeq = builtMelSeq
+
+            var builtF0 = [Float](repeating: 0.0, count: totalFrames)
+            var builtVoiced = [Float](repeating: 0.0, count: totalFrames)
+            var vf = 0
+            while vf < totalFrames {
+                if 194 < inputSeq[vf].count {
+                    builtF0[vf] = inputSeq[vf][194] * 500.0
+                }
+                if 192 < inputSeq[vf].count {
+                    builtVoiced[vf] = inputSeq[vf][192]
+                }
+                vf += 1
+            }
+            vocoderF0 = builtF0
+            vocoderVoiced = builtVoiced
         }
 
         // 4. ニューラルボコーダーによる 16kHz PCM 波形展開
-        var vocoderF0 = [Float](repeating: 0.0, count: totalFrames)
-        var vocoderVoiced = [Float](repeating: 0.0, count: totalFrames)
-        var vf = 0
-        while vf < totalFrames {
-            if 194 < inputSeq[vf].count {
-                vocoderF0[vf] = inputSeq[vf][194] * 500.0
-            }
-            if 192 < inputSeq[vf].count {
-                vocoderVoiced[vf] = inputSeq[vf][192]
-            }
-            vf += 1
-        }
-
         var rawSamples = neuralVocoder.synthesize(
             mel: melSeq,
             f0Contour: vocoderF0,
@@ -458,10 +506,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         )
 
         // 5. 無音・休止・促音区間および無声破裂音の閉鎖期における完全ゼロミュート
-        // なぜ閉鎖期・ポーズをゼロクリアするか:
-        // 調音生理学において無声破裂音（k, t, p）の閉鎖期および休止・ポーズは気流が完全遮断され音響エネルギーが物理的に 0 であるため。
         let silenceMask = computeFrameSilenceMask(
-            linguisticFeatures: linguisticFeatures,
+            linguisticFeatures: effectiveLinguisticFeatures,
             totalFrames: totalFrames
         )
         let frameSize = AudioConfig.hopSize

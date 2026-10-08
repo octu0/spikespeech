@@ -131,7 +131,7 @@ extension SpikeSpeechEngine {
         }
 
         // 実測 F0・有声度・エネルギーを注入せず、processText の出力のみから特徴量を符号化
-        let features = encodeLinguisticFeatures(
+        var features = encodeLinguisticFeatures(
             features: linguisticFeatures
         )
         if features.count != totalFrames {
@@ -214,6 +214,20 @@ extension SpikeSpeechEngine {
         }
         let srcLen = speechMel.count
 
+        // 1b. 教師 WAV に対する PitchTracker 実測（ホップ 160）
+        let pitchResult = pitchTracker.track(pcm: pcm16k)
+        var speechF0 = [Float](repeating: 0.0, count: srcLen)
+        var speechVoiced = [Float](repeating: 0.0, count: srcLen)
+        var sf0 = 0
+        while sf0 < srcLen {
+            let srcFrame = effectiveLeadSilence + sf0
+            if srcFrame < pitchResult.frameCount {
+                speechF0[sf0] = pitchResult.f0[srcFrame]
+                speechVoiced[sf0] = pitchResult.voiced[srcFrame]
+            }
+            sf0 += 1
+        }
+
         // srcDurs の総和を厳密に srcLen と一致させる
         var curSrcSum = 0
         var cI = 0
@@ -232,9 +246,11 @@ extension SpikeSpeechEngine {
             }
         }
 
-        // 音素境界単位で教師 Mel を目標フレーム数へ線形リサンプリング
+        // 音素境界単位で教師 Mel およびトラッカー F0 を目標フレーム数へ線形リサンプリング
         let melCh = AudioConfig.melChannels
         var resampledMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: targetSpeechFrames)
+        var resampledF0 = [Float](repeating: 0.0, count: targetSpeechFrames)
+        var resampledVoiced = [Float](repeating: 0.0, count: targetSpeechFrames)
         var srcOffset = 0
         var dstOffset = 0
         var phSeqIdx = 0
@@ -257,6 +273,8 @@ extension SpikeSpeechEngine {
                         pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
                     }
                 }
+                resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
 
             case (false, true):
                 let safeSrcIdx = min(srcLen - 1, max(0, srcOffset))
@@ -268,6 +286,8 @@ extension SpikeSpeechEngine {
                             pDst.baseAddress!.update(from: pSrc.baseAddress!, count: melCh)
                         }
                     }
+                    resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                    resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
                     f += 1
                 }
 
@@ -298,6 +318,8 @@ extension SpikeSpeechEngine {
                         resampledMel[dstIdx][c] = (1.0 - alpha) * speechMel[src0][c] + alpha * speechMel[src1][c]
                         c += 1
                     }
+                    resampledF0[dstIdx] = (1.0 - alpha) * speechF0[src0] + alpha * speechF0[src1]
+                    resampledVoiced[dstIdx] = (1.0 - alpha) * speechVoiced[src0] + alpha * speechVoiced[src1]
                     f += 1
                 }
             }
@@ -359,6 +381,79 @@ extension SpikeSpeechEngine {
                 }
             }
             trf += 1
+        }
+
+        // 教師 F0 による ch 194 / ch 195 の上書き（設計仕様 1 項）
+        var lf0 = 0
+        while lf0 < leadSil {
+            if 194 < features[lf0].count {
+                features[lf0][194] = 0.0
+            }
+            if 195 < features[lf0].count {
+                features[lf0][195] = 0.0
+            }
+            lf0 += 1
+        }
+
+        var bf0 = 0
+        while bf0 < targetSpeechFrames {
+            let dstF = leadSil + bf0
+            let vVal = resampledVoiced[bf0]
+            let f0Val = resampledF0[bf0]
+            if 0.5 <= vVal && 70.0 <= f0Val {
+                var normF0 = f0Val / 500.0
+                if normF0 < 0.0 {
+                    normF0 = 0.0
+                }
+                if 1.0 < normF0 {
+                    normF0 = 1.0
+                }
+                if 194 < features[dstF].count {
+                    features[dstF][194] = normF0
+                }
+            } else {
+                if 194 < features[dstF].count {
+                    features[dstF][194] = 0.0
+                }
+            }
+            bf0 += 1
+        }
+
+        var trf0 = 0
+        while trf0 < trailSil {
+            let dstF = leadSil + targetSpeechFrames + trf0
+            if 194 < features[dstF].count {
+                features[dstF][194] = 0.0
+            }
+            if 195 < features[dstF].count {
+                features[dstF][195] = 0.0
+            }
+            trf0 += 1
+        }
+
+        var fIdx = 0
+        while fIdx < totalFrames {
+            if 195 < features[fIdx].count {
+                var delta: Float = 0.0
+                if 0 < fIdx && 194 < features[fIdx - 1].count {
+                    let curNorm = features[fIdx][194]
+                    let prevNorm = features[fIdx - 1][194]
+                    if 0.0 < curNorm && 0.0 < prevNorm {
+                        let curF0 = curNorm * 500.0
+                        let prevF0 = prevNorm * 500.0
+                        var d = (curF0 - prevF0) / 50.0
+                        if d < -1.0 {
+                            d = -1.0
+                        }
+                        if 1.0 < d {
+                            d = 1.0
+                        }
+                        delta = d
+                    }
+                }
+                features[fIdx][195] = delta
+            }
+            fIdx += 1
         }
 
         // 3. 教師波形を教師 Mel と同じ音素境界の上へ載せる（設計書 3 項）
@@ -776,6 +871,213 @@ extension SpikeSpeechEngine {
             fujisakiF0: fujiF0s,
             targetF0: targF0s,
             voicedMask: vMasks
+        )
+    }
+
+    /// FrameMel モデル学習用の訓練サンプルを抽出する
+    ///
+    /// なぜ音素系列・目標継続時間・目標対数Mel・目標F0・目標エネルギーを一体として生成するか:
+    /// 音素アライメントと音響特徴量（Mel, F0, RMSエネルギー）のフレーム対応を推論パイプラインと
+    /// 同一の音素辞書・アライメント基盤で厳密に同期させ、学習時の特徴量不整合を排除するため。
+    public func prepareFrameMelTrainingSample(
+        text: String,
+        pcm16k: [Float],
+        melExtractor: MelSpectrogramExtractor,
+        pitchTracker: PitchTracker,
+        alignment: UtteranceAlignment? = nil
+    ) -> (
+        phoneIds: [Int32],
+        targetDurations: [Int],
+        targetMel: [[Float]],
+        targetF0: [Float],
+        targetEnergy: [Float]
+    )? {
+        if pcm16k.isEmpty {
+            return nil
+        }
+        let targetMel = melExtractor.extractLogMel(pcm: pcm16k)
+        let totalFrames = targetMel.count
+        if totalFrames <= 0 {
+            return nil
+        }
+
+        let linguisticFeatures = lengthRegulator.processText(
+            text: text,
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            prosodyPredictor: prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.default.baseF0,
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+        )
+        let phoneIds = linguisticFeatures.phoneIds
+        let phoneCount = phoneIds.count
+        if phoneCount < 3 {
+            return nil
+        }
+        let bodyPhoneCount = phoneCount - 2
+
+        let leadSilence: Int
+        let trailSilence: Int
+        var bodyDurs: [Int] = []
+        switch alignment {
+        case .some(let uttAlign) where uttAlign.phonemes.count == bodyPhoneCount && AlignmentStore.isUtteranceAlignmentValid(uttAlign):
+            leadSilence = max(1, uttAlign.leadSilenceFrames)
+            trailSilence = max(1, uttAlign.trailSilenceFrames)
+            var p = 0
+            while p < uttAlign.phonemes.count {
+                bodyDurs.append(max(1, uttAlign.phonemes[p].durationFrames))
+                p += 1
+            }
+        case _:
+            let boundaries = Self.detectSpeechBoundaries(
+                pcm: pcm16k,
+                hopSize: AudioConfig.hopSize,
+                totalFrames: totalFrames
+            )
+            let rawLead = boundaries.leadSilence
+            let rawTrail = boundaries.trailSilence
+            let speechFrames = boundaries.speechFrames
+            leadSilence = max(1, rawLead)
+            trailSilence = max(1, rawTrail)
+
+            var rawFloatDurs: [Float] = []
+            var p = 0
+            while p < bodyPhoneCount {
+                let pid = phoneIds[1 + p]
+                let avgDur = lengthRegulator.phonemeDuration(phoneId: pid, speedFactor: 1.0)
+                rawFloatDurs.append(avgDur)
+                p += 1
+            }
+            var sumFloat: Float = 0.0
+            var fI = 0
+            while fI < rawFloatDurs.count {
+                sumFloat += rawFloatDurs[fI]
+                fI += 1
+            }
+            let scale: Float
+            if 0.001 < sumFloat {
+                scale = Float(speechFrames) / sumFloat
+            } else {
+                scale = 1.0
+            }
+            var scaledFloatDurs: [Float] = []
+            var sI = 0
+            while sI < rawFloatDurs.count {
+                scaledFloatDurs.append(max(1.0, rawFloatDurs[sI] * scale))
+                sI += 1
+            }
+            bodyDurs = lengthRegulator.quantizeDurations(durations: scaledFloatDurs)
+        }
+
+        var sumBody = 0
+        var b = 0
+        while b < bodyDurs.count {
+            sumBody += bodyDurs[b]
+            b += 1
+        }
+
+        var finalLead = leadSilence
+        var finalTrail = trailSilence
+        var curSum = finalLead + sumBody + finalTrail
+        let diff = totalFrames - curSum
+        if diff != 0 {
+            let newTrail = finalTrail + diff
+            if 1 <= newTrail {
+                finalTrail = newTrail
+            } else {
+                finalTrail = 1
+                curSum = finalLead + sumBody + finalTrail
+                let leadDiff = totalFrames - curSum
+                finalLead = max(1, finalLead + leadDiff)
+                curSum = finalLead + sumBody + finalTrail
+                if curSum != totalFrames {
+                    let lastBodyDiff = totalFrames - curSum
+                    let lastIdx = bodyDurs.count - 1
+                    bodyDurs[lastIdx] = max(1, bodyDurs[lastIdx] + lastBodyDiff)
+                }
+            }
+        }
+
+        var targetDurations = [Int](repeating: 0, count: phoneCount)
+        targetDurations[0] = finalLead
+        var pI = 0
+        while pI < bodyPhoneCount {
+            targetDurations[1 + pI] = bodyDurs[pI]
+            pI += 1
+        }
+        targetDurations[phoneCount - 1] = finalTrail
+
+        let pitchResult = pitchTracker.track(pcm: pcm16k)
+        var targetF0 = [Float](repeating: 0.0, count: totalFrames)
+        var t = 0
+        while t < totalFrames {
+            if t < pitchResult.frameCount {
+                if 0.5 <= pitchResult.voiced[t] && 70.0 <= pitchResult.f0[t] {
+                    let f0Hz = pitchResult.f0[t]
+                    let norm = f0Hz / 500.0
+                    targetF0[t] = max(0.0, min(1.0, norm))
+                } else {
+                    targetF0[t] = 0.0
+                }
+            }
+            t += 1
+        }
+
+        let hopSize = AudioConfig.hopSize
+        let winSize = 320
+        var frameRms = [Float](repeating: 0.0, count: totalFrames)
+        var maxRms: Float = 0.0
+        t = 0
+        while t < totalFrames {
+            let startSample = t * hopSize
+            var sumSq: Float = 0.0
+            var count = 0
+            var s = 0
+            while s < winSize {
+                let pcmIdx = startSample + s
+                if pcmIdx < pcm16k.count {
+                    let v = pcm16k[pcmIdx]
+                    sumSq += v * v
+                    count += 1
+                }
+                s += 1
+            }
+            let rms: Float
+            if 0 < count {
+                rms = sqrtf(sumSq / Float(count))
+            } else {
+                rms = 0.0
+            }
+            frameRms[t] = rms
+            if maxRms < rms {
+                maxRms = rms
+            }
+            t += 1
+        }
+
+        var targetEnergy = [Float](repeating: 0.0, count: totalFrames)
+        let invMaxRms: Float
+        if 0.0001 < maxRms {
+            invMaxRms = 1.0 / maxRms
+        } else {
+            invMaxRms = 0.0
+        }
+        t = 0
+        while t < totalFrames {
+            let norm = frameRms[t] * invMaxRms
+            targetEnergy[t] = max(0.0, min(1.0, norm))
+            t += 1
+        }
+
+        return (
+            phoneIds: phoneIds,
+            targetDurations: targetDurations,
+            targetMel: targetMel,
+            targetF0: targetF0,
+            targetEnergy: targetEnergy
         )
     }
 }

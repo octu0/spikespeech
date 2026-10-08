@@ -473,56 +473,81 @@ public final class LengthRegulator: Sendable {
         }
 
         // 8. 音素物理カテゴリに基づく音響エネルギー輪郭の生成
-        // なぜ一律固定値ではなく音素カテゴリ別物理プロファイル＋半正弦波窓にするか:
-        // 学習側 PitchTracker の実測 RMS は発話内ピーク 0.70〜0.80 で母音平均約 0.20〜0.25 であるため、
-        // 推論時も半正弦波窓により中央ピーク 0.70、両端で滑らかに遷移させ、膜電位飽和を防ぎ過渡的フォルマント変化を維持する。
+        // なぜ半正弦波窓を外しカテゴリピーク一定値とするか:
+        // 音素境界での半正弦波窓減衰（端で約1割まで低下）による発音途切れ・デコボコを排除するため、
+        // 音素持続時間内の全フレームにカテゴリピーク値を一定値として配置する（音素間線形補間は行わない）。
         var baseEnergyContour = [Float](repeating: 0.0, count: totalFrames)
         var curFrame = 0
         var phIter = 0
         while phIter < phoneIds.count {
             let pid = Int(phoneIds[phIter])
             let dur = Int(durations[phIter])
-            let peakEnergy: Float
 
-            switch true {
-            case vocabulary.isPauseOrSilence(id: pid):
-                peakEnergy = 0.0
-            case vocabulary.isUnvoicedStop(id: pid):
-                peakEnergy = 0.02 // 閉鎖無音区間
-            case vocabulary.isUnvoicedFricative(id: pid):
-                peakEnergy = 0.18 // 無声摩擦気流
-            case vocabulary.isAffricate(id: pid):
-                peakEnergy = 0.15 // 破擦音
-            case vocabulary.isVoicedStop(id: pid):
-                peakEnergy = 0.25 // 有声破裂音
-            default:
-                let symbol = vocabulary.token(for: pid)
-                if vocabulary.isVoiced(symbol: symbol) {
-                    switch symbol {
-                    case "a", "i", "u", "e", "o", "N", "_":
-                        peakEnergy = 0.70 // 母音・撥音・長音
-                    default:
-                        peakEnergy = 0.35 // その他有声子音（鼻音・半母音・弾音など）
+            switch vocabulary.isUnvoicedStop(id: pid) {
+            case true:
+                switch dur <= 2 {
+                case true:
+                    var f = 0
+                    while f < dur {
+                        let frameIdx = curFrame + f
+                        if frameIdx < totalFrames {
+                            baseEnergyContour[frameIdx] = 0.35
+                        }
+                        f += 1
                     }
-                } else {
-                    peakEnergy = 0.10
+                case false:
+                    // 3 <= dur: 先頭 dur - 2 フレームを 0.02、末尾 2 フレームを 0.35
+                    let closureFrames = dur - 2
+                    var f = 0
+                    while f < closureFrames {
+                        let frameIdx = curFrame + f
+                        if frameIdx < totalFrames {
+                            baseEnergyContour[frameIdx] = 0.02
+                        }
+                        f += 1
+                    }
+                    while f < dur {
+                        let frameIdx = curFrame + f
+                        if frameIdx < totalFrames {
+                            baseEnergyContour[frameIdx] = 0.35
+                        }
+                        f += 1
+                    }
                 }
-            }
+            case false:
+                let peakEnergy: Float
+                switch true {
+                case vocabulary.isPauseOrSilence(id: pid):
+                    peakEnergy = 0.0
+                case vocabulary.isUnvoicedFricative(id: pid):
+                    peakEnergy = 0.18 // 無声摩擦気流
+                case vocabulary.isAffricate(id: pid):
+                    peakEnergy = 0.15 // 破擦音
+                case vocabulary.isVoicedStop(id: pid):
+                    peakEnergy = 0.25 // 有声破裂音
+                default:
+                    let symbol = vocabulary.token(for: pid)
+                    switch vocabulary.isVoiced(symbol: symbol) {
+                    case true:
+                        switch symbol {
+                        case "a", "i", "u", "e", "o", "N", "_":
+                            peakEnergy = 0.70 // 母音・撥音・長音
+                        default:
+                            peakEnergy = 0.35 // その他有声子音（鼻音・半母音・弾音など）
+                        }
+                    case false:
+                        peakEnergy = 0.10
+                    }
+                }
 
-            var f = 0
-            while f < dur {
-                let frameIdx = curFrame + f
-                if frameIdx < totalFrames {
-                    switch (peakEnergy <= 0.05, dur <= 2) {
-                    case (true, _), (_, true):
+                var f = 0
+                while f < dur {
+                    let frameIdx = curFrame + f
+                    if frameIdx < totalFrames {
                         baseEnergyContour[frameIdx] = peakEnergy
-                    default:
-                        let phase = (Float(f) + 0.5) / Float(dur)
-                        let window = sinf(Float.pi * phase)
-                        baseEnergyContour[frameIdx] = peakEnergy * window
                     }
+                    f += 1
                 }
-                f += 1
             }
 
             curFrame += dur

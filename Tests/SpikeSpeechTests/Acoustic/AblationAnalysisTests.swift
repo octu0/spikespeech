@@ -1169,25 +1169,198 @@ final class AblationAnalysisTests: XCTestCase {
         XCTAssertEqual(pair.features.count, synthFeatures.count, "学習特徴行列と合成特徴行列のフレーム数が一致していません")
         XCTAssertEqual(pair.targets.count, pair.features.count, "目標Melスペクトルと特徴量のフレーム数が一致していません")
 
-        // 2. 全チャンネル・全フレームの最大絶対差検証（手順3要件: 最大差 0）
-        var globalMaxDiff: Float = 0.0
+        // 2. ゲート条件 1: ch 194 と ch 195 以外の全チャンネル・全フレームの最大絶対差は 0
+        var nonPitchMaxDiff: Float = 0.0
         var f = 0
         while f < pair.features.count {
             var c = 0
             let inDim = min(pair.features[f].count, synthFeatures[f].count)
             while c < inDim {
-                let diff = abs(pair.features[f][c] - synthFeatures[f][c])
-                if globalMaxDiff < diff {
-                    globalMaxDiff = diff
+                if c != 194 && c != 195 {
+                    let diff = abs(pair.features[f][c] - synthFeatures[f][c])
+                    if nonPitchMaxDiff < diff {
+                        nonPitchMaxDiff = diff
+                    }
                 }
                 c += 1
             }
             f += 1
         }
+        XCTAssertTrue(nonPitchMaxDiff <= 0.0, "ch 194/195 以外の特徴量最大絶対差が 0 ではありません: \(nonPitchMaxDiff)")
 
-        XCTAssertTrue(globalMaxDiff <= 0.0, "全チャンネル・全フレームの特徴量最大絶対差が 0 ではありません: \(globalMaxDiff)")
+        // 3. ゲート条件 2: ch 194 の学習と合成の平均絶対差は 0.02 より大きい
+        var sumDiff194: Float = 0.0
+        var f194 = 0
+        while f194 < pair.features.count {
+            let diff = abs(pair.features[f194][194] - synthFeatures[f194][194])
+            sumDiff194 += diff
+            f194 += 1
+        }
+        let meanDiff194 = sumDiff194 / Float(max(1, pair.features.count))
+        XCTAssertTrue(0.02 < meanDiff194, "ch 194 の学習と合成の平均絶対差が 0.02 以下です: \(meanDiff194)")
 
-        // 3. アライメント指定時も特徴行列が厳密一致することの検証
+        // 4. ゲート条件 3: BASIC5000_0001 の有声な本体フレームで、学習 ch 194 の × 500 と、同じフレームへ補間したトラッカー F0 の相関が 0.8 より大きい
+        let pitchResult = pitchTracker.track(pcm: rawPCM)
+        let boundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+            pcm: rawPCM,
+            hopSize: AudioConfig.hopSize,
+            totalFrames: max(1, rawPCM.count / AudioConfig.hopSize)
+        )
+        let leadSilence = boundaries.leadSilence
+        let actualSpeechFrames = boundaries.speechFrames
+        let speechEnd = min(pitchResult.frameCount, leadSilence + actualSpeechFrames)
+        var speechF0: [Float] = []
+        var speechVoiced: [Float] = []
+        var sf = leadSilence
+        while sf < speechEnd {
+            speechF0.append(pitchResult.f0[sf])
+            speechVoiced.append(pitchResult.voiced[sf])
+            sf += 1
+        }
+        let srcLen = speechF0.count
+
+        let phoneCount = synthLinguistic.phoneIds.count
+        let leadSil = Int(synthLinguistic.durations[0])
+        let trailSil = Int(synthLinguistic.durations[phoneCount - 1])
+        let bodyPhoneCount = phoneCount - 2
+        let targetSpeechFrames = synthLinguistic.totalFrames - leadSil - trailSil
+
+        var rawFloatDurs: [Float] = []
+        var p = 0
+        while p < bodyPhoneCount {
+            let pid = synthLinguistic.phoneIds[1 + p]
+            let avgDur = engine.lengthRegulator.phonemeDuration(phoneId: pid, speedFactor: 1.0)
+            rawFloatDurs.append(avgDur)
+            p += 1
+        }
+        var sumFloat: Float = 0.0
+        var fI = 0
+        while fI < rawFloatDurs.count {
+            sumFloat += rawFloatDurs[fI]
+            fI += 1
+        }
+        let scale: Float
+        if 0.001 < sumFloat {
+            scale = Float(actualSpeechFrames) / sumFloat
+        } else {
+            scale = 1.0
+        }
+        var scaledFloatDurs: [Float] = []
+        var sI = 0
+        while sI < rawFloatDurs.count {
+            scaledFloatDurs.append(max(1.0, rawFloatDurs[sI] * scale))
+            sI += 1
+        }
+        var srcDurs = engine.lengthRegulator.quantizeDurations(durations: scaledFloatDurs)
+        var curSrcSum = 0
+        var cI = 0
+        while cI < srcDurs.count {
+            curSrcSum += srcDurs[cI]
+            cI += 1
+        }
+        let srcDiff = srcLen - curSrcSum
+        if srcDiff != 0 && srcDurs.isEmpty != true {
+            let lastIdx = srcDurs.count - 1
+            let adj = srcDurs[lastIdx] + srcDiff
+            if 1 <= adj {
+                srcDurs[lastIdx] = adj
+            } else {
+                srcDurs[lastIdx] = 1
+            }
+        }
+
+        var resampledF0 = [Float](repeating: 0.0, count: targetSpeechFrames)
+        var resampledVoiced = [Float](repeating: 0.0, count: targetSpeechFrames)
+        var srcOffset = 0
+        var dstOffset = 0
+        var phSeqIdx = 0
+        while phSeqIdx < bodyPhoneCount {
+            let srcDur = srcDurs[phSeqIdx]
+            let dstDur = Int(synthLinguistic.durations[1 + phSeqIdx])
+            switch (dstDur <= 1, srcDur <= 1) {
+            case (true, _):
+                let srcIdx: Int
+                if srcDur <= 1 {
+                    srcIdx = srcOffset
+                } else {
+                    srcIdx = srcOffset + (srcDur / 2)
+                }
+                let safeSrcIdx = min(srcLen - 1, max(0, srcIdx))
+                let dstIdx = min(targetSpeechFrames - 1, dstOffset)
+                resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
+            case (false, true):
+                let safeSrcIdx = min(srcLen - 1, max(0, srcOffset))
+                var fi = 0
+                while fi < dstDur {
+                    let dstIdx = min(targetSpeechFrames - 1, dstOffset + fi)
+                    resampledF0[dstIdx] = speechF0[safeSrcIdx]
+                    resampledVoiced[dstIdx] = speechVoiced[safeSrcIdx]
+                    fi += 1
+                }
+            case (false, false):
+                let maxDstP = Float(dstDur - 1)
+                let maxSrcP = Float(srcDur - 1)
+                var fi = 0
+                while fi < dstDur {
+                    let dstIdx = min(targetSpeechFrames - 1, dstOffset + fi)
+                    let posWithinPh = (Float(fi) / maxDstP) * maxSrcP
+                    var s0 = Int(posWithinPh)
+                    if srcDur <= s0 { s0 = srcDur - 1 }
+                    if s0 < 0 { s0 = 0 }
+                    var s1 = s0 + 1
+                    if srcDur <= s1 { s1 = srcDur - 1 }
+                    let alpha = posWithinPh - Float(s0)
+                    let src0 = min(srcLen - 1, max(0, srcOffset + s0))
+                    let src1 = min(srcLen - 1, max(0, srcOffset + s1))
+                    resampledF0[dstIdx] = (1.0 - alpha) * speechF0[src0] + alpha * speechF0[src1]
+                    resampledVoiced[dstIdx] = (1.0 - alpha) * speechVoiced[src0] + alpha * speechVoiced[src1]
+                    fi += 1
+                }
+            }
+            srcOffset += srcDur
+            dstOffset += dstDur
+            phSeqIdx += 1
+        }
+
+        // 有声な本体フレームで相関を計算
+        var sumX: Float = 0.0
+        var sumY: Float = 0.0
+        var sumXY: Float = 0.0
+        var sumX2: Float = 0.0
+        var sumY2: Float = 0.0
+        var countVoiced: Int = 0
+
+        var bf = 0
+        while bf < targetSpeechFrames {
+            let dstF = leadSil + bf
+            let trackerF0 = resampledF0[bf]
+            let trackerV = resampledVoiced[bf]
+            let trainF0 = pair.features[dstF][194] * 500.0
+
+            if 0.5 <= trackerV && 70.0 <= trackerF0 && 0.0 < pair.features[dstF][194] {
+                sumX += trainF0
+                sumY += trackerF0
+                sumXY += trainF0 * trackerF0
+                sumX2 += trainF0 * trainF0
+                sumY2 += trackerF0 * trackerF0
+                countVoiced += 1
+            }
+            bf += 1
+        }
+
+        XCTAssertTrue(10 <= countVoiced, "有声フレーム数が少なすぎます: \(countVoiced)")
+        let nF = Float(countVoiced)
+        let numerator = (nF * sumXY) - (sumX * sumY)
+        let denomX = (nF * sumX2) - (sumX * sumX)
+        let denomY = (nF * sumY2) - (sumY * sumY)
+        let denom = sqrt(max(1e-12, denomX * denomY))
+        let correlation = numerator / denom
+
+        print("  [特徴ゲート検証] ch194/195以外最大差: \(nonPitchMaxDiff), ch194平均差: \(meanDiff194), 有声本体相関: \(correlation) (N=\(countVoiced))")
+        XCTAssertTrue(0.8 < correlation, "学習 ch 194 * 500 とトラッカー F0 の相関が 0.8 以下です: \(correlation)")
+
+        // 5. アライメント指定時も ch 194/195 以外の差が 0 かつ ch 194 の平均差 > 0.02 を検証
         var effectiveAlign: UtteranceAlignment? = nil
         let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
         if FileManager.default.fileExists(atPath: corpusAlignPath) {
@@ -1208,21 +1381,34 @@ final class AblationAnalysisTests: XCTestCase {
             }
             XCTAssertEqual(pairWithAlign.features.count, synthFeatures.count, "アライメント指定時のフレーム数が一致していません")
             XCTAssertEqual(pairWithAlign.targets.count, synthFeatures.count, "アライメント指定時の目標Melフレーム数が一致していません")
-            var alignMaxDiff: Float = 0.0
+
+            var alignNonPitchMaxDiff: Float = 0.0
             var af = 0
             while af < pairWithAlign.features.count {
                 var c = 0
                 let inDim = min(pairWithAlign.features[af].count, synthFeatures[af].count)
                 while c < inDim {
-                    let diff = abs(pairWithAlign.features[af][c] - synthFeatures[af][c])
-                    if alignMaxDiff < diff {
-                        alignMaxDiff = diff
+                    if c != 194 && c != 195 {
+                        let diff = abs(pairWithAlign.features[af][c] - synthFeatures[af][c])
+                        if alignNonPitchMaxDiff < diff {
+                            alignNonPitchMaxDiff = diff
+                        }
                     }
                     c += 1
                 }
                 af += 1
             }
-            XCTAssertTrue(alignMaxDiff <= 0.0, "アライメント指定時の全チャンネル・全フレーム特徴量最大絶対差が 0 ではありません: \(alignMaxDiff)")
+            XCTAssertTrue(alignNonPitchMaxDiff <= 0.0, "アライメント指定時の ch 194/195 以外の最大絶対差が 0 ではありません: \(alignNonPitchMaxDiff)")
+
+            var alignSumDiff194: Float = 0.0
+            var af194 = 0
+            while af194 < pairWithAlign.features.count {
+                let diff = abs(pairWithAlign.features[af194][194] - synthFeatures[af194][194])
+                alignSumDiff194 += diff
+                af194 += 1
+            }
+            let alignMeanDiff194 = alignSumDiff194 / Float(max(1, pairWithAlign.features.count))
+            XCTAssertTrue(0.02 < alignMeanDiff194, "アライメント指定時の ch 194 平均絶対差が 0.02 以下です: \(alignMeanDiff194)")
         }
     }
 
@@ -1558,110 +1744,9 @@ final class AblationAnalysisTests: XCTestCase {
         print("[Natural Ratio Tenki] 出力完了 (\(tenkiWav.count) samples, \(Float(tenkiWav.count)/16000.0)s)")
     }
 
-    /// Models/weights.json 内の音素平均フレームテーブルを自然な音素比率プロファイルに更新して永続化する
+    /// Models/weights.json および波形ファイルへの書き込みを行わず return する
     func testUpdateWeightsWithHealthyDurations() throws {
-        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
-        guard FileManager.default.fileExists(atPath: weightsURL.path) else { return }
-
-        let data = try Data(contentsOf: weightsURL)
-        let loaded = try JSONDecoder().decode(SpikingNetworkWeights.self, from: data)
-
-        // 健全な実測音素プロファイル
-        let updated = loaded
-            .withPhonemeAverageDurations(LengthRegulator.defaultPhonemeAverageDurations)
-            .withMeanFramesPerMora(16.0)
-        try WeightCheckpoint.atomicWritePretty(updated, to: weightsURL)
-        print("[Weights Updated] Models/weights.json に自然な音素平均フレームテーブルを永続化しました。")
-
-        // エンジン経由で標準 synthesize を実行し、.tmp/wave15/ に診断音声を出力
-        let engine = SpikeSpeechEngine(weights: updated)
-
-        let konWavData = engine.synthesizeWav(text: "こんにちは")
-        try konWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_konnichiwa.wav"))
-        print("[TTS Output] tts_konnichiwa.wav 保存完了 (\(konWavData.count) bytes)")
-
-        let tenkiPath = ".tmp/wave15/tts_tenki.wav"
-        let tenkiWavData = engine.synthesizeWav(text: "今日はいい天気です")
-        try tenkiWavData.write(to: URL(fileURLWithPath: tenkiPath))
-        print("[TTS Output] tts_tenki.wav 保存完了 (\(tenkiWavData.count) bytes)")
-
-        let wavReader = WavAudioReader()
-        let tenkiPcm = try wavReader.loadWav16k(from: tenkiPath)
-        let melExtractor = MelSpectrogramExtractor(
-            sampleRate: Float(AudioConfig.sampleRate),
-            melChannels: AudioConfig.melChannels
-        )
-        let pitchTracker = PitchTracker()
-        let tenkiMel = melExtractor.extractLogMel(pcm: tenkiPcm)
-        let tenkiPitch = pitchTracker.track(pcm: tenkiPcm)
-
-        var voicedF0s: [Float] = []
-        var pf = 0
-        while pf < tenkiPitch.frameCount {
-            if 0.5 <= tenkiPitch.voiced[pf] && 50.0 <= tenkiPitch.f0[pf] && tenkiPitch.f0[pf] <= 500.0 {
-                voicedF0s.append(tenkiPitch.f0[pf])
-            }
-            pf += 1
-        }
-
-        var meanF0: Float = 0.0
-        var stdF0: Float = 0.0
-        var minF0: Float = 0.0
-        var maxF0: Float = 0.0
-        if voicedF0s.isEmpty != true {
-            let sumF = voicedF0s.reduce(0, +)
-            meanF0 = sumF / Float(voicedF0s.count)
-            let sumSq = voicedF0s.reduce(0) { $0 + powf($1 - meanF0, 2) }
-            stdF0 = sqrtf(sumSq / Float(voicedF0s.count))
-            minF0 = voicedF0s.min() ?? 0.0
-            maxF0 = voicedF0s.max() ?? 0.0
-        }
-
-        var spectralFluxSum: Float = 0.0
-        var fluxCount = 0
-        var t = 1
-        while t < tenkiMel.count {
-            var frameDiff: Float = 0.0
-            var c = 0
-            while c < AudioConfig.melChannels {
-                let d = tenkiMel[t][c] - tenkiMel[t - 1][c]
-                frameDiff += d * d
-                c += 1
-            }
-            spectralFluxSum += sqrtf(frameDiff)
-            fluxCount += 1
-            t += 1
-        }
-        var meanSpectralFlux: Float = 0.0
-        if 0 < fluxCount {
-            meanSpectralFlux = spectralFluxSum / Float(fluxCount)
-        }
-
-        var channelVarSum: Float = 0.0
-        t = 0
-        while t < tenkiMel.count {
-            let m = tenkiMel[t].reduce(0, +) / Float(AudioConfig.melChannels)
-            let v = tenkiMel[t].reduce(0) { $0 + powf($1 - m, 2) } / Float(AudioConfig.melChannels)
-            channelVarSum += v
-            t += 1
-        }
-        var meanChannelVar: Float = 0.0
-        if 0 < tenkiMel.count {
-            meanChannelVar = channelVarSum / Float(tenkiMel.count)
-        }
-
-        print("\n=======================================================")
-        print("tts_tenki.wav 客観音響特性分析")
-        print("=======================================================")
-        print("  時間: \(String(format: "%.2f", Float(tenkiPcm.count) / 16000.0))s (\(tenkiPcm.count) samples, \(tenkiMel.count) frames)")
-        print("  有声 F0: 平均=\(String(format: "%.1f", meanF0)) Hz, 標準偏差=\(String(format: "%.1f", stdF0)) Hz, min=\(String(format: "%.1f", minF0)) Hz, max=\(String(format: "%.1f", maxF0)) Hz")
-        print("  スペクトル動態度 (Spectral Flux): \(String(format: "%.4f", meanSpectralFlux)) (時間変化の激しさ)")
-        print("  フォルマント凹凸度 (Channel Variance): \(String(format: "%.4f", meanChannelVar)) (平坦度/横縞の逆指標)")
-        print("-------------------------------------------------------\n")
-
-        let mizuWavData = engine.synthesizeWav(text: "水をマレーシアから買わなくてはならないのです。")
-        try mizuWavData.write(to: URL(fileURLWithPath: ".tmp/wave15/tts_mizuwomare.wav"))
-        print("[TTS Output] tts_mizuwomare.wav 保存完了 (\(mizuWavData.count) bytes)")
+        return
     }
 
     /// 自然な実音声音素プロファイルによる TTS 合成検証
@@ -2610,6 +2695,176 @@ final class AblationAnalysisTests: XCTestCase {
         }
     }
 
+    struct ClosureWaveMetrics {
+        let name: String
+        let path: String
+        let sampleCount: Int
+        let durationSec: Float
+        let centroidMedian1k5: Float
+        let stopRatio: Float
+        let mod6to12Ratio: Float
+        let firstHalfF0: Float
+        let secondHalfF0: Float
+        let f0Diff: Float
+        let bodyFrameCount: Int
+        let bodyDurationSec: Float
+        let dips: [(startSec: Float, lengthMs: Int, avgRms: Float)]
+        let maxDipLengthMs: Int
+    }
+
+    func measureClosureWav(path: String, name: String) throws -> ClosureWaveMetrics? {
+        guard FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        let reader = WavAudioReader()
+        let pcm = try reader.loadWav16k(from: path)
+        let sampleCount = pcm.count
+        let durationSec = Float(sampleCount) / 16000.0
+
+        let metric = AcousticCentroidMetric.measure(pcm: pcm)
+        let halves = AcousticCentroidMetric.measureHalves(pcm: pcm, interpolateParabolic: false)
+        let mod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: pcm)
+
+        let winSize = 320
+        let hopSize = 160
+        let totalFrames = max(1, (pcm.count - winSize) / hopSize + 1)
+        var frameRms = [Float](repeating: 0.0, count: totalFrames)
+        var maxRms: Float = 0.0
+
+        var f = 0
+        while f < totalFrames {
+            let start = f * hopSize
+            var sumSq: Float = 0.0
+            var s = 0
+            while s < winSize {
+                let pcmIdx = start + s
+                var v: Float = 0.0
+                if pcmIdx < pcm.count {
+                    v = pcm[pcmIdx] * 32768.0
+                }
+                sumSq += v * v
+                s += 1
+            }
+            let rms = sqrtf(sumSq / Float(winSize))
+            frameRms[f] = rms
+            if maxRms < rms {
+                maxRms = rms
+            }
+            f += 1
+        }
+
+        let bodyThreshold = max(0.010 * 32768.0, maxRms * 0.06)
+        var firstBody = -1
+        var lastBody = -1
+        var sf = 0
+        while sf < totalFrames {
+            if bodyThreshold <= frameRms[sf] {
+                if firstBody < 0 {
+                    firstBody = sf
+                }
+                lastBody = sf
+            }
+            sf += 1
+        }
+
+        var bodyFrames = 0
+        var bodySec: Float = 0.0
+        if 0 <= firstBody && firstBody <= lastBody {
+            bodyFrames = lastBody - firstBody + 1
+            bodySec = Float(bodyFrames) * 0.010
+        }
+
+        let dipThreshold = max(0.008 * 32768.0, maxRms * 0.12)
+        var dips: [(startSec: Float, lengthMs: Int, avgRms: Float)] = []
+        var maxDipLen = 0
+
+        if 0 <= firstBody && firstBody <= lastBody {
+            var curStart = -1
+            var curCount = 0
+            var curSumRms: Float = 0.0
+
+            var bf = firstBody
+            while bf <= lastBody {
+                let rmsVal = frameRms[bf]
+                if rmsVal < dipThreshold {
+                    if curStart < 0 {
+                        curStart = bf
+                        curCount = 0
+                        curSumRms = 0.0
+                    }
+                    curCount += 1
+                    curSumRms += rmsVal
+                } else {
+                    if 0 <= curStart {
+                        if 8 <= curCount {
+                            let avg = curSumRms / Float(curCount)
+                            if avg < 800.0 {
+                                let startSec = Float(curStart * hopSize) / 16000.0
+                                let lenMs = curCount * 10
+                                if maxDipLen < lenMs {
+                                    maxDipLen = lenMs
+                                }
+                                dips.append((startSec: startSec, lengthMs: lenMs, avgRms: avg))
+                            }
+                        }
+                        curStart = -1
+                    }
+                }
+                bf += 1
+            }
+            if 0 <= curStart && 8 <= curCount {
+                let avg = curSumRms / Float(curCount)
+                if avg < 800.0 {
+                    let startSec = Float(curStart * hopSize) / 16000.0
+                    let lenMs = curCount * 10
+                    if maxDipLen < lenMs {
+                        maxDipLen = lenMs
+                    }
+                    dips.append((startSec: startSec, lengthMs: lenMs, avgRms: avg))
+                }
+            }
+        }
+
+        return ClosureWaveMetrics(
+            name: name,
+            path: path,
+            sampleCount: sampleCount,
+            durationSec: durationSec,
+            centroidMedian1k5: metric.centroidMedian200to1500,
+            stopRatio: metric.cosRatio,
+            mod6to12Ratio: mod6to12,
+            firstHalfF0: halves.first.f0Median,
+            secondHalfF0: halves.second.f0Median,
+            f0Diff: halves.first.f0Median - halves.second.f0Median,
+            bodyFrameCount: bodyFrames,
+            bodyDurationSec: bodySec,
+            dips: dips,
+            maxDipLengthMs: maxDipLen
+        )
+    }
+
+    func printClosureMetrics(_ m: ClosureWaveMetrics) {
+        print("\n==================================================")
+        print("波形分析対象: \(m.name) (\(m.path))")
+        print("  ファイル長: \(m.sampleCount) サンプル (\(String(format: "%.3f", m.durationSec)) 秒)")
+        print("  本体長: \(m.bodyFrameCount) フレーム (\(String(format: "%.3f", m.bodyDurationSec)) 秒)")
+        print("  五つのゲート客観指標:")
+        print("    1. 200–1500 Hz 重心変化中央値: \(String(format: "%.1f", m.centroidMedian1k5)) Hz")
+        print("    2. 停止割合 (cos > 0.99):       \(String(format: "%.3f", m.stopRatio))")
+        print("    3. 6–12 Hz 変調割合:           \(String(format: "%.4f", m.mod6to12Ratio))")
+        print("    4. 前半 F0 中央値:             \(String(format: "%.1f", m.firstHalfF0)) Hz")
+        print("    5. 後半 F0 中央値:             \(String(format: "%.1f", m.secondHalfF0)) Hz (差: \(String(format: "%+.1f", m.f0Diff)) Hz)")
+        print("  深い落ち込み分析 (RMS < max(800, dipThresh), >= 80ms):")
+        print("    本数: \(m.dips.count) 本, 最大長: \(m.maxDipLengthMs) ms")
+        var dIdx = 0
+        while dIdx < m.dips.count {
+            let d = m.dips[dIdx]
+            print("      [\(dIdx + 1)] 開始: \(String(format: "%.3f", d.startSec))s, 長さ: \(d.lengthMs)ms, 平均RMS: \(String(format: "%.1f", d.avgRms))")
+            dIdx += 1
+        }
+        print("==================================================\n")
+    }
+
     /// 有声フレームの隣接スペクトル余弦 > 0.99 割合およびスペクトル重心変化中央値を計測する
     func testSpectralCosineAndCentroid() throws {
         let files = [
@@ -2714,10 +2969,127 @@ final class AblationAnalysisTests: XCTestCase {
 
             let halves = AcousticCentroidMetric.measureHalves(pcm: pcm)
             let f0Full = AcousticCentroidMetric.measureF0Median(pcm: pcm)
+            let mod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: pcm)
             print("[\(name)] 全体 F0 中央値=\(String(format: "%.1f", f0Full)) Hz")
             print("[\(name)] 前半: 停止割合=\(String(format: "%.3f", halves.first.cosRatio)), 重心=\(String(format: "%.1f", halves.first.centroidMedian200to1500)) Hz, F0=\(String(format: "%.1f", halves.first.f0Median)) Hz")
             print("[\(name)] 後半: 停止割合=\(String(format: "%.3f", halves.second.cosRatio)), 重心=\(String(format: "%.1f", halves.second.centroidMedian200to1500)) Hz, F0=\(String(format: "%.1f", halves.second.f0Median)) Hz")
+            print("[\(name)] 6–12 Hz 割合: \(String(format: "%.4f", mod6to12))")
         }
+    }
+
+    /// design_cfc_closure.md に基づく閉鎖・パルス修正の客観指標および深い落ち込みの計測評価
+    func testClosureDesignEvaluation() throws {
+        let targets = [
+            ("新しい水", "tts_mizuwomare.wav"),
+            ("新しい天気", "tts_tenki.wav"),
+            ("既存の copy", ".tmp/wave15/copy_BASIC5000_0001.wav")
+        ]
+        var tIdx = 0
+        while tIdx < targets.count {
+            let (label, path) = targets[tIdx]
+            if let m = try measureClosureWav(path: path, name: label) {
+                printClosureMetrics(m)
+                switch label {
+                case "新しい水":
+                    break
+                case "新しい天気":
+                    XCTAssertEqual(m.dips.count, 2, "新しい天気の深い落ち込み本数は 2 本であること")
+                    XCTAssertTrue(m.maxDipLengthMs <= 100, "新しい天気の深い落ち込み最大長は 100ms 以下であること: \(m.maxDipLengthMs)ms")
+                case "既存の copy":
+                    XCTAssertEqual(m.dips.count, 2, "既存 copy の深い落ち込み本数は 2 本であること")
+                    XCTAssertTrue(m.maxDipLengthMs <= 130, "既存 copy の深い落ち込み最大長は 130ms 以下であること: \(m.maxDipLengthMs)ms")
+                default:
+                    break
+                }
+            } else {
+                XCTFail("[\(label)] ファイルが存在しません: \(path)")
+            }
+            tIdx += 1
+        }
+    }
+
+    /// design_cfc_closure.md 受入基準検証: ep05 継続時間、meanFramesPerMora=16、ch 199 ゼロ化の永続化確認
+    func testApplyClosureUpdatesAndSynthesize() throws {
+        let ep05URL = URL(fileURLWithPath: "Models/weights.ep05.json")
+        let weightsURL = URL(fileURLWithPath: "Models/weights.json")
+        guard FileManager.default.fileExists(atPath: ep05URL.path),
+              FileManager.default.fileExists(atPath: weightsURL.path) else {
+            XCTFail("重みファイルが見つかりません")
+            return
+        }
+
+        let ep05Data = try Data(contentsOf: ep05URL)
+        let ep05Weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: ep05Data)
+
+        let curData = try Data(contentsOf: weightsURL)
+        let curWeights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: curData)
+
+        // 1. phonemeAverageDurations が ep05 と完全一致（キー集合および値）
+        guard let ep05Durs = ep05Weights.phonemeAverageDurations,
+              let curDurs = curWeights.phonemeAverageDurations else {
+            XCTFail("phonemeAverageDurations が存在しません")
+            return
+        }
+        XCTAssertEqual(curDurs.count, ep05Durs.count, "継続時間のキー数が ep05 と一致しません")
+        for (k, v) in ep05Durs {
+            guard let curVal = curDurs[k] else {
+                XCTFail("キー \(k) が Models/weights.json に存在しません")
+                return
+            }
+            XCTAssertEqual(curVal, v, accuracy: 1e-5, "キー \(k) の継続時間が ep05 と一致しません: \(curVal) vs \(v)")
+        }
+
+        // 2. meanFramesPerMora が 16.0
+        XCTAssertEqual(curWeights.meanFramesPerMora, 16.0, "meanFramesPerMora が 16.0 ではありません")
+
+        // 3. wIn は変えない
+        XCTAssertEqual(curWeights.wIn, ep05Weights.wIn, "wIn は変えてはなりません")
+
+        // 4. cfcWf[0] と cfcWg[0] の入力 5 および入力 199 L2 ノルムの確認、層 1 以降の一致確認
+        guard let wf = curWeights.cfcWf, let wg = curWeights.cfcWg,
+              0 < wf.count, 0 < wg.count else {
+            XCTFail("cfcWf または cfcWg がありません")
+            return
+        }
+
+        func l2ForInput(_ arr: [Float], _ inp: Int) -> Float {
+            var sumSq: Float = 0.0
+            var h = 0
+            while h < 256 {
+                let v = arr[(inp * 256) + h]
+                sumSq += v * v
+                h += 1
+            }
+            return sqrtf(sumSq)
+        }
+
+        let l2WfInp5 = l2ForInput(wf[0], 5)
+        let l2WfInp199 = l2ForInput(wf[0], 199)
+        let l2WgInp5 = l2ForInput(wg[0], 5)
+        let l2WgInp199 = l2ForInput(wg[0], 199)
+
+        XCTAssertTrue(abs(l2WfInp5 - 3.7) < 0.2, "cfcWf[0] input 5 L2 が約 3.7 ではありません: \(l2WfInp5)")
+        XCTAssertTrue(abs(l2WgInp5 - 3.7) < 0.2, "cfcWg[0] input 5 L2 が約 3.7 ではありません: \(l2WgInp5)")
+        XCTAssertEqual(l2WfInp199, 0.0, accuracy: 1e-6, "cfcWf[0] input 199 L2 が 0 ではありません: \(l2WfInp199)")
+        XCTAssertEqual(l2WgInp199, 0.0, accuracy: 1e-6, "cfcWg[0] input 199 L2 が 0 ではありません: \(l2WgInp199)")
+
+        if let epWf = ep05Weights.cfcWf, let epWg = ep05Weights.cfcWg {
+            var l = 1
+            while l < wf.count && l < epWf.count {
+                XCTAssertEqual(wf[l], epWf[l], "層 \(l) の cfcWf は ep05 と一致すること")
+                XCTAssertEqual(wg[l], epWg[l], "層 \(l) の cfcWg は ep05 と一致すること")
+                l += 1
+            }
+        }
+
+        // 5. 正規波形ファイルの存在および直下と .tmp/wave15/ の同一 PCM 検証
+        let dataMizuRoot = try Data(contentsOf: URL(fileURLWithPath: "tts_mizuwomare.wav"))
+        let dataMizuTmp = try Data(contentsOf: URL(fileURLWithPath: ".tmp/wave15/tts_mizuwomare.wav"))
+        XCTAssertEqual(dataMizuRoot, dataMizuTmp, "水の直下と .tmp/wave15/ の波形 PCM データが完全一致すること")
+
+        let dataTenkiRoot = try Data(contentsOf: URL(fileURLWithPath: "tts_tenki.wav"))
+        let dataTenkiTmp = try Data(contentsOf: URL(fileURLWithPath: ".tmp/wave15/tts_tenki.wav"))
+        XCTAssertEqual(dataTenkiRoot, dataTenkiTmp, "天気の直下と .tmp/wave15/ の波形 PCM データが完全一致すること")
     }
 
     /// 設計仕様書に基づく音響客観指標計測:
@@ -3179,6 +3551,247 @@ final class AblationAnalysisTests: XCTestCase {
         XCTAssertTrue(res.allPassed, "受入ゲート総合判定に失敗")
     }
 #endif
+
+    func testProbeProsodyVsTrackerF0() throws {
+        let outputDir = ".tmp/wave15"
+        try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: "Models/weights.json"))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        var vocWeights: NeuralVocoderWeights? = nil
+        if let vData = try? Data(contentsOf: URL(fileURLWithPath: "Models/vocoder_weights.json")) {
+            vocWeights = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: vData)
+        }
+        let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+        let probeText = "水をマレーシアから買わなくてはならないのです。"
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        if FileManager.default.fileExists(atPath: wavPath) != true {
+            throw XCTSkip("BASIC5000_0001.wav が存在しないためスキップします: \(wavPath)")
+        }
+
+        let wavReader = WavAudioReader()
+        let rawPCM = try wavReader.loadWav16k(from: wavPath)
+        var peak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawPCM.count {
+            let a = abs(rawPCM[pIdx])
+            if peak < a { peak = a }
+            pIdx += 1
+        }
+        var pcm16k = rawPCM
+        if 0.01 < peak {
+            let normFactor = 0.85 / peak
+            var s = 0
+            while s < pcm16k.count {
+                pcm16k[s] = pcm16k[s] * normFactor
+                s += 1
+            }
+        }
+
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let pitchTracker = PitchTracker()
+
+        var effectiveAlign: UtteranceAlignment? = nil
+        let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        if FileManager.default.fileExists(atPath: corpusAlignPath) {
+            if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                effectiveAlign = alignMap["BASIC5000_0001"]
+            }
+        }
+
+        guard let pair = engine.prepareTrainingPair(
+            text: probeText,
+            pcm16k: pcm16k,
+            melExtractor: melExtractor,
+            pitchTracker: pitchTracker,
+            alignment: effectiveAlign,
+            useScaledDuration: false
+        ) else {
+            XCTFail("prepareTrainingPair に失敗しました")
+            return
+        }
+
+        // プローブ A: synthesize(text:) と同一パイプライン
+        let rawSamplesA = engine.synthesize(text: probeText)
+        let pathA = ".tmp/wave15/probe_prosody_f0.wav"
+        let dataA = WavEncoder.encode(samples: rawSamplesA, sampleRate: Int(engine.sampleRate))
+        try? dataA.write(to: URL(fileURLWithPath: pathA))
+        let metricA = AcousticCentroidMetric.measure(pcm: rawSamplesA)
+        let centroid1k5A = metricA.centroidMedian200to1500
+
+        // プローブ B: A と同じ特徴行列の ch 194/195 のみを教師 PitchTracker F0 に置換、ボコーダへは A の prosody を渡す
+        engine.workspace.reset()
+        engine.neuralVocoder.reset()
+
+        let linguisticFeatures = engine.lengthRegulator.processText(
+            text: probeText,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.default.baseF0,
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+        )
+        let totalFrames = linguisticFeatures.totalFrames
+        let featA = engine.encodeLinguisticFeatures(features: linguisticFeatures)
+
+        var featB = featA
+        var f = 0
+        while f < totalFrames {
+            if f < pair.features.count {
+                featB[f][194] = pair.features[f][194]
+                featB[f][195] = pair.features[f][195]
+            }
+            f += 1
+        }
+
+        let snnAcousticSeqB = engine.decoder.decodeSequence(
+            featuresSeq: featB,
+            workspace: engine.workspace
+        )
+
+        let melChannels = AudioConfig.melChannels
+        var melSeqB = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+        var t = 0
+        while t < totalFrames {
+            if t < snnAcousticSeqB.count {
+                let outDim = snnAcousticSeqB[t].count
+                let copyCount = min(melChannels, outDim)
+                melSeqB[t].withUnsafeMutableBufferPointer { melDst in
+                    snnAcousticSeqB[t].withUnsafeBufferPointer { acSrc in
+                        melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                    }
+                }
+            }
+            t += 1
+        }
+
+        var vocoderF0A = [Float](repeating: 0.0, count: totalFrames)
+        var vocoderVoicedA = [Float](repeating: 0.0, count: totalFrames)
+        var vf = 0
+        while vf < totalFrames {
+            if 194 < featA[vf].count {
+                vocoderF0A[vf] = featA[vf][194] * 500.0
+            }
+            if 192 < featA[vf].count {
+                vocoderVoicedA[vf] = featA[vf][192]
+            }
+            vf += 1
+        }
+
+        var rawSamplesB = engine.neuralVocoder.synthesize(
+            mel: melSeqB,
+            f0Contour: vocoderF0A,
+            voicedFlags: vocoderVoicedA,
+            speaker: .zero
+        )
+
+        let silenceMask = engine.computeFrameSilenceMask(
+            linguisticFeatures: linguisticFeatures,
+            totalFrames: totalFrames
+        )
+        let frameSize = AudioConfig.hopSize
+        var fIdx = 0
+        while fIdx < totalFrames {
+            let isSilence = silenceMask[fIdx]
+            switch isSilence {
+            case true:
+                var prevIsSilence = true
+                if 0 < fIdx {
+                    prevIsSilence = silenceMask[fIdx - 1]
+                }
+                let startSample = fIdx * frameSize
+                let endSample = min(rawSamplesB.count, startSample + frameSize)
+                switch prevIsSilence {
+                case false:
+                    let invN = 1.0 / Float(frameSize)
+                    var s = startSample
+                    while s < endSample {
+                        let sampleOffset = s - startSample
+                        let fade = 1.0 - (Float(sampleOffset) * invN)
+                        rawSamplesB[s] = rawSamplesB[s] * fade
+                        s += 1
+                    }
+                case true:
+                    var s = startSample
+                    while s < endSample {
+                        rawSamplesB[s] = 0.0
+                        s += 1
+                    }
+                }
+            case false:
+                break
+            }
+            fIdx += 1
+        }
+
+        let targetPeak: Float = 0.85
+        var currentPeakB: Float = 0.0
+        var pIdxB = 0
+        while pIdxB < rawSamplesB.count {
+            let absVal = abs(rawSamplesB[pIdxB])
+            if currentPeakB < absVal {
+                currentPeakB = absVal
+            }
+            pIdxB += 1
+        }
+        if 0.01 < currentPeakB {
+            var normScale = targetPeak / currentPeakB
+            if 6.0 < normScale {
+                normScale = 6.0
+            }
+            var s = 0
+            while s < rawSamplesB.count {
+                var scaled = rawSamplesB[s] * normScale
+                if targetPeak < scaled {
+                    scaled = targetPeak
+                }
+                if scaled < -targetPeak {
+                    scaled = -targetPeak
+                }
+                rawSamplesB[s] = scaled
+                s += 1
+            }
+        }
+
+        let fadeLen = 160
+        if (fadeLen * 2) <= rawSamplesB.count {
+            let invFade: Float = 1.0 / Float(fadeLen)
+            var s = 0
+            while s < fadeLen {
+                let factor = Float(s) * invFade
+                rawSamplesB[s] = rawSamplesB[s] * factor
+                s += 1
+            }
+            let endOffset = rawSamplesB.count - fadeLen
+            s = 0
+            while s < fadeLen {
+                let factor = Float(fadeLen - 1 - s) * invFade
+                rawSamplesB[endOffset + s] = rawSamplesB[endOffset + s] * factor
+                s += 1
+            }
+        }
+
+        let dataB = WavEncoder.encode(samples: rawSamplesB, sampleRate: Int(engine.sampleRate))
+        let pathB = ".tmp/wave15/probe_tracker_f0.wav"
+        try? dataB.write(to: URL(fileURLWithPath: pathB))
+        let metricB = AcousticCentroidMetric.measure(pcm: rawSamplesB)
+        let centroid1k5B = metricB.centroidMedian200to1500
+
+        print("プローブ A 200–1500 Hz: \(centroid1k5A) Hz")
+        print("プローブ B 200–1500 Hz: \(centroid1k5B) Hz")
+
+        // 仕様書判定: B < 22Hz のため波形分岐が確定
+        XCTAssertTrue(centroid1k5B < 22.0, "プローブ B の 200–1500 Hz 重心は 22 Hz 未満であること（実測: \(centroid1k5B) Hz）")
+        XCTAssertTrue(0 < rawSamplesA.count, "プローブ A サンプルが空でないこと")
+        XCTAssertTrue(0 < rawSamplesB.count, "プローブ B サンプルが空でないこと")
+    }
 }
 
 

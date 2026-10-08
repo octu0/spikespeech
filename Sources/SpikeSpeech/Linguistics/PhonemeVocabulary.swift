@@ -226,6 +226,30 @@ public struct PhonemeVocabulary: Sendable {
         }
     }
 
+    /// 音素 ID が有声（母音・有声子音・撥音）であるか判定する
+    public static func isVoicedPhone(phoneId: Int) -> Bool {
+        switch phoneId {
+        case 5, 6, 7, 8, 9, 26: // a, i, u, e, o, _
+            return true
+        case 13, 15, 16, 17, 18, 19, 20, 21, 22, 24: // n, m, y, r, w, g, z, d, b, N
+            return true
+        case 31, 33, 34, 35, 36, 37: // ny, my, ry, gy, j, by
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 音素 ID が母音または特殊拍（促音・撥音・長音）であるか判定する
+    public static func isVowelOrSpecialMora(phoneId: Int) -> Bool {
+        switch phoneId {
+        case 5, 6, 7, 8, 9, 24, 25, 26: // a, i, u, e, o, N, Q, _
+            return true
+        default:
+            return false
+        }
+    }
+
     /// カタカナ文字をひらがなに正規化する。
     /// カタカナとひらがなは Unicode コードポイントが 0x60 オフセットで並行配置されており、
     /// 文字列置換ライブラリ呼び出しを排してスカラー演算のみで一括変換する。

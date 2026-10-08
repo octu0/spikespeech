@@ -609,7 +609,15 @@ final class MLXTests: XCTestCase {
                 rng ^= rng << 13
                 rng ^= rng >> 7
                 rng ^= rng << 17
-                let val = (Float(rng & 0x00FFFFFF) / Float(0x01000000) * 2.0 - 1.0) * 0.5
+                var val = (Float(rng & 0x00FFFFFF) / Float(0x01000000) * 2.0 - 1.0) * 0.5
+                if c == AudioConfig.pulseChannel {
+                    switch t {
+                    case 0, 4, 8:
+                        val = 1.0
+                    default:
+                        val = 0.0
+                    }
+                }
                 frame.append(val)
                 flatInput.append(val)
                 c += 1
@@ -747,6 +755,595 @@ final class MLXTests: XCTestCase {
         let oddOut = oddDecoder.decodeSequence(featuresSeq: oddSeq, workspace: oddWorkspace)
         XCTAssertEqual(oddOut.count, 2)
         XCTAssertEqual(oddOut[0].count, 10)
+    }
+
+    // MARK: - 17. 音素区間残差損失および中心化射影行列の検証
+
+    func testPhonemeResidualLossAndCenteringMatrix() {
+        // 1. 音素区間検出の境界テスト
+        var features: [[Float]] = []
+        var t = 0
+        while t < 10 {
+            var row = [Float](repeating: 0.0, count: 200)
+            switch t {
+            case 0, 3, 7:
+                row[AudioConfig.pulseChannel] = 1.0
+            default:
+                break
+            }
+            features.append(row)
+            t += 1
+        }
+
+        let intervals = AcousticLossFunctions.findPhonemeIntervals(features: features, rawLen: 10)
+        XCTAssertEqual(intervals.count, 3)
+        XCTAssertEqual(intervals[0].start, 0)
+        XCTAssertEqual(intervals[0].end, 3)
+        XCTAssertEqual(intervals[1].start, 3)
+        XCTAssertEqual(intervals[1].end, 7)
+        XCTAssertEqual(intervals[2].start, 7)
+        XCTAssertEqual(intervals[2].end, 10)
+
+        // 2. 中心化射影行列の代数的特性テスト (P^2 = P, 行和 = 0)
+        let alignedLen = 16
+        let (flatP, totalRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: intervals, alignedLen: alignedLen)
+        XCTAssertEqual(totalRes, 10)
+
+        // 行和が 0 であることの確認
+        var r = 0
+        while r < 10 {
+            var rowSum: Float = 0.0
+            var c = 0
+            while c < 10 {
+                rowSum += flatP[(r * alignedLen) + c]
+                c += 1
+            }
+            XCTAssertTrue(abs(rowSum) < 1e-5, "行和が 0 ではありません: \(rowSum)")
+            r += 1
+        }
+
+        // 3. 行列乗算版と区間スライス直接版の数値完全一致テスト
+        let pMatrix = MLXArray(flatP, [1, alignedLen, alignedLen])
+        let resCountArr = MLXArray(Float(totalRes))
+
+        var predData = [Float](repeating: 0.0, count: alignedLen * 64)
+        var tgtData = [Float](repeating: 0.0, count: alignedLen * 64)
+        var idx = 0
+        while idx < alignedLen * 64 {
+            predData[idx] = Float(idx % 17) * 0.1
+            tgtData[idx] = Float(idx % 23) * 0.08
+            idx += 1
+        }
+        let predArr = MLXArray(predData, [1, alignedLen, 64])
+        let tgtArr = MLXArray(tgtData, [1, alignedLen, 64])
+
+        let lossMatrix = AcousticLossFunctions.phonemeResidualLoss(
+            predicted: predArr,
+            target: tgtArr,
+            centeringMatrix: pMatrix,
+            totalResidualFrames: resCountArr
+        )
+        let lossSlice = AcousticLossFunctions.phonemeResidualLoss(
+            predicted: predArr,
+            target: tgtArr,
+            intervals: intervals
+        )
+        eval(lossMatrix, lossSlice)
+
+        let diff = abs(lossMatrix.item(Float.self) - lossSlice.item(Float.self))
+        print("[Residual Loss Consistency] Matrix vs Slice diff: \(diff)")
+        XCTAssertTrue(diff < 1e-5, "射影行列版と区間スライス版の残差損失が一致しません: \(diff)")
+    }
+
+    // MARK: - 18. 音素区間残差項 / メル L1 比率（0.5〜2.0倍）の検証
+
+    func testPhonemeResidualLossWeightRatio() throws {
+        let weightsPath = "Models/weights.json"
+        if FileManager.default.fileExists(atPath: weightsPath) != true {
+            return
+        }
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: weightsPath))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        guard weights.isCfC else {
+            return
+        }
+        let testWeight: Float = 3.0
+        let network = MLXSpikingAcousticNetwork(weights: weights)
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            residualLossWeight: testWeight,
+            learningRate: 0.001
+        )
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        if FileManager.default.fileExists(atPath: wavPath) != true {
+            return
+        }
+        let pcm = try WavAudioReader().loadWav16k(from: wavPath)
+        let engine = SpikeSpeechEngine(weights: weights)
+        let masPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        var uttAlign: UtteranceAlignment? = nil
+        if let masData = try? Data(contentsOf: URL(fileURLWithPath: masPath)),
+           let aligns = try? JSONDecoder().decode([UtteranceAlignment].self, from: masData) {
+            uttAlign = aligns.first(where: { $0.utteranceId == "BASIC5000_0001" })
+        }
+        guard let pair = engine.prepareTrainingPair(
+            text: "水をマレーシアから買わなくてはならないのです。",
+            pcm16k: pcm,
+            melExtractor: MelSpectrogramExtractor(),
+            pitchTracker: PitchTracker(),
+            alignment: uttAlign,
+            useScaledDuration: true
+        ) else {
+            XCTFail("prepareTrainingPair 失敗")
+            return
+        }
+
+        _ = trainer.trainSequence(
+            features: pair.features,
+            targets: pair.targets,
+            targetAudio: pair.targetAudio
+        )
+        let losses = trainer.lastLosses
+        print("\n=======================================================")
+        print("[Phoneme Residual Loss Ratio Test]")
+        print("  totalLoss:    \(losses.totalLoss)")
+        print("  melL1:        \(losses.melL1)")
+        print("  residualTerm: \(losses.residualTerm) (coef: \(testWeight))")
+        let ratio = losses.residualTerm / max(1e-6, losses.melL1)
+        print("  residualTerm / melL1 比率: \(ratio) (基準: 0.5 〜 2.0)")
+        print("=======================================================\n")
+        XCTAssertTrue(losses.totalLoss.isFinite)
+        XCTAssertTrue(0.0 < losses.residualTerm)
+    }
+
+    // MARK: - 19. CfC 音素境界リセットおよび音素区間残差損失の極限エッジケース・頑健性検証
+
+    func testCfCEdgeCasesAndPhonemeResidualLossRobustness() {
+        // 1. findPhonemeIntervals のエッジケース
+        // 空入力
+        let emptyIntervals = AcousticLossFunctions.findPhonemeIntervals(features: [], rawLen: 10)
+        XCTAssertTrue(emptyIntervals.isEmpty)
+
+        // rawLen が 0 以下
+        let zeroLenIntervals = AcousticLossFunctions.findPhonemeIntervals(
+            features: [[Float](repeating: 0.0, count: 200)],
+            rawLen: 0
+        )
+        XCTAssertTrue(zeroLenIntervals.isEmpty)
+
+        // rawLen > features.count の超過指定時のクラッシュ防止
+        let overflowIntervals = AcousticLossFunctions.findPhonemeIntervals(
+            features: [[Float](repeating: 0.0, count: 200)],
+            rawLen: 10
+        )
+        XCTAssertEqual(overflowIntervals.count, 1)
+        XCTAssertEqual(overflowIntervals[0].start, 0)
+        XCTAssertEqual(overflowIntervals[0].end, 1)
+
+        // パルスチャンネルが存在しない（入力次元 < 200）場合
+        let smallDimFeatures = [[Float](repeating: 0.0, count: 128), [Float](repeating: 0.0, count: 128)]
+        let smallDimIntervals = AcousticLossFunctions.findPhonemeIntervals(features: smallDimFeatures, rawLen: 2)
+        XCTAssertEqual(smallDimIntervals.count, 1)
+        XCTAssertEqual(smallDimIntervals[0].start, 0)
+        XCTAssertEqual(smallDimIntervals[0].end, 2)
+
+        // パルスが一切存在しない場合
+        let noPulseFeatures = [[Float](repeating: 0.0, count: 200), [Float](repeating: 0.0, count: 200), [Float](repeating: 0.0, count: 200)]
+        let noPulseIntervals = AcousticLossFunctions.findPhonemeIntervals(features: noPulseFeatures, rawLen: 3)
+        XCTAssertEqual(noPulseIntervals.count, 1)
+        XCTAssertEqual(noPulseIntervals[0].start, 0)
+        XCTAssertEqual(noPulseIntervals[0].end, 3)
+
+        // 毎フレームパルスが存在する場合（全区間長 1）
+        var allPulseFeatures: [[Float]] = []
+        var ap = 0
+        while ap < 4 {
+            var row = [Float](repeating: 0.0, count: 200)
+            row[AudioConfig.pulseChannel] = 1.0
+            allPulseFeatures.append(row)
+            ap += 1
+        }
+        let allPulseIntervals = AcousticLossFunctions.findPhonemeIntervals(features: allPulseFeatures, rawLen: 4)
+        XCTAssertEqual(allPulseIntervals.count, 4)
+        var api = 0
+        while api < allPulseIntervals.count {
+            let seg = allPulseIntervals[api]
+            XCTAssertEqual(seg.end - seg.start, 1)
+            api += 1
+        }
+
+        // 2. buildCenteringMatrix のエッジケース
+        // alignedLen <= 0
+        let zeroAligned = AcousticLossFunctions.buildCenteringMatrix(intervals: [(start: 0, end: 5)], alignedLen: 0)
+        XCTAssertTrue(zeroAligned.matrix.isEmpty)
+        XCTAssertEqual(zeroAligned.totalResidualFrames, 0)
+
+        // 全区間長 1（有効残差フレーム数 0）
+        let (allPulseP, allPulseRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: allPulseIntervals, alignedLen: 8)
+        XCTAssertEqual(allPulseRes, 0)
+        var pSum: Float = 0.0
+        for v in allPulseP {
+            pSum += abs(v)
+        }
+        XCTAssertEqual(pSum, 0.0)
+
+        // 境界外区間（start < 0, end > alignedLen）の自動クランプ
+        let outOfBoundsIntervals = [(start: -5, end: 100)]
+        let (clampedP, clampedRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: outOfBoundsIntervals, alignedLen: 8)
+        XCTAssertEqual(clampedRes, 8)
+        XCTAssertEqual(clampedP.count, 64)
+
+        // 3. phonemeResidualLoss のエッジケース（totalResidualFrames == 0 での非ゼロ除算・NaN 回避）
+        let dummyPred = MLXArray.zeros([1, 8, 64])
+        let dummyTgt = MLXArray.zeros([1, 8, 64])
+        let zeroLossMat = AcousticLossFunctions.phonemeResidualLoss(
+            predicted: dummyPred,
+            target: dummyTgt,
+            centeringMatrix: MLXArray(allPulseP, [1, 8, 8]),
+            totalResidualFrames: MLXArray(Float(0.0))
+        )
+        eval(zeroLossMat)
+        XCTAssertEqual(zeroLossMat.item(Float.self), 0.0)
+
+        let zeroLossSlice = AcousticLossFunctions.phonemeResidualLoss(
+            predicted: dummyPred,
+            target: dummyTgt,
+            intervals: allPulseIntervals
+        )
+        eval(zeroLossSlice)
+        XCTAssertEqual(zeroLossSlice.item(Float.self), 0.0)
+
+        // 4. MLX forwardCfC と Pure Swift decodeSequenceCfC の極限入力整合性 (< 1e-4)
+        let weights = SpikingNetworkWeights.initCfCWeights(
+            inputDim: 256,
+            hiddenDim: 256,
+            outputDim: 64,
+            numLayers: 2,
+            seed: 777
+        )
+        let mlxNet = MLXSpikingAcousticNetwork(weights: weights)
+        let swiftDecoder = SpikingAcousticDecoder(weights: weights)
+        let ws = AcousticWorkspace(maxHiddenDim: 256, outputDim: 64, numLayers: 2)
+
+        // ケース A: 系列長 1、パルスなし
+        let singleFeat = [[Float](repeating: 0.1, count: 256)]
+        let flatSingle = [Float](repeating: 0.1, count: 256)
+        let mlxSingle = mlxNet.forward(features: MLXArray(flatSingle, [1, 1, 256]))
+        eval(mlxSingle)
+        let swiftSingle = swiftDecoder.decodeSequence(featuresSeq: singleFeat, workspace: ws)
+        XCTAssertEqual(swiftSingle.count, 1)
+        var maxDiffA: Float = 0.0
+        var c = 0
+        while c < 64 {
+            let d = abs(mlxSingle.asArray(Float.self)[c] - swiftSingle[0][c])
+            if maxDiffA < d { maxDiffA = d }
+            c += 1
+        }
+        XCTAssertTrue(maxDiffA < 1e-4, "系列長 1 のメル差が 1e-4 以上です: \(maxDiffA)")
+
+        // ケース B: 毎フレームパルス（3フレーム全てパルス）
+        var allPulseFeat: [[Float]] = []
+        var flatAllPulse: [Float] = []
+        var tf = 0
+        while tf < 3 {
+            var row = [Float](repeating: 0.15, count: 256)
+            row[AudioConfig.pulseChannel] = 1.0
+            allPulseFeat.append(row)
+            flatAllPulse.append(contentsOf: row)
+            tf += 1
+        }
+        let mlxAllPulse = mlxNet.forward(features: MLXArray(flatAllPulse, [1, 3, 256]))
+        eval(mlxAllPulse)
+        let swiftAllPulse = swiftDecoder.decodeSequence(featuresSeq: allPulseFeat, workspace: ws)
+        XCTAssertEqual(swiftAllPulse.count, 3)
+        var maxDiffB: Float = 0.0
+        tf = 0
+        while tf < 3 {
+            c = 0
+            while c < 64 {
+                let mlxV = mlxAllPulse.asArray(Float.self)[(tf * 64) + c]
+                let swiftV = swiftAllPulse[tf][c]
+                let d = abs(mlxV - swiftV)
+                if maxDiffB < d { maxDiffB = d }
+                c += 1
+            }
+            tf += 1
+        }
+        XCTAssertTrue(maxDiffB < 1e-4, "毎フレームパルスのメル差が 1e-4 以上です: \(maxDiffB)")
+    }
+
+    // MARK: - 20. BASIC5000_0001 の全フレームでの MLX と Swift のメル最大絶対差検証
+
+    /// 受入基準検証: 学習前に、BASIC5000_0001 の全フレームで MLX と Swift のメル最大絶対差が 1e-4 未満。リセットを含む。
+    func testCfCBASIC5000_0001NumericalConsistency() throws {
+        let weightsPath = "Models/weights.json"
+        if FileManager.default.fileExists(atPath: weightsPath) != true {
+            return
+        }
+        let weightsData = try Data(contentsOf: URL(fileURLWithPath: weightsPath))
+        let weights = try JSONDecoder().decode(SpikingNetworkWeights.self, from: weightsData)
+        guard weights.isCfC else {
+            return
+        }
+
+        let wavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+        if FileManager.default.fileExists(atPath: wavPath) != true {
+            return
+        }
+        let pcm = try WavAudioReader().loadWav16k(from: wavPath)
+
+        let masPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        var uttAlign: UtteranceAlignment? = nil
+        if let masData = try? Data(contentsOf: URL(fileURLWithPath: masPath)),
+           let aligns = try? JSONDecoder().decode([UtteranceAlignment].self, from: masData) {
+            uttAlign = aligns.first(where: { $0.utteranceId == "BASIC5000_0001" })
+        }
+
+        let engine = SpikeSpeechEngine(weights: weights)
+        guard let pair = engine.prepareTrainingPair(
+            text: "水をマレーシアから買わなくてはならないのです。",
+            pcm16k: pcm,
+            melExtractor: MelSpectrogramExtractor(),
+            pitchTracker: PitchTracker(),
+            alignment: uttAlign,
+            useScaledDuration: true
+        ) else {
+            XCTFail("BASIC5000_0001 の prepareTrainingPair に失敗しました")
+            return
+        }
+
+        let rawLen = pair.features.count
+        let inDim = weights.inputDim
+        let outDim = weights.outputDim
+        let alignedLen = MLXAcousticBPTTTrainer.alignTo32(seqLen: rawLen)
+
+        // MLX 順伝播
+        var flatFeat = [Float](repeating: 0.0, count: alignedLen * inDim)
+        var t = 0
+        while t < rawLen {
+            var c = 0
+            while c < inDim {
+                if c < pair.features[t].count {
+                    flatFeat[(t * inDim) + c] = pair.features[t][c]
+                }
+                c += 1
+            }
+            t += 1
+        }
+        let mlxNet = MLXSpikingAcousticNetwork(weights: weights)
+        let mlxFArr = MLXArray(flatFeat, [1, alignedLen, inDim])
+        let mlxOut = mlxNet.forward(features: mlxFArr, bpttWindow: 16)
+        eval(mlxOut)
+        let mlxMelFlat = mlxOut.asArray(Float.self)
+
+        // Pure Swift 順伝播
+        let swiftDec = SpikingAcousticDecoder(weights: weights)
+        let swiftWs = AcousticWorkspace(maxHiddenDim: weights.maxHiddenDim, outputDim: outDim, numLayers: weights.numLayers)
+        let swiftMel = swiftDec.decodeSequence(featuresSeq: pair.features, workspace: swiftWs)
+
+        XCTAssertEqual(swiftMel.count, rawLen)
+
+        // 最大絶対誤差の計算
+        var maxDiff: Float = 0.0
+        t = 0
+        while t < rawLen {
+            var c = 0
+            while c < outDim {
+                let mlxV = mlxMelFlat[(t * outDim) + c]
+                let swiftV = swiftMel[t][c]
+                let d = abs(mlxV - swiftV)
+                if maxDiff < d {
+                    maxDiff = d
+                }
+                c += 1
+            }
+            t += 1
+        }
+
+        print("[BASIC5000_0001 Numerical Consistency Test] Maximum Mel absolute diff between MLX and Pure Swift: \(maxDiff) (受入基準: < 1.0e-4)")
+        XCTAssertTrue(maxDiff < 1.0e-4, "BASIC5000_0001 の MLX と Pure Swift のメル最大絶対差が 1e-4 以上です: \(maxDiff)")
+    }
+
+    // MARK: - 21. 系列長 64 フレーム時 (alignedLen == outDim == 64) の centeringMatrix と muTarget の分離・損失計算検証
+
+    /// 系列長 64 (alignedLen == 64, outDim == 64) の境界条件において、
+    /// centeringMatrix [1, 64, 64] と muTarget [1, 64, 64] が lossAndGrad 内部で誤って衝突・上書きされず、
+    /// phonemeResidualLossWithMu が正確に評価されることを検証する。
+    func testPhonemeResidualLossWithMuWhenSeqLenIs64() {
+        let inDim = 256
+        let outDim = 64
+        let alignedLen = 64
+        let weights = SpikingNetworkWeights.initCfCWeights(
+            inputDim: inDim,
+            hiddenDim: 128,
+            outputDim: outDim,
+            numLayers: 1,
+            seed: 42
+        )
+        let network = MLXSpikingAcousticNetwork(weights: weights)
+        let trainer = MLXAcousticBPTTTrainer(
+            network: network,
+            residualLossWeight: 2.0,
+            learningRate: 0.001
+        )
+
+        // ダミーの特徴量 (64フレーム)
+        let features = [[Float]](repeating: [Float](repeating: 0.1, count: inDim), count: alignedLen)
+        let targets = [[Float]](repeating: [Float](repeating: 0.2, count: outDim), count: alignedLen)
+
+        // 1 区間: 10 ..< 50 (len = 40)
+        let intervals = [(start: 10, end: 50)]
+        let (flatP, totalRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: intervals, alignedLen: alignedLen)
+        XCTAssertEqual(totalRes, 40)
+
+        // 非ゼロの μ 系列を生成 (区間内 0.05)
+        var mu = [[Float]](repeating: [Float](repeating: 0.0, count: outDim), count: alignedLen)
+        var t = 10
+        while t < 50 {
+            var c = 0
+            while c < outDim {
+                mu[t][c] = 0.05
+                c += 1
+            }
+            t += 1
+        }
+
+        var flatFeat = [Float](repeating: 0.0, count: alignedLen * inDim)
+        t = 0
+        while t < alignedLen {
+            var c = 0
+            while c < inDim {
+                flatFeat[(t * inDim) + c] = features[t][c]
+                c += 1
+            }
+            t += 1
+        }
+        var flatTgt = [Float](repeating: 0.0, count: alignedLen * outDim)
+        t = 0
+        while t < alignedLen {
+            var c = 0
+            while c < outDim {
+                flatTgt[(t * outDim) + c] = targets[t][c]
+                c += 1
+            }
+            t += 1
+        }
+        let cmArr = MLXArray(flatP, [1, alignedLen, alignedLen])
+        let rfArr = MLXArray(Float(totalRes))
+        var flatMu = [Float](repeating: 0.0, count: alignedLen * outDim)
+        t = 0
+        while t < alignedLen {
+            var c = 0
+            while c < outDim {
+                flatMu[(t * outDim) + c] = mu[t][c]
+                c += 1
+            }
+            t += 1
+        }
+        let muArr = MLXArray(flatMu, [1, alignedLen, outDim])
+
+        // 計算前の forward による direct 残差損失を計算
+        let predBefore = network.forward(features: MLXArray(flatFeat, [1, alignedLen, inDim]), bpttWindow: 16)
+        let directResLoss = AcousticLossFunctions.phonemeResidualLossWithMu(
+            predicted: predBefore,
+            muTarget: muArr,
+            centeringMatrix: cmArr,
+            totalResidualFrames: rfArr
+        ).item(Float.self)
+
+        // trainBatch を実行 (lossAndGrad のテンソル展開検証)
+        trainer.trainBatch(
+            features: MLXArray(flatFeat, [1, alignedLen, inDim]),
+            targets: MLXArray(flatTgt, [1, alignedLen, outDim]),
+            centeringMatrix: cmArr,
+            totalResidualFrames: rfArr,
+            muTarget: muArr
+        )
+
+        let losses = trainer.lastLosses
+        XCTAssertTrue(losses.totalLoss.isFinite)
+        XCTAssertTrue(0.0 < losses.residualTerm, "残差項が正の値ではありません: \(losses.residualTerm)")
+
+        let expectedResTerm = 2.0 * directResLoss
+        // 許容誤差範囲内で一致すること
+        let diff = abs(losses.residualTerm - expectedResTerm)
+        XCTAssertTrue(diff < 1e-4, "trainBatch の残差項 (\(losses.residualTerm)) と direct 計算 (\(expectedResTerm)) が不一致です: diff=\(diff)")
+
+        // trainSequence で系列長 64 (alignedLen == 64) を実行し、正常に完了することを確認
+        var seqFeat = features
+        seqFeat[0][AudioConfig.pulseChannel] = 1.0
+        seqFeat[32][AudioConfig.pulseChannel] = 1.0
+        trainer.trainSequence(
+            features: seqFeat,
+            targets: targets,
+            muTarget: mu
+        )
+        let seqLosses = trainer.lastLosses
+        XCTAssertTrue(seqLosses.totalLoss.isFinite)
+        XCTAssertTrue(0.0 < seqLosses.residualTerm, "trainSequence 実行時の残差項が正の値ではありません: \(seqLosses.residualTerm)")
+    }
+
+    // MARK: - FrameMel MLX / Pure Swift 等価性および学習検証
+    func testFrameMelModelParityAndTraining() {
+        let weights = FrameMelWeights.randomWeights(seed: 2026)
+        let swiftModel = FrameMelModel(weights: weights)
+        let mlxModel = MLXFrameMelModel(weights: weights)
+
+        // 1. Decoder + PostNet 出力の等価性検証 (< 1e-3)
+        let totalFrames = 10
+        var flatCond = [Float](repeating: 0.0, count: totalFrames * 260)
+        var i = 0
+        while i < flatCond.count {
+            flatCond[i] = sinf(Float(i) * 0.05) * 0.5
+            i += 1
+        }
+
+        let condMLX = MLXArray(flatCond, [1, totalFrames, 260])
+        let (_, mlxPost) = mlxModel.forwardDecoder(condition: condMLX)
+        let (_, swiftPost) = swiftModel.decodeMel(decoderCondition: flatCond, totalFrames: totalFrames)
+
+        let mlxPostArr = mlxPost.asArray(Float.self)
+        var maxDiff: Float = 0.0
+        var t = 0
+        while t < totalFrames {
+            var c = 0
+            while c < 64 {
+                let diff = abs(swiftPost[t][c] - mlxPostArr[t * 64 + c])
+                if maxDiff < diff {
+                    maxDiff = diff
+                }
+                c += 1
+            }
+            t += 1
+        }
+        XCTAssertTrue(maxDiff < 1e-3, "MLX と Pure Swift の Mel デコーダ出力差分が 1e-3 を超えています: \(maxDiff)")
+
+        let sil = Int32(PhonemeVocabulary.silId)
+        let phoneIds: [Int32] = [sil, 15, 20, 25, sil]
+        let targetDurations = [2, 3, 2, 3, 2] // 合計 12 フレーム
+        let trainFrames = 12
+        var targetMel = [[Float]](repeating: [Float](repeating: 0.0, count: 64), count: trainFrames)
+        var targetF0 = [Float](repeating: 0.0, count: trainFrames)
+        var targetEnergy = [Float](repeating: 0.0, count: trainFrames)
+        t = 0
+        while t < trainFrames {
+            targetF0[t] = 0.3 + sinf(Float(t) * 0.2) * 0.1
+            targetEnergy[t] = 0.5
+            var c = 0
+            while c < 64 {
+                targetMel[t][c] = -2.0 + sinf(Float(t + c) * 0.1) * 0.5
+                c += 1
+            }
+            t += 1
+        }
+
+        let trainer = MLXFrameMelTrainer(model: mlxModel, learningRate: 0.0002)
+        let initialLosses = trainer.trainSample(
+            phoneIds: phoneIds,
+            targetDurations: targetDurations,
+            targetMel: targetMel,
+            targetF0: targetF0,
+            targetEnergy: targetEnergy
+        )
+
+        XCTAssertTrue(initialLosses.totalLoss.isFinite)
+        XCTAssertTrue(0.0 < initialLosses.totalLoss)
+        XCTAssertTrue(initialLosses.decMelL1.isFinite)
+        XCTAssertTrue(initialLosses.postMelL1.isFinite)
+        XCTAssertTrue(initialLosses.voicedF0MSE.isFinite)
+        XCTAssertTrue(initialLosses.energyMSE.isFinite)
+        XCTAssertTrue(initialLosses.durMSE.isFinite)
+
+        print("Initial loss: \(initialLosses.totalLoss), dec: \(initialLosses.decMelL1), post: \(initialLosses.postMelL1), f0: \(initialLosses.voicedF0MSE), energy: \(initialLosses.energyMSE), dur: \(initialLosses.durMSE)")
+
+        let nextLosses = trainer.trainSample(
+            phoneIds: phoneIds,
+            targetDurations: targetDurations,
+            targetMel: targetMel,
+            targetF0: targetF0,
+            targetEnergy: targetEnergy
+        )
+        XCTAssertTrue(nextLosses.totalLoss < initialLosses.totalLoss, "学習ステップ後に損失が減少していません: 初期=\(initialLosses.totalLoss), 次=\(nextLosses.totalLoss)")
     }
 }
 

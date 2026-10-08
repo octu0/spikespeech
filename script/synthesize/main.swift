@@ -12,6 +12,7 @@ func main() {
     var pitch: Float = 1.0
     var voiceName: String = "female"
     var benchmark: Bool = false
+    var probeF0: Bool = false
     var copyInputPath: String? = nil
     var ablateInputPath: String? = nil
 
@@ -19,6 +20,8 @@ func main() {
     while i < args.count {
         let arg = args[i]
         switch arg {
+        case "--probe-f0":
+            probeF0 = true
         case "--copy":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -84,7 +87,7 @@ func main() {
         case "--benchmark":
             benchmark = true
         case "-h", "--help":
-            print("Usage: synthesize [-t <text> | --copy <input.wav>] [-o <output.wav>] [-w <weights.json>] [-v <voice>] [--speed 1.0] [--pitch 1.0] [--benchmark]")
+            print("Usage: synthesize [-t <text> | --copy <input.wav> | --probe-f0] [-o <output.wav>] [-w <weights.json>] [-v <voice>] [--speed 1.0] [--pitch 1.0] [--benchmark]")
             return
         default:
             if text.isEmpty {
@@ -223,6 +226,10 @@ func main() {
         text = "水をマレーシアから買わなくてはならないのです"
     }
 
+    if probeF0 && text.isEmpty {
+        text = "水をマレーシアから買わなくてはならないのです。"
+    }
+
     if text.isEmpty {
         print("エラー: 入力テキストが指定されていません。-t \"日本語テキスト\" を指定してください。")
         print("ヘルプ表示: synthesize --help")
@@ -258,6 +265,260 @@ func main() {
 
     let voiceProfile = VoiceProfile.preset(named: voiceName)
     let engine = SpikeSpeechEngine(weights: weights, vocoderWeights: vocWeights)
+
+    if probeF0 {
+        print("==================================================")
+        print("【プローブ A / B 計測開始 (design_cfc_f0_probe.md)】")
+        print("==================================================")
+        let probeText = "水をマレーシアから買わなくてはならないのです。"
+        let teacherWavPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav"
+
+        // 1. プローブ A: synthesize の特徴、F0、有声、ボコーダ
+        let samplesA = engine.synthesize(text: probeText)
+        let dataA = WavEncoder.encode(samples: samplesA, sampleRate: Int(engine.sampleRate))
+        let pathA = ".tmp/wave15/probe_prosody_f0.wav"
+        let urlA = URL(fileURLWithPath: pathA)
+        let dirA = urlA.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: dirA.path) != true {
+            try? FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
+        }
+        try? dataA.write(to: urlA)
+        let metricA = AcousticCentroidMetric.measure(pcm: samplesA)
+        let centroid1k5A = metricA.centroidMedian200to1500
+        print("プローブ A 波形出力完了: \(pathA) (サンプル数: \(samplesA.count))")
+        print("  - プローブ A 200–1500 Hz 重心差中央値: \(String(format: "%.2f", centroid1k5A)) Hz")
+        print("  - プローブ A 停止割合 (余弦 > 0.99):   \(String(format: "%.4f", metricA.cosRatio))")
+
+        // 2. プローブ B: A と同じ特徴行列の ch 194 と ch 195 だけを、prepareTrainingPair と同じ補間で教師の PitchTracker F0 に替える。
+        //    ボコーダへ渡す F0 と有声は A の prosody のまま。音響モデルの入力だけが変わる。
+        let wavReader = WavAudioReader()
+        guard let rawPCM = try? wavReader.loadWav16k(from: teacherWavPath) else {
+            print("エラー: 教師 WAV の読み込みに失敗しました: \(teacherWavPath)")
+            return
+        }
+
+        var peak: Float = 0.0
+        var pIdx = 0
+        while pIdx < rawPCM.count {
+            let a = abs(rawPCM[pIdx])
+            if peak < a {
+                peak = a
+            }
+            pIdx += 1
+        }
+        var pcm16k = rawPCM
+        if 0.01 < peak {
+            let normFactor = 0.85 / peak
+            var s = 0
+            while s < pcm16k.count {
+                pcm16k[s] = pcm16k[s] * normFactor
+                s += 1
+            }
+        }
+
+        let melExtractor = MelSpectrogramExtractor(
+            sampleRate: Float(AudioConfig.sampleRate),
+            melChannels: AudioConfig.melChannels
+        )
+        let pitchTracker = PitchTracker()
+
+        var effectiveAlign: UtteranceAlignment? = nil
+        let corpusAlignPath = "/Users/octu0/workspace/spiketrans/.tmp/jsut_ver1.1/basic5000/mas_alignments.json"
+        if FileManager.default.fileExists(atPath: corpusAlignPath) {
+            if let alignMap = try? AlignmentStore.load(from: corpusAlignPath) {
+                effectiveAlign = alignMap["BASIC5000_0001"]
+            }
+        }
+
+        guard let pair = engine.prepareTrainingPair(
+            text: probeText,
+            pcm16k: pcm16k,
+            melExtractor: melExtractor,
+            pitchTracker: pitchTracker,
+            alignment: effectiveAlign,
+            useScaledDuration: true
+        ) else {
+            print("エラー: prepareTrainingPair に失敗しました")
+            return
+        }
+
+        engine.workspace.reset()
+        engine.neuralVocoder.reset()
+
+        let linguisticFeatures = engine.lengthRegulator.processText(
+            text: probeText,
+            normalizer: engine.normalizer,
+            prosodyModel: engine.prosodyModel,
+            vocabulary: engine.vocabulary,
+            prosodyPredictor: engine.prosodyPredictor,
+            speedFactor: 1.0,
+            baseF0: VoiceProfile.default.baseF0,
+            addBoundarySilence: true,
+            meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+        )
+        let totalFrames = linguisticFeatures.totalFrames
+        let featA = engine.encodeLinguisticFeatures(features: linguisticFeatures)
+
+        var featB = featA
+        var f = 0
+        while f < totalFrames {
+            if f < pair.features.count {
+                featB[f][194] = pair.features[f][194]
+                featB[f][195] = pair.features[f][195]
+            }
+            f += 1
+        }
+
+        let snnAcousticSeqB = engine.decoder.decodeSequence(
+            featuresSeq: featB,
+            workspace: engine.workspace
+        )
+
+        let melChannels = AudioConfig.melChannels
+        var melSeqB = [[Float]](repeating: [Float](repeating: 0.0, count: melChannels), count: totalFrames)
+        var t = 0
+        while t < totalFrames {
+            if t < snnAcousticSeqB.count {
+                let outDim = snnAcousticSeqB[t].count
+                let copyCount = min(melChannels, outDim)
+                melSeqB[t].withUnsafeMutableBufferPointer { melDst in
+                    snnAcousticSeqB[t].withUnsafeBufferPointer { acSrc in
+                        melDst.baseAddress!.update(from: acSrc.baseAddress!, count: copyCount)
+                    }
+                }
+            }
+            t += 1
+        }
+
+        var vocoderF0A = [Float](repeating: 0.0, count: totalFrames)
+        var vocoderVoicedA = [Float](repeating: 0.0, count: totalFrames)
+        var vf = 0
+        while vf < totalFrames {
+            if 194 < featA[vf].count {
+                vocoderF0A[vf] = featA[vf][194] * 500.0
+            }
+            if 192 < featA[vf].count {
+                vocoderVoicedA[vf] = featA[vf][192]
+            }
+            vf += 1
+        }
+
+        var rawSamplesB = engine.neuralVocoder.synthesize(
+            mel: melSeqB,
+            f0Contour: vocoderF0A,
+            voicedFlags: vocoderVoicedA,
+            speaker: .zero
+        )
+
+        let silenceMask = engine.computeFrameSilenceMask(
+            linguisticFeatures: linguisticFeatures,
+            totalFrames: totalFrames
+        )
+        let frameSize = AudioConfig.hopSize
+        var fIdx = 0
+        while fIdx < totalFrames {
+            let isSilence = silenceMask[fIdx]
+            switch isSilence {
+            case true:
+                var prevIsSilence = true
+                if 0 < fIdx {
+                    prevIsSilence = silenceMask[fIdx - 1]
+                }
+                let startSample = fIdx * frameSize
+                let endSample = min(rawSamplesB.count, startSample + frameSize)
+                switch prevIsSilence {
+                case false:
+                    let invN = 1.0 / Float(frameSize)
+                    var s = startSample
+                    while s < endSample {
+                        let sampleOffset = s - startSample
+                        let fade = 1.0 - (Float(sampleOffset) * invN)
+                        rawSamplesB[s] = rawSamplesB[s] * fade
+                        s += 1
+                    }
+                case true:
+                    var s = startSample
+                    while s < endSample {
+                        rawSamplesB[s] = 0.0
+                        s += 1
+                    }
+                }
+            case false:
+                break
+            }
+            fIdx += 1
+        }
+
+        let targetPeak: Float = 0.85
+        var currentPeakB: Float = 0.0
+        var pIdxB = 0
+        while pIdxB < rawSamplesB.count {
+            let absVal = abs(rawSamplesB[pIdxB])
+            if currentPeakB < absVal {
+                currentPeakB = absVal
+            }
+            pIdxB += 1
+        }
+        if 0.01 < currentPeakB {
+            var normScale = targetPeak / currentPeakB
+            if 6.0 < normScale {
+                normScale = 6.0
+            }
+            var s = 0
+            while s < rawSamplesB.count {
+                var scaled = rawSamplesB[s] * normScale
+                if targetPeak < scaled {
+                    scaled = targetPeak
+                }
+                if scaled < -targetPeak {
+                    scaled = -targetPeak
+                }
+                rawSamplesB[s] = scaled
+                s += 1
+            }
+        }
+
+        let fadeLen = 160
+        if (fadeLen * 2) <= rawSamplesB.count {
+            let invFade: Float = 1.0 / Float(fadeLen)
+            var s = 0
+            while s < fadeLen {
+                let factor = Float(s) * invFade
+                rawSamplesB[s] = rawSamplesB[s] * factor
+                s += 1
+            }
+            let endOffset = rawSamplesB.count - fadeLen
+            s = 0
+            while s < fadeLen {
+                let factor = Float(fadeLen - 1 - s) * invFade
+                rawSamplesB[endOffset + s] = rawSamplesB[endOffset + s] * factor
+                s += 1
+            }
+        }
+
+        let dataB = WavEncoder.encode(samples: rawSamplesB, sampleRate: Int(engine.sampleRate))
+        let pathB = ".tmp/wave15/probe_tracker_f0.wav"
+        let urlB = URL(fileURLWithPath: pathB)
+        try? dataB.write(to: urlB)
+        let metricB = AcousticCentroidMetric.measure(pcm: rawSamplesB)
+        let centroid1k5B = metricB.centroidMedian200to1500
+        print("プローブ B 波形出力完了: \(pathB) (サンプル数: \(rawSamplesB.count))")
+        print("  - プローブ B 200–1500 Hz 重心差中央値: \(String(format: "%.2f", centroid1k5B)) Hz")
+        print("  - プローブ B 停止割合 (余弦 > 0.99):   \(String(format: "%.4f", metricB.cosRatio))")
+
+        print("--------------------------------------------------")
+        print("【プローブ計測結果と分岐判定】")
+        print("  プローブ A (synthesize prosody F0): \(String(format: "%.2f", centroid1k5A)) Hz")
+        print("  プローブ B (decoder tracker F0):    \(String(format: "%.2f", centroid1k5B)) Hz")
+
+        if 22.0 <= centroid1k5B && centroid1k5A < 22.0 {
+            print("  ==> 【分岐判定: 韻律分岐（ステップ 2）】プローブ B >= 22Hz かつ プローブ A < 22Hz。音響 CfC を凍結し、韻律の F0 予測器のみを 5 エポック学習します。")
+        } else {
+            print("  ==> 【分岐判定: 波形分岐（ステップ 3）】プローブ B < 22Hz。動きが教師 F0 を入れたメルからもボコーダへ出ていないため、韻律は回さず音響モデルに波形損失を足して 5 エポック学習します。")
+        }
+        print("--------------------------------------------------")
+        return
+    }
 
     if let ablateTeacherPath = ablateInputPath {
         // Ablation 4本切り分けモード

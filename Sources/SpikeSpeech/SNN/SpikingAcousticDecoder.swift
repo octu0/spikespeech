@@ -735,6 +735,7 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
                             let wgPtr = wgBuf.baseAddress!
                             let bgPtr = bgBuf.baseAddress!
 
+                            let isLayer0Mask = (l == 0 && 199 < inDim)
                             var t = 0
                             while t < totalFrames {
                                 let xRow = currentInput[t]
@@ -742,6 +743,9 @@ public final class SpikingAcousticDecoder: @unchecked Sendable {
                                     let xhPtr = xhBuf.baseAddress!
                                     xRow.withUnsafeBufferPointer { xBuf in
                                         xhPtr.update(from: xBuf.baseAddress!, count: inDim)
+                                    }
+                                    if isLayer0Mask {
+                                        xhPtr[199] = 0.0
                                     }
                                     h.withUnsafeBufferPointer { hBuf in
                                         (xhPtr + inDim).update(from: hBuf.baseAddress!, count: hDim)

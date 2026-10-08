@@ -69,6 +69,9 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     /// 推論時の正本として確実に保持・再現するため。
     public let meanFramesPerMora: Float?
 
+    /// SpikeVoice (arXiv:2408.00788) に基づくフレーム単位対数メルモデル重み
+    public let frameMelWeights: FrameMelWeights?
+
     /// 総層数
     public var numLayers: Int {
         switch cfcWf {
@@ -90,6 +93,11 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         case .none:
             return false
         }
+    }
+
+    /// FrameMel モデルであるかどうかのフラグ
+    public var isFrameMel: Bool {
+        return frameMelWeights != nil
     }
 
     public init(
@@ -114,7 +122,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         cfcWf: [[Float]]? = nil,
         cfcBf: [[Float]]? = nil,
         cfcWg: [[Float]]? = nil,
-        cfcBg: [[Float]]? = nil
+        cfcBg: [[Float]]? = nil,
+        frameMelWeights: FrameMelWeights? = nil
     ) {
         self.inputDim = inputDim
         self.maxHiddenDim = maxHiddenDim
@@ -138,6 +147,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.cfcBf = cfcBf
         self.cfcWg = cfcWg
         self.cfcBg = cfcBg
+        self.frameMelWeights = frameMelWeights
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -145,6 +155,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         case wIn, wRec, bH, wLayers, bHLayers, gammaRMS, wConv, wOut, bOut
         case lexicon, prosodyWeights, phonemeAverageDurations, meanFramesPerMora
         case cfcWf, cfcBf, cfcWg, cfcBg
+        case frameMelWeights
     }
 
     public init(from decoder: Decoder) throws {
@@ -240,6 +251,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.cfcBf = try container.decodeIfPresent([[Float]].self, forKey: .cfcBf)
         self.cfcWg = try container.decodeIfPresent([[Float]].self, forKey: .cfcWg)
         self.cfcBg = try container.decodeIfPresent([[Float]].self, forKey: .cfcBg)
+        self.frameMelWeights = try container.decodeIfPresent(FrameMelWeights.self, forKey: .frameMelWeights)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -272,6 +284,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         try container.encodeIfPresent(cfcBf, forKey: .cfcBf)
         try container.encodeIfPresent(cfcWg, forKey: .cfcWg)
         try container.encodeIfPresent(cfcBg, forKey: .cfcBg)
+        try container.encodeIfPresent(frameMelWeights, forKey: .frameMelWeights)
     }
 
     /// 語彙知識を付与した新しい重みインスタンスを生成する
@@ -300,7 +313,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -328,7 +342,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -358,7 +373,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -388,7 +404,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -418,7 +435,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -472,7 +490,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -513,7 +532,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -541,7 +561,8 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: self.cfcWf,
             cfcBf: self.cfcBf,
             cfcWg: self.cfcWg,
-            cfcBg: self.cfcBg
+            cfcBg: self.cfcBg,
+            frameMelWeights: self.frameMelWeights
         )
     }
 
@@ -591,7 +612,37 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
             cfcWf: cfcWf,
             cfcBf: cfcBf,
             cfcWg: cfcWg,
-            cfcBg: cfcBg
+            cfcBg: cfcBg,
+            frameMelWeights: self.frameMelWeights
+        )
+    }
+
+    /// FrameMel モデル重みを更新した新しい重みインスタンスを生成する
+    public func withFrameMelWeights(_ newWeights: FrameMelWeights?) -> SpikingNetworkWeights {
+        return SpikingNetworkWeights(
+            inputDim: self.inputDim,
+            maxHiddenDim: self.maxHiddenDim,
+            outputDim: self.outputDim,
+            timeSteps: self.timeSteps,
+            lifConfig: self.lifConfig,
+            wIn: self.wIn,
+            wRec: self.wRec,
+            bH: self.bH,
+            wLayers: self.wLayers,
+            bHLayers: self.bHLayers,
+            gammaRMS: self.gammaRMS,
+            wConv: self.wConv,
+            wOut: self.wOut,
+            bOut: self.bOut,
+            lexicon: self.lexicon,
+            prosodyWeights: self.prosodyWeights,
+            phonemeAverageDurations: self.phonemeAverageDurations,
+            meanFramesPerMora: self.meanFramesPerMora,
+            cfcWf: self.cfcWf,
+            cfcBf: self.cfcBf,
+            cfcWg: self.cfcWg,
+            cfcBg: self.cfcBg,
+            frameMelWeights: newWeights
         )
     }
 

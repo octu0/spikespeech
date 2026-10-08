@@ -361,4 +361,158 @@ final class LinguisticTests: XCTestCase {
         XCTAssertTrue(foundVowelEnergy, "母音の高エネルギー区間が存在すること")
         XCTAssertTrue(foundFricativeEnergy, "摩擦音の中間エネルギー区間が存在すること")
     }
+
+    /// 音素境界での半正弦を外した一定カテゴリピーク（母音 0.70, 無声摩擦 0.18 等）および無声閉鎖の検証
+    func testConstantCategoryPeakEnergyContour() {
+        let features = lengthRegulator.processText(
+            text: "すし",
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            addBoundarySilence: false
+        )
+
+        var p = 0
+        var curF = 0
+        while p < features.phoneIds.count {
+            let pid = Int(features.phoneIds[p])
+            let dur = Int(features.durations[p])
+            let sym = vocabulary.token(for: pid)
+            var f = 0
+            while f < dur {
+                let eng = features.energyContour[curF + f]
+                switch sym {
+                case "s", "sh":
+                    XCTAssertEqual(eng, 0.18, accuracy: 1e-5, "無声摩擦音は全フレームで 0.18 一定であること")
+                case "u", "i":
+                    XCTAssertEqual(eng, 0.70, accuracy: 1e-5, "母音は端でも半正弦に減衰せず 0.70 一定であること")
+                default:
+                    break
+                }
+                f += 1
+            }
+            curF += dur
+            p += 1
+        }
+
+        // 無声破裂音（k, t）: dur <= 2 は全フレーム 0.35、dur >= 3 は先頭 dur - 2 フレーム 0.02、末尾 2 フレーム 0.35
+        let stopFeatures = lengthRegulator.processText(
+            text: "かた",
+            normalizer: normalizer,
+            prosodyModel: prosodyModel,
+            vocabulary: vocabulary,
+            addBoundarySilence: false
+        )
+
+        var sp = 0
+        var sCurF = 0
+        while sp < stopFeatures.phoneIds.count {
+            let pid = Int(stopFeatures.phoneIds[sp])
+            let dur = Int(stopFeatures.durations[sp])
+            switch vocabulary.isUnvoicedStop(id: pid) {
+            case true:
+                var f = 0
+                while f < dur {
+                    let eng = stopFeatures.energyContour[sCurF + f]
+                    switch dur <= 2 {
+                    case true:
+                        XCTAssertEqual(eng, 0.35, accuracy: 1e-5, "dur <= 2 の無声閉鎖音は全フレーム 0.35 であること")
+                    case false:
+                        switch f < dur - 2 {
+                        case true:
+                            XCTAssertEqual(eng, 0.02, accuracy: 1e-5, "無声閉鎖音の閉鎖期フレームは 0.02 であること")
+                        case false:
+                            XCTAssertEqual(eng, 0.35, accuracy: 1e-5, "無声閉鎖音の末尾2フレームは 0.35 であること")
+                        }
+                    }
+                    f += 1
+                }
+            case false:
+                let sym = vocabulary.token(for: pid)
+                var f = 0
+                while f < dur {
+                    let eng = stopFeatures.energyContour[sCurF + f]
+                    if sym == "a" {
+                        XCTAssertEqual(eng, 0.70, accuracy: 1e-5, "母音 a は全フレーム 0.70 一定であること")
+                    }
+                    f += 1
+                }
+            }
+            sCurF += dur
+            sp += 1
+        }
+    }
+
+    /// 無声閉鎖音（id 10: k, 12: t, 23: p, 30: ky, 38: py）の継続時間境界条件（dur = 1, 2, 3, 4, 5）の網羅検証
+    func testUnvoicedStopDurationEdgeCases() {
+        // 全5種の無声閉鎖音IDが正しく判定されることの検証
+        let stopIds: [Int] = [10, 12, 23, 30, 38]
+        for sid in stopIds {
+            XCTAssertTrue(vocabulary.isUnvoicedStop(id: sid), "ID \(sid) は無声閉鎖音であること")
+        }
+
+        let testCases: [(word: String, stopId: Int32)] = [
+            ("か", 10), // k
+            ("た", 12), // t
+            ("ぱ", 23)  // p
+        ]
+
+        let durationConfigs: [(targetDur: Int, stopWeight: Float, vowelWeight: Float, moraFrames: Float)] = [
+            (1, 1.0, 1.0, 2.0),
+            (2, 2.0, 1.0, 3.0),
+            (3, 3.0, 1.0, 4.0),
+            (4, 4.0, 2.0, 6.0),
+            (5, 5.0, 2.0, 7.0)
+        ]
+
+        var cIdx = 0
+        while cIdx < testCases.count {
+            let tc = testCases[cIdx]
+            var dIdx = 0
+            while dIdx < durationConfigs.count {
+                let dc = durationConfigs[dIdx]
+                let avgDurs: [Int32: Float] = [
+                    tc.stopId: dc.stopWeight,
+                    5: dc.vowelWeight,  // a
+                    1: 1.0              // sil
+                ]
+                let lr = LengthRegulator(
+                    phonemeAverageDurations: avgDurs,
+                    meanFramesPerMora: dc.moraFrames
+                )
+                let feat = lr.processText(
+                    text: tc.word,
+                    normalizer: normalizer,
+                    prosodyModel: prosodyModel,
+                    vocabulary: vocabulary,
+                    addBoundarySilence: false
+                )
+
+                XCTAssertEqual(feat.phoneIds.count, 2, "\(tc.word) は子音と母音の2音素であること")
+                let actualStopId = feat.phoneIds[0]
+                XCTAssertEqual(actualStopId, tc.stopId, "先頭音素 ID が期待値と一致すること")
+                let actualDur = Int(feat.durations[0])
+                XCTAssertEqual(actualDur, dc.targetDur, "目標継続時間 \(dc.targetDur) と実測継続時間 \(actualDur) が一致すること")
+
+                var f = 0
+                while f < actualDur {
+                    let eng = feat.energyContour[f]
+                    switch actualDur <= 2 {
+                    case true:
+                        XCTAssertEqual(eng, 0.35, accuracy: 1e-5, "dur <= 2 の無声閉鎖音は全フレーム 0.35 であること (dur=\(actualDur), f=\(f))")
+                    case false:
+                        switch f < actualDur - 2 {
+                        case true:
+                            XCTAssertEqual(eng, 0.02, accuracy: 1e-5, "dur >= 3 の無声閉鎖音閉鎖期は 0.02 であること (dur=\(actualDur), f=\(f))")
+                        case false:
+                            XCTAssertEqual(eng, 0.35, accuracy: 1e-5, "dur >= 3 の無声閉鎖音開放期は 0.35 であること (dur=\(actualDur), f=\(f))")
+                        }
+                    }
+                    f += 1
+                }
+                dIdx += 1
+            }
+            cIdx += 1
+        }
+    }
 }

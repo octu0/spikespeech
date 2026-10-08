@@ -384,19 +384,29 @@ public final class MLXSpikingAcousticNetwork: Module, @unchecked Sendable {
         var currentInput = features
         var l = 0
         while l < numL {
+            var layerInput = currentInput
+            let inDim = currentInput.shape[currentInput.shape.count - 1]
+            if l == 0 && 199 < inDim {
+                var maskValues = [Float](repeating: 1.0, count: inDim)
+                maskValues[199] = 0.0
+                let mask = MLXArray(maskValues).reshaped([1, 1, inDim])
+                layerInput = layerInput * mask
+            }
+
             let wf = cfcWf[l]
             let bf = cfcBf[l]
             let wg = cfcWg[l]
             let bg = cfcBg[l]
             let hDim = wf.shape[1]
 
+            // 発話の先頭は 0 から始める
             var h = MLXArray.zeros([batchSize, hDim])
             var hSeq: [MLXArray] = []
             hSeq.reserveCapacity(seqLen)
 
             var t = 0
             while t < seqLen {
-                let xt = currentInput[0..., t, 0...]
+                let xt = layerInput[0..., t, 0...]
                 let xh = concatenated([xt, h], axis: -1)
                 let f = matmul(xh, wf) + bf
                 let zg = matmul(xh, wg) + bg
@@ -594,14 +604,16 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     public let bpttWindow: Int
     public let vocoder: MLXNeuralVocoder?
     public let waveformLossWeight: Float
+    public let residualLossWeight: Float
     public let usePreTanh: Bool
-    public var lastLosses: (totalLoss: Float, melL1: Float, waveTerm: Float) = (0.0, 0.0, 0.0)
+    public var lastLosses: (totalLoss: Float, melL1: Float, waveTerm: Float, residualTerm: Float) = (0.0, 0.0, 0.0, 0.0)
     private let lossAndGrad: (MLXSpikingAcousticNetwork, [MLXArray]) -> ([MLXArray], ModuleParameters)
 
     public init(
         network: MLXSpikingAcousticNetwork,
         vocoder: MLXNeuralVocoder? = nil,
         waveformLossWeight: Float = 0.0,
+        residualLossWeight: Float = 0.0,
         usePreTanh: Bool = false,
         learningRate: Float = 0.003,
         bpttWindow: Int = 16,
@@ -610,6 +622,7 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
         self.network = network
         self.vocoder = vocoder
         self.waveformLossWeight = waveformLossWeight
+        self.residualLossWeight = residualLossWeight
         self.usePreTanh = usePreTanh
         vocoder?.freeze()
 
@@ -657,16 +670,59 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             var totalLoss = l1Loss + (deltaLoss * 0.5)
             var waveTerm = MLXArray(0.0)
 
-            if let voc = vocoder, 0.0 < waveformLossWeight, 4 <= arrays.count, 195 <= fArr.dim(-1) {
-                let targetWave = arrays[3]
+            var targetWave: MLXArray? = nil
+            var segIdx: MLXArray? = nil
+            var cmArr: MLXArray? = nil
+            var rfArr: MLXArray? = nil
+            var muArr: MLXArray? = nil
+
+            var aIdx = 3
+            while aIdx < arrays.count {
+                let candidate = arrays[aIdx]
+                switch candidate.ndim {
+                case 3:
+                    if candidate.shape[1] != candidate.shape[2] {
+                        muArr = candidate
+                    } else {
+                        switch cmArr {
+                        case .none:
+                            cmArr = candidate
+                        case .some:
+                            muArr = candidate
+                        }
+                    }
+                case 2:
+                    targetWave = candidate
+                case 1:
+                    switch candidate.size {
+                    case 1:
+                        switch candidate.dtype {
+                        case .float32:
+                            rfArr = candidate
+                        default:
+                            segIdx = candidate
+                        }
+                    default:
+                        segIdx = candidate
+                    }
+                case 0:
+                    if candidate.dtype == .float32 {
+                        rfArr = candidate
+                    }
+                default:
+                    break
+                }
+                aIdx += 1
+            }
+
+            if let voc = vocoder, let tw = targetWave, 0.0 < waveformLossWeight, 195 <= fArr.dim(-1) {
                 let segFrames = 32
                 let hopSize = AudioConfig.hopSize
                 let segSamples = segFrames * hopSize
-                if 5 <= arrays.count {
-                    let segIdx = arrays[4]
-                    let predSegment = pred[0..., segIdx, 0...]
-                    let f0Segment = fArr[0..., segIdx, 194..<195]
-                    let voicedSegment = fArr[0..., segIdx, 192..<193]
+                if let sIdx = segIdx {
+                    let predSegment = pred[0..., sIdx, 0...]
+                    let f0Segment = fArr[0..., sIdx, 194..<195]
+                    let voicedSegment = fArr[0..., sIdx, 192..<193]
                     let vocInput = concatenated([predSegment, f0Segment, voicedSegment], axis: -1)
                     let predWave: MLXArray
                     switch usePreTanh {
@@ -675,11 +731,11 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                     case false:
                         predWave = voc(vocInput)
                     }
-                    let waveLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: predWave, target: targetWave)
+                    let waveLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: predWave, target: tw)
                     waveTerm = MLXArray(waveformLossWeight) * waveLoss
                     totalLoss = totalLoss + waveTerm
                 } else {
-                    let totalSamples = targetWave.dim(-1)
+                    let totalSamples = tw.dim(-1)
                     let numSegs = totalSamples / segSamples
                     if 0 < numSegs {
                         var waveLossSum = MLXArray(0.0)
@@ -700,7 +756,7 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                             }
                             let sampleStart = k * segSamples
                             let sampleEnd = sampleStart + segSamples
-                            let targetWaveSeg = targetWave[0..., sampleStart..<sampleEnd]
+                            let targetWaveSeg = tw[0..., sampleStart..<sampleEnd]
                             let waveLoss = MLXNeuralVocoder.multiResolutionSTFTLoss(predicted: predWave, target: targetWaveSeg)
                             waveLossSum = waveLossSum + waveLoss
                             k += 1
@@ -711,8 +767,29 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                     }
                 }
             }
+            var resTerm = MLXArray(0.0)
+            if 0.0 < residualLossWeight, let cm = cmArr, let rf = rfArr {
+                let resLoss: MLXArray
+                if let mu = muArr {
+                    resLoss = AcousticLossFunctions.phonemeResidualLossWithMu(
+                        predicted: pred,
+                        muTarget: mu,
+                        centeringMatrix: cm,
+                        totalResidualFrames: rf
+                    )
+                } else {
+                    resLoss = AcousticLossFunctions.phonemeResidualLoss(
+                        predicted: pred,
+                        target: tArr,
+                        centeringMatrix: cm,
+                        totalResidualFrames: rf
+                    )
+                }
+                resTerm = MLXArray(residualLossWeight) * resLoss
+                totalLoss = totalLoss + resTerm
+            }
 
-            return [totalLoss, l1Loss, waveTerm]
+            return [totalLoss, l1Loss, waveTerm, resTerm]
         }
     }
 
@@ -778,7 +855,10 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
         targets: MLXArray,
         mask: MLXArray? = nil,
         targetWaveform: MLXArray? = nil,
-        segIndices: MLXArray? = nil
+        segIndices: MLXArray? = nil,
+        centeringMatrix: MLXArray? = nil,
+        totalResidualFrames: MLXArray? = nil,
+        muTarget: MLXArray? = nil
     ) -> Float {
         let maskArray: MLXArray
         switch mask {
@@ -794,10 +874,23 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                 inArrays.append(si)
             }
         }
+        if let cm = centeringMatrix {
+            inArrays.append(cm)
+            if let rf = totalResidualFrames {
+                inArrays.append(rf)
+            }
+        }
+        if let mu = muTarget {
+            inArrays.append(mu)
+        }
         let (lossVals, grads) = self.lossAndGrad(network, inArrays)
         let lossVal = lossVals[0]
         let l1Val = lossVals[1]
         let waveVal = lossVals[2]
+        var resVal = MLXArray(0.0)
+        if 4 <= lossVals.count {
+            resVal = lossVals[3]
+        }
         var safeGrads = grads
         if network.isCfC != true {
             if let recG = safeGrads[unwrapping: "wRec"] {
@@ -811,16 +904,32 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                 safeGrads[unwrapping: "wIn"] = inG * scale
             }
         }
-        let (clippedGrads, _) = clipGradNorm(gradients: safeGrads, maxNorm: 5.0)
+        let gradMaxNorm: Float
+        switch network.isCfC {
+        case true:
+            gradMaxNorm = 1.0
+        case false:
+            gradMaxNorm = 5.0
+        }
+        let (clippedGrads, totalNorm) = clipGradNorm(gradients: safeGrads, maxNorm: gradMaxNorm)
 
-        optimizer.update(model: network, gradients: clippedGrads)
-        eval(network, optimizer, lossVal, l1Val, waveVal)
-        Stream.gpu.synchronize()
-
+        eval(lossVal, l1Val, waveVal, resVal, totalNorm)
         let lossResult = lossVal.item(Float.self)
         let l1Result = l1Val.item(Float.self)
         let waveResult = waveVal.item(Float.self)
-        self.lastLosses = (totalLoss: lossResult, melL1: l1Result, waveTerm: waveResult)
+        let resResult = resVal.item(Float.self)
+        let normVal = totalNorm.item(Float.self)
+
+        if lossResult.isFinite != true || normVal.isFinite != true || 50.0 < lossResult {
+            Memory.clearCache()
+            return lossResult
+        }
+
+        optimizer.update(model: network, gradients: clippedGrads)
+        eval(network, optimizer)
+        Stream.gpu.synchronize()
+
+        self.lastLosses = (totalLoss: lossResult, melL1: l1Result, waveTerm: waveResult, residualTerm: resResult)
         Memory.clearCache()
         return lossResult
     }
@@ -872,10 +981,12 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
     }
 
     /// 単一発話の系列学習ヘルパー
+    @discardableResult
     public func trainSequence(
         features: [[Float]],
         targets: [[Float]],
-        targetAudio: [Float]? = nil
+        targetAudio: [Float]? = nil,
+        muTarget: [[Float]]? = nil
     ) -> Float {
         let rawLen = min(features.count, targets.count)
         if rawLen <= 0 {
@@ -923,6 +1034,34 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
             targetWaveArr = MLXArray(segAudio, [1, totalSamples])
         }
 
+        var cmArr: MLXArray? = nil
+        var rfArr: MLXArray? = nil
+        var muArr: MLXArray? = nil
+        if 0.0 < residualLossWeight {
+            let intervals = AcousticLossFunctions.findPhonemeIntervals(features: features, rawLen: rawLen)
+            let (flatP, totalRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: intervals, alignedLen: alignedLen)
+            cmArr = MLXArray(flatP, [1, alignedLen, alignedLen])
+            rfArr = MLXArray(Float(totalRes))
+
+            if let mu = muTarget {
+                var flatMu = [Float](repeating: 0.0, count: alignedLen * outDim)
+                var mt = 0
+                while mt < rawLen {
+                    if mt < mu.count {
+                        var mc = 0
+                        while mc < outDim {
+                            if mc < mu[mt].count {
+                                flatMu[(mt * outDim) + mc] = mu[mt][mc]
+                            }
+                            mc += 1
+                        }
+                    }
+                    mt += 1
+                }
+                muArr = MLXArray(flatMu, [1, alignedLen, outDim])
+            }
+        }
+
         return autoreleasepool {
             let fArr = MLXArray(flatFeat, [1, alignedLen, inDim])
             let tArr = MLXArray(flatTgt, [1, alignedLen, outDim])
@@ -933,7 +1072,10 @@ public final class MLXAcousticBPTTTrainer: @unchecked Sendable {
                 targets: tArr,
                 mask: mArr,
                 targetWaveform: targetWaveArr,
-                segIndices: nil
+                segIndices: nil,
+                centeringMatrix: cmArr,
+                totalResidualFrames: rfArr,
+                muTarget: muArr
             )
         }
     }

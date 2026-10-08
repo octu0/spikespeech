@@ -420,4 +420,44 @@ final class DSPTests: XCTestCase {
             f += 1
         }
     }
+
+    // MARK: - 10. 振幅エンベロープ 6–12 Hz 変調割合計測テスト
+
+    func testMeasureModulation6to12Ratio() {
+        // 1. 境界条件の検証: 空配列・極短サンプル・無音
+        XCTAssertEqual(AcousticCentroidMetric.measureModulation6to12Ratio(pcm: []), 0.0, accuracy: 1e-6)
+        let shortPCM = [Float](repeating: 0.1, count: 100)
+        XCTAssertEqual(AcousticCentroidMetric.measureModulation6to12Ratio(pcm: shortPCM), 0.0, accuracy: 1e-6)
+        let zeroPCM = [Float](repeating: 0.0, count: 16000)
+        XCTAssertEqual(AcousticCentroidMetric.measureModulation6to12Ratio(pcm: zeroPCM), 0.0, accuracy: 1e-6)
+
+        // 2. 8 Hz 振幅変調信号 (6–12 Hz 帯域内): 変調割合が顕著に高くなること
+        let sampleRate: Float = 16000.0
+        let durSeconds: Float = 2.0
+        let totalSamples = Int(sampleRate * durSeconds)
+        var pcm8Hz = [Float](repeating: 0.0, count: totalSamples)
+        var s = 0
+        while s < totalSamples {
+            let t = Float(s) / sampleRate
+            let carrier = sinf(2.0 * Float.pi * 1000.0 * t)
+            let mod = 1.0 + (0.8 * sinf(2.0 * Float.pi * 8.0 * t))
+            pcm8Hz[s] = carrier * mod * 0.4
+            s += 1
+        }
+        let ratio8Hz = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: pcm8Hz)
+        XCTAssertTrue(0.70 <= ratio8Hz, "8 Hz 変調信号の 6–12 Hz 変調比率は 0.70 以上であること（実測: \(ratio8Hz)）")
+
+        // 3. 18 Hz 振幅変調信号 (2–25 Hz 帯域内だが 6–12 Hz 帯域外): 6–12 Hz 変調割合が極めて低くなること
+        var pcm18Hz = [Float](repeating: 0.0, count: totalSamples)
+        s = 0
+        while s < totalSamples {
+            let t = Float(s) / sampleRate
+            let carrier = sinf(2.0 * Float.pi * 1000.0 * t)
+            let mod = 1.0 + (0.8 * sinf(2.0 * Float.pi * 18.0 * t))
+            pcm18Hz[s] = carrier * mod * 0.4
+            s += 1
+        }
+        let ratio18Hz = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: pcm18Hz)
+        XCTAssertTrue(ratio18Hz <= 0.15, "18 Hz 変調信号の 6–12 Hz 変調比率は 0.15 以下であること（実測: \(ratio18Hz)）")
+    }
 }

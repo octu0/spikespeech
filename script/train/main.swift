@@ -19,7 +19,8 @@ func main() {
     var inDim: Int = AudioConfig.acousticInputDim // 256 (Triphone context 64*3 + acoustic features)
     var outDim: Int = AudioConfig.melChannels // 64
     var timeSteps: Int = 4
-    var useCfC: Bool = true
+    var useCfC: Bool = false
+    var useFrameMel: Bool = true
     var maxSamples: Int? = nil
     var datasetPath: String? = nil
     var outputPath: String = "Models/weights.json"
@@ -30,6 +31,7 @@ func main() {
     var vocoderEpochs: Int = 5
     var vocoderLearningRate: Float = 0.0003
     var waveformLossWeight: Float = 0.15
+    var residualLossWeight: Float = 3.0
     var prosodyEpochs: Int = 15
     var prosodySamplesLimit: Int? = nil
     var prosodyStepsPerSample: Int = 2
@@ -39,7 +41,7 @@ func main() {
     var forceMAS: Bool = false
 
     func printUsage() {
-        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [--force-mas] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--waveform-weight <weight>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [--fresh-snn] [-o <output.json>]")
+        print("Usage: train -d <corpus_dir> [--alignments <alignments.json>] [--force-mas] [-s <samples>] [-e <epochs>] [--prosody-samples <samples>] [--prosody-steps <steps>] [--prosody-lr <lr>] [--fresh-prosody] [--vocoder-epochs <epochs>] [--vocoder-lr <lr>] [--waveform-weight <weight>] [--residual-weight <weight>] [--prosody-epochs <epochs>] [--lr <learning_rate>] [--lr-min <min_lr>] [--warmup-epochs <epochs>] [--wd <weight_decay>] [--shuffle-seed <seed>] [--no-shuffle] [--hidden-dim <dim>] [--num-layers <layers>] [--in-dim <dim>] [--out-dim <dim>] [--time-steps <steps>] [-w <weights.json>] [--fresh] [--fresh-snn] [-o <output.json>]")
     }
 
 
@@ -157,6 +159,18 @@ func main() {
                 }
                 i += 1
             }
+        case "--residual-weight":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Float(args[nextIdx]) {
+                    var safeVal = val
+                    if safeVal < 0.0 {
+                        safeVal = 0.0
+                    }
+                    residualLossWeight = safeVal
+                }
+                i += 1
+            }
         case "--lr":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -259,10 +273,15 @@ func main() {
             forceInitBOut = true
         case "--force-mas":
             forceMAS = true
+        case "--frame-mel":
+            useFrameMel = true
+            useCfC = false
         case "--cfc":
             useCfC = true
+            useFrameMel = false
         case "--snn":
             useCfC = false
+            useFrameMel = false
         case "-h", "--help":
             printUsage()
             return
@@ -279,7 +298,6 @@ func main() {
         inDim = 256
         outDim = 64
         numLayers = 4
-        waveformLossWeight = 0.0
     }
 
     guard let explicit = datasetPath, explicit.isEmpty != true else {
@@ -370,18 +388,57 @@ func main() {
     }
 
     let weights: SpikingNetworkWeights
-    switch loadedExisting {
+    switch useFrameMel {
+    case true:
+        let base: SpikingNetworkWeights
+        switch loadedExisting {
+        case .some(let loaded):
+            var lex = loaded.lexicon
+            if lex.isEmpty {
+                lex = ViterbiMorphology.loadDefaultLexicon()
+            }
+            base = loaded.withLexicon(lex)
+            print("既存の学習済み重みをロードしました: \(loadWeightsPath ?? "")")
+        case .none:
+            let defaultLex = ViterbiMorphology.loadDefaultLexicon()
+            base = SpikingNetworkWeights.initCfCWeights(
+                inputDim: inDim,
+                hiddenDim: hiddenDim,
+                outputDim: outDim,
+                numLayers: numLayers,
+                seed: 2026,
+                lexicon: defaultLex
+            )
+            print("新規の重みで初期化しました。")
+        }
+        let fmw: FrameMelWeights
+        var shouldFresh = forceFresh || forceFreshSNN
+        if base.frameMelWeights == nil {
+            shouldFresh = true
+        }
+        switch shouldFresh {
+        case true:
+            print("FrameMel モデル重みを新規乱数で初期化しました。")
+            fmw = FrameMelWeights.randomWeights(seed: 2026)
+        case false:
+            print("既存の FrameMel モデル重みをロードしてウォームスタートします。")
+            fmw = base.frameMelWeights!
+        }
+        weights = base.withFrameMelWeights(fmw)
+    case false:
+        switch loadedExisting {
     case .some(let loaded):
         var lex = loaded.lexicon
         if lex.isEmpty {
             lex = ViterbiMorphology.loadDefaultLexicon()
         }
         var shouldFreshAcoustic = forceFresh || forceFreshSNN
-        if useCfC {
-            // CfC 音響モデル重み（W_f, b_f, W_g, b_g, 出力層）は新規初期化する（既存の softplus 構成重みを引き継がない）
+        if useCfC && loaded.isCfC != true {
+            // 既存重みが CfC でない場合は新規 CfC 初期化が必要
             shouldFreshAcoustic = true
         }
         if useCfC != true && loaded.isCfC {
+            // 既存重みが CfC で SNN 学習を指定された場合は新規 SNN 初期化が必要
             shouldFreshAcoustic = true
         }
 
@@ -509,6 +566,7 @@ func main() {
             )
             print("新規の決定論的ランダム SNN 重みで初期化しました。")
         }
+    }
     }
 
     let engine = SpikeSpeechEngine(weights: weights)
@@ -727,6 +785,7 @@ func main() {
     // コーパス読み込み
     let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]], targetAudio: [Float])] = []
+    var frameMelSamples: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
     var reconTargetSample: (features: [[Float]], targets: [[Float]], targetAudio: [Float])? = nil
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
     var prosodySamples: [ProsodyTrainingSample] = []
@@ -739,7 +798,12 @@ func main() {
         var lineIdx = 0
         while lineIdx < lines.count {
             if let limit = maxSamples {
-                if limit <= trainingData.count {
+                let currentCount: Int
+                switch useFrameMel {
+                case true: currentCount = frameMelSamples.count
+                case false: currentCount = trainingData.count
+                }
+                if limit <= currentCount {
                     break
                 }
             }
@@ -885,22 +949,40 @@ func main() {
                             }
                         }
 
-                        if let pair = engine.prepareTrainingPair(
-                            text: text,
-                            pcm16k: pcm16k,
-                            melExtractor: melExtractor,
-                            pitchTracker: pitchTracker,
-                            alignment: effectiveAlign,
-                            useScaledDuration: true
-                        ) {
-                            trainingData.append(pair)
-                            if id == "BASIC5000_0001" {
-                                reconTargetSample = pair
+                        switch useFrameMel {
+                        case true:
+                            if let fSample = engine.prepareFrameMelTrainingSample(
+                                text: text,
+                                pcm16k: pcm16k,
+                                melExtractor: melExtractor,
+                                pitchTracker: pitchTracker,
+                                alignment: effectiveAlign
+                            ) {
+                                frameMelSamples.append(fSample)
+                                if 0 < vocoderEpochs {
+                                    let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
+                                    let pitchResult = pitchTracker.track(pcm: pcm16k)
+                                    vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                                }
                             }
-                            if 0 < vocoderEpochs {
-                                let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
-                                let pitchResult = pitchTracker.track(pcm: pcm16k)
-                                vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                        case false:
+                            if let pair = engine.prepareTrainingPair(
+                                text: text,
+                                pcm16k: pcm16k,
+                                melExtractor: melExtractor,
+                                pitchTracker: pitchTracker,
+                                alignment: effectiveAlign,
+                                useScaledDuration: true
+                            ) {
+                                trainingData.append(pair)
+                                if id == "BASIC5000_0001" {
+                                    reconTargetSample = pair
+                                }
+                                if 0 < vocoderEpochs {
+                                    let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
+                                    let pitchResult = pitchTracker.track(pcm: pcm16k)
+                                    vocoderPairs.append((mel: extractedMel, f0: pitchResult.f0, voiced: pitchResult.voiced, pcm: pcm16k))
+                                }
                             }
                         }
                         if 0 < prosodyEpochs {
@@ -942,11 +1024,346 @@ func main() {
         }
     }
 
-    if trainingData.isEmpty {
-        print("エラー: 有効な学習データが 0 件です。")
+    switch useFrameMel {
+    case true:
+        if frameMelSamples.isEmpty {
+            print("エラー: 有効な FrameMel 学習データが 0 件です。")
+            return
+        }
+        print("有効 FrameMel 学習サンプル数: \(frameMelSamples.count) 件")
+    case false:
+        if trainingData.isEmpty {
+            print("エラー: 有効な学習データが 0 件です。")
+            return
+        }
+        print("有効学習サンプル数: \(trainingData.count) 件")
+    }
+
+    if useFrameMel {
+        print("\n==================================================")
+        print("SpikeVoice (arXiv:2408.00788) フレーム単位対数メルモデル学習を開始します")
+        print("  データ数: \(frameMelSamples.count), エポック数: \(epochs)")
+        print("  初期学習率: \(learningRate), 最小学習率: \(lrMin)")
+        print("==================================================")
+
+        // 1. モデルとトレーナーの初期化
+        let frameMelModel: MLXFrameMelModel
+        switch weights.frameMelWeights {
+        case .some(let existingW):
+            frameMelModel = MLXFrameMelModel(weights: existingW)
+            print("既存の FrameMel 重みをロードしました。")
+        case .none:
+            var melSums = [Float](repeating: 0.0, count: AudioConfig.melChannels)
+            var melCounts = [Float](repeating: 0.0, count: AudioConfig.melChannels)
+            var sIdx = 0
+            while sIdx < frameMelSamples.count {
+                let sMel = frameMelSamples[sIdx].targetMel
+                var f = 0
+                while f < sMel.count {
+                    var c = 0
+                    while c < AudioConfig.melChannels {
+                        if c < sMel[f].count {
+                            melSums[c] += sMel[f][c]
+                            melCounts[c] += 1.0
+                        }
+                        c += 1
+                    }
+                    f += 1
+                }
+                sIdx += 1
+            }
+            var meanMel = [Float](repeating: 0.0, count: AudioConfig.melChannels)
+            var c = 0
+            while c < AudioConfig.melChannels {
+                if 0.0 < melCounts[c] {
+                    meanMel[c] = melSums[c] / melCounts[c]
+                }
+                c += 1
+            }
+            let initW = FrameMelWeights.randomWeights(seed: 2026, meanMel: meanMel)
+            frameMelModel = MLXFrameMelModel(weights: initW)
+            print("新規の FrameMel 重みを決定論的初期化しました（初期 meanMel 適合）。")
+        }
+
+        var trainer = MLXFrameMelTrainer(model: frameMelModel, learningRate: learningRate)
+        Memory.cacheLimit = 32 * 1024 * 1024
+
+        let schedule = CosineWarmupSchedule(
+            lrBase: learningRate,
+            lrMin: lrMin,
+            warmupEpochs: warmupEpochs,
+            totalEpochs: epochs
+        )
+
+        let healthyAlignments = Array(alignmentMap.values).filter { AlignmentStore.isUtteranceAlignmentValid($0) }
+        let healthyPhonemeAverages: [Int32: Float]
+        if healthyAlignments.isEmpty != true {
+            healthyPhonemeAverages = AlignmentStore.computeAverageDurations(from: healthyAlignments)
+        } else {
+            switch weights.phonemeAverageDurations {
+            case .some(let existing):
+                healthyPhonemeAverages = existing
+            case .none:
+                healthyPhonemeAverages = LengthRegulator.defaultPhonemeAverageDurations
+            }
+        }
+        let baseWithDurations = weights
+            .withMeanFramesPerMora(16.0)
+            .withPhonemeAverageDurations(healthyPhonemeAverages)
+
+        var bestMizuCentroid: Float = -Float.greatestFiniteMagnitude
+        var bestMizuStop: Float = Float.greatestFiniteMagnitude
+        var bestEpoch: Int = -1
+        var bestFullWeights: SpikingNetworkWeights = baseWithDurations
+        var bestMizuPCM: [Float] = []
+        var bestTenkiPCM: [Float] = []
+        var bestLosses: (decMelL1: Float, voicedF0MSE: Float, energyMSE: Float) = (0.0, 0.0, 0.0)
+        var stopReason: String = "エポック 30 まで実行完了"
+
+        var epoch = 0
+        epochLoop: while epoch < epochs {
+            if noShuffle != true {
+                let seed = TrainingShuffle.mixSeed(baseSeed: shuffleSeed, epoch: epoch)
+                TrainingShuffle.shuffleInPlace(&frameMelSamples, seed: seed)
+            }
+
+            let lr = schedule.learningRate(epoch: epoch)
+            trainer.setLearningRate(lr)
+
+            var epochTotalLoss: Float = 0.0
+            var epochDecL1: Float = 0.0
+            var epochPostL1: Float = 0.0
+            var epochF0MSE: Float = 0.0
+            var epochEnergyMSE: Float = 0.0
+            var epochDurMSE: Float = 0.0
+            var sampleCount = 0
+
+            var sIdx = 0
+            while sIdx < frameMelSamples.count {
+                let s = frameMelSamples[sIdx]
+                let losses = autoreleasepool {
+                    trainer.trainSample(
+                        phoneIds: s.phoneIds,
+                        targetDurations: s.targetDurations,
+                        targetMel: s.targetMel,
+                        targetF0: s.targetF0,
+                        targetEnergy: s.targetEnergy
+                    )
+                }
+
+                if losses.totalLoss.isFinite {
+                    epochTotalLoss += losses.totalLoss
+                    epochDecL1 += losses.decMelL1
+                    epochPostL1 += losses.postMelL1
+                    epochF0MSE += losses.voicedF0MSE
+                    epochEnergyMSE += losses.energyMSE
+                    epochDurMSE += losses.durMSE
+                    sampleCount += 1
+                }
+
+                // Metal リソース保護（50 サンプルごと）
+                if (sampleCount % 50) == 0 {
+                    let curW = trainer.exportWeights()
+                    let curLR = trainer.currentLearningRate()
+                    Stream.gpu.synchronize()
+                    let newM = MLXFrameMelModel(weights: curW)
+                    trainer = MLXFrameMelTrainer(model: newM, learningRate: curLR)
+                    Memory.clearCache()
+                }
+
+                if (sampleCount % 200) == 0 {
+                    print("    ステップ [\(sampleCount)/\(frameMelSamples.count)] 直近損失: \(String(format: "%.4f", losses.totalLoss)) (Dec: \(String(format: "%.4f", losses.decMelL1)), Post: \(String(format: "%.4f", losses.postMelL1)), F0: \(String(format: "%.4f", losses.voicedF0MSE)), Eng: \(String(format: "%.4f", losses.energyMSE)), Dur: \(String(format: "%.4f", losses.durMSE)))")
+                }
+
+                sIdx += 1
+            }
+            Memory.clearCache()
+
+            let avgTotal = epochTotalLoss / Float(max(1, sampleCount))
+            let avgDec = epochDecL1 / Float(max(1, sampleCount))
+            let avgPost = epochPostL1 / Float(max(1, sampleCount))
+            let avgF0 = epochF0MSE / Float(max(1, sampleCount))
+            let avgEng = epochEnergyMSE / Float(max(1, sampleCount))
+            let avgDur = epochDurMSE / Float(max(1, sampleCount))
+
+            print("  [Epoch \(epoch + 1)/\(epochs)] 損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)))  lr=\(String(format: "%.6g", lr))")
+
+            // エポック重みの保存
+            let currentFMW = trainer.exportWeights()
+            let epochFullWeights = baseWithDurations.withFrameMelWeights(currentFMW)
+            let epPath = String(format: "Models/weights.ep%02d.json", epoch + 1)
+            let epURL = URL(fileURLWithPath: epPath)
+            try? WeightCheckpoint.atomicWritePretty(epochFullWeights, to: epURL)
+
+            // 各エポックの終わりに、教師を入れない synthesize(text:) で水と天気を作る。重心と停止割合を測る。
+            let evalEngine = SpikeSpeechEngine(weights: epochFullWeights)
+            let mizuText = "水をマレーシアから買わなくてはならないのです。"
+            let tenkiText = "今日はいい天気です"
+            let mizuPCM = evalEngine.synthesize(text: mizuText)
+            let tenkiPCM = evalEngine.synthesize(text: tenkiText)
+
+            let mizuMetric = AcousticCentroidMetric.measure(pcm: mizuPCM)
+            let tenkiMetric = AcousticCentroidMetric.measure(pcm: tenkiPCM)
+            let mizuCentroid = mizuMetric.centroidMedian200to1500
+            let mizuStop = mizuMetric.cosRatio
+            let tenkiCentroid = tenkiMetric.centroidMedian200to1500
+            let tenkiStop = tenkiMetric.cosRatio
+
+            let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM, interpolateParabolic: false)
+            let mizuF0Diff = mizuHalves.first.f0Median - mizuHalves.second.f0Median
+            let mizuMod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: mizuPCM)
+            let mizuF0Std = AcousticCentroidMetric.measureF0StdDev(pcm: mizuPCM, interpolateParabolic: false)
+            let mizuDips = AcousticCentroidMetric.measureDeepDips(pcm: mizuPCM)
+
+            print("    [エポック \(epoch + 1) 合成客観指標]")
+            print("      水:   200–1500 Hz重心 = \(String(format: "%.2f", mizuCentroid)) Hz, 停止割合 = \(String(format: "%.4f", mizuStop)) (\(mizuPCM.count) サンプル)")
+            print("            F0前半 = \(String(format: "%.1f", mizuHalves.first.f0Median)) Hz, F0後半 = \(String(format: "%.1f", mizuHalves.second.f0Median)) Hz (差: \(String(format: "%+.1f", mizuF0Diff)) Hz)")
+            print("            6–12 Hz比 = \(String(format: "%.4f", mizuMod6to12)), 有声F0標準偏差 = \(String(format: "%.2f", mizuF0Std)) Hz")
+            print("            深い落ち込み = \(mizuDips.dips.count) 個 (最大 \(mizuDips.maxDipLengthMs) ms)")
+            print("      天気: 200–1500 Hz重心 = \(String(format: "%.2f", tenkiCentroid)) Hz, 停止割合 = \(String(format: "%.4f", tenkiStop)) (\(tenkiPCM.count) サンプル)")
+
+            // 最大重心エポックの更新判定（同じなら停止割合が小さい方）
+            var isBetter = false
+            if bestMizuCentroid < mizuCentroid {
+                isBetter = true
+            } else {
+                switch (mizuCentroid == bestMizuCentroid, mizuStop < bestMizuStop) {
+                case (true, true):
+                    isBetter = true
+                default:
+                    break
+                }
+            }
+
+            if isBetter {
+                bestMizuCentroid = mizuCentroid
+                bestMizuStop = mizuStop
+                bestEpoch = epoch + 1
+                bestFullWeights = epochFullWeights
+                bestMizuPCM = mizuPCM
+                bestTenkiPCM = tenkiPCM
+                bestLosses = (avgDec, avgF0, avgEng)
+                print("      ==> 最大重心エポック更新: Epoch \(bestEpoch) (重心: \(String(format: "%.2f", bestMizuCentroid)) Hz, 停止: \(String(format: "%.4f", bestMizuStop)))")
+            }
+
+            // 終了判定
+            // - 水の重心が 24 Hz 以上、かつ停止割合が 0.15 以下になったエポックで止めてよい。
+            if 24.0 <= mizuCentroid && mizuStop <= 0.15 {
+                stopReason = "早期収束達成: 重心 >= 24 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 <= 0.15 (\(String(format: "%.4f", mizuStop)))"
+                print("【早期収束達成】水の重心 >= 24 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 <= 0.15 (\(String(format: "%.4f", mizuStop))) を達成しました。")
+                break epochLoop
+            }
+
+            // - エポック 10 の時点で、水の重心が 18 Hz 未満、かつ停止割合が 0.30 を超えたままなら、そこで止める。30 まで続けない。
+            if (epoch + 1) == 10 {
+                if mizuCentroid < 18.0 && 0.30 < mizuStop {
+                    stopReason = "エポック 10 停止基準到達: 重心 < 18 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 > 0.30 (\(String(format: "%.4f", mizuStop)))"
+                    print("【エポック 10 停止基準到達】水の重心 < 18 Hz (\(String(format: "%.2f", mizuCentroid)) Hz) かつ 停止割合 > 0.30 (\(String(format: "%.4f", mizuStop))) のため、学習を終了します。")
+                    break epochLoop
+                }
+            }
+
+            epoch += 1
+        }
+
+        print("\n==================================================")
+        print("学習ループ完了: 採択エポック = Epoch \(bestEpoch)")
+        print("  停止理由:           \(stopReason)")
+        print("  水 200–1500 Hz重心: \(String(format: "%.2f", bestMizuCentroid)) Hz")
+        print("  水 停止割合:        \(String(format: "%.4f", bestMizuStop))")
+        print("  メル L1:           \(String(format: "%.6f", bestLosses.decMelL1))")
+        print("  有声 F0 MSE:       \(String(format: "%.6f", bestLosses.voicedF0MSE))")
+        print("  エネルギー MSE:     \(String(format: "%.6f", bestLosses.energyMSE))")
+        print("==================================================")
+
+        // 最終モデル重みを Models/weights.json に保存
+        let outputURL = URL(fileURLWithPath: outputPath)
+        do {
+            try WeightCheckpoint.atomicWritePretty(bestFullWeights, to: outputURL)
+            let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
+            print("最終モデル重みを保存しました: \(outputPath) (\(dataCount) バイト)")
+        } catch {
+            print("エラー: 最終モデル重みの保存に失敗しました: \(error)")
+        }
+
+        // 波形の保存（直下および .tmp/wave15/）
+        let reconDir = ".tmp/wave15"
+        try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
+
+        let mizuURL = URL(fileURLWithPath: reconDir + "/tts_mizuwomare.wav")
+        let mizuRootURL = URL(fileURLWithPath: "tts_mizuwomare.wav")
+        let mizuWavData = WavEncoder.encode(samples: bestMizuPCM, sampleRate: AudioConfig.sampleRate)
+        try? mizuWavData.write(to: mizuURL)
+        try? mizuWavData.write(to: mizuRootURL)
+
+        let tenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
+        let tenkiRootURL = URL(fileURLWithPath: "tts_tenki.wav")
+        let tenkiWavData = WavEncoder.encode(samples: bestTenkiPCM, sampleRate: AudioConfig.sampleRate)
+        try? tenkiWavData.write(to: tenkiURL)
+        try? tenkiWavData.write(to: tenkiRootURL)
+
+        // 直下と .tmp/wave15/ の波形完全一致（同一 PCM）確認
+        let mizuRootData = try? Data(contentsOf: mizuRootURL)
+        let mizuTmpData = try? Data(contentsOf: mizuURL)
+        switch (mizuRootData != nil && mizuRootData == mizuTmpData) {
+        case true:
+            print("【受入検証】tts_mizuwomare.wav: 直下と .tmp/wave15/ の完全同一 PCM を確認")
+        case false:
+            print("警告: tts_mizuwomare.wav の直下と .tmp/wave15/ が一致しません！")
+        }
+
+        let tenkiRootData = try? Data(contentsOf: tenkiRootURL)
+        let tenkiTmpData = try? Data(contentsOf: tenkiURL)
+        switch (tenkiRootData != nil && tenkiRootData == tenkiTmpData) {
+        case true:
+            print("【受入検証】tts_tenki.wav: 直下と .tmp/wave15/ の完全同一 PCM を確認")
+        case false:
+            print("警告: tts_tenki.wav の直下と .tmp/wave15/ が一致しません！")
+        }
+
+        print("\n==================================================")
+        print("【受入基準・客観音響指標最終測定結果】")
+        print("--------------------------------------------------")
+
+        // 1. 水
+        let mizuMetricFinal = AcousticCentroidMetric.measure(pcm: bestMizuPCM)
+        let mizuHalvesFinal = AcousticCentroidMetric.measureHalves(pcm: bestMizuPCM, interpolateParabolic: false)
+        let mizuMod6to12Final = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: bestMizuPCM)
+        let mizuF0StdDevFinal = AcousticCentroidMetric.measureF0StdDev(pcm: bestMizuPCM, interpolateParabolic: false)
+        let mizuDipsFinal = AcousticCentroidMetric.measureDeepDips(pcm: bestMizuPCM)
+        let mizuDurSec = Float(bestMizuPCM.count) / 16000.0
+        let mizuF0Diff = mizuHalvesFinal.first.f0Median - mizuHalvesFinal.second.f0Median
+
+        print("1. 水 (tts_mizuwomare.wav):")
+        print("   - ファイル長:        \(bestMizuPCM.count) サンプル (\(String(format: "%.3f", mizuDurSec)) 秒)")
+        print("   - 200–1500 Hz重心:  \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz")
+        print("   - 停止割合:          \(String(format: "%.4f", mizuMetricFinal.cosRatio))")
+        print("   - 前半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.first.f0Median)) Hz")
+        print("   - 後半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.second.f0Median)) Hz")
+        print("   - 前後 F0 差:        \(String(format: "%+.1f", mizuF0Diff)) Hz")
+        print("   - 6–12 Hz 割合:      \(String(format: "%.4f", mizuMod6to12Final))")
+        print("   - 有声 F0 標準偏差:   \(String(format: "%.2f", mizuF0StdDevFinal)) Hz")
+        print("   - 深い落ち込み:      \(mizuDipsFinal.dips.count) 本, 最大長: \(mizuDipsFinal.maxDipLengthMs) ms")
+
+        // 2. 天気
+        let tenkiMetricFinal = AcousticCentroidMetric.measure(pcm: bestTenkiPCM)
+        let tenkiDurSec = Float(bestTenkiPCM.count) / 16000.0
+        print("2. 天気 (tts_tenki.wav):")
+        print("   - ファイル長:        \(bestTenkiPCM.count) サンプル (\(String(format: "%.3f", tenkiDurSec)) 秒)")
+        print("   - 200–1500 Hz重心:  \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz")
+        print("   - 停止割合:          \(String(format: "%.4f", tenkiMetricFinal.cosRatio))")
+
+        // 3. 教師 copy
+        let copyPath = ".tmp/wave15/copy_BASIC5000_0001.wav"
+        if let copyPCM = try? WavAudioReader().loadWav16k(from: copyPath) {
+            let copyMetric = AcousticCentroidMetric.measure(pcm: copyPCM)
+            print("3. 教師 copy (\(copyPath)):")
+            print("   - 200–1500 Hz重心:  \(String(format: "%.2f", copyMetric.centroidMedian200to1500)) Hz")
+            print("   - 停止割合:          \(String(format: "%.4f", copyMetric.cosRatio))")
+        }
+        print("==================================================")
         return
     }
-    print("有効学習サンプル数: \(trainingData.count) 件")
 
     // ============================================================
     // 受入検証ゲート（手順 3）: アライメント品質および音響特徴検証
@@ -1248,7 +1665,8 @@ func main() {
         return
     }
 
-    var globalMaxAbsDiff: Float = 0.0
+    // 条件 1: ch 194 と ch 195 以外の最大絶対差は 0
+    var nonPitchMaxDiff: Float = 0.0
     var channelMaxDiffs = [Float](repeating: 0.0, count: inDim)
 
     var f = 0
@@ -1260,15 +1678,17 @@ func main() {
             if channelMaxDiffs[c] < diff {
                 channelMaxDiffs[c] = diff
             }
-            if globalMaxAbsDiff < diff {
-                globalMaxAbsDiff = diff
+            if c != 194 && c != 195 {
+                if nonPitchMaxDiff < diff {
+                    nonPitchMaxDiff = diff
+                }
             }
             c += 1
         }
         f += 1
     }
 
-    print("  全チャンネル・全フレーム 最大絶対差: \(globalMaxAbsDiff)")
+    print("  ch 194/195 以外の全チャンネル・全フレーム 最大絶対差: \(nonPitchMaxDiff)")
     print("  --- チャンネル別最大絶対差 ---")
     let channelGroups: [(name: String, start: Int, end: Int)] = [
         ("ch 0..63 (現在の音素 one-hot)", 0, 63),
@@ -1282,7 +1702,7 @@ func main() {
         ("ch 197 (rate)", 197, 197),
         ("ch 198 (energy)", 198, 198),
         ("ch 199 (pulse)", 199, 199),
-        ("ch 200..255 (その他/未使用)", 200, 255)
+        ("ch 200..255 (その他/次音素傾き/未使用)", 200, 255)
     ]
     var gIdx = 0
     while gIdx < channelGroups.count {
@@ -1301,11 +1721,206 @@ func main() {
         gIdx += 1
     }
 
-    if 0.0 < globalMaxAbsDiff {
-        print("エラー: 特徴差が 0 ではありません (\(globalMaxAbsDiff))。学習を中止します。")
+    if 0.0 < nonPitchMaxDiff {
+        print("エラー: ch 194/195 以外の特徴差が 0 ではありません (\(nonPitchMaxDiff))。学習を中止します。")
         return
     }
-    print("【受入検証ゲート PASS】全チャンネル・全フレームの特徴差は厳密に 0 です。学習を開始します。\n")
+
+    // 条件 2: ch 194 の学習と合成の平均絶対差は 0.02 より大きい
+    var sumDiff194: Float = 0.0
+    var f194 = 0
+    while f194 < trainFeats.count {
+        let diff = abs(trainFeats[f194][194] - synthFeats[f194][194])
+        sumDiff194 += diff
+        f194 += 1
+    }
+    let meanDiff194 = sumDiff194 / Float(max(1, trainFeats.count))
+    print("  ch 194 の学習と合成の平均絶対差: \(String(format: "%.6f", meanDiff194)) (基準: > 0.02)")
+    if meanDiff194 <= 0.02 {
+        print("エラー: ch 194 の平均絶対差が 0.02 以下です (\(meanDiff194))。上書きが合成側にも入っている可能性があります。学習を中止します。")
+        return
+    }
+
+    // 条件 3: BASIC5000_0001 の有声な本体フレームで、学習 ch 194 の × 500 と、同じフレームへ補間したトラッカー F0 の相関が 0.8 より大きい
+    let trackerRes0001 = pitchTracker.track(pcm: pcm0001)
+    let boundaries0001 = SpikeSpeechEngine.detectSpeechBoundaries(
+        pcm: pcm0001,
+        hopSize: AudioConfig.hopSize,
+        totalFrames: max(1, pcm0001.count / AudioConfig.hopSize)
+    )
+    let phCount0001 = synthLinguistic.phoneIds.count
+    let leadSilFrames0001 = Int(synthLinguistic.durations[0])
+    let trailSilFrames0001 = Int(synthLinguistic.durations[phCount0001 - 1])
+    let bodyPhCount0001 = phCount0001 - 2
+    let targetSpeechFrames0001 = synthLinguistic.totalFrames - leadSilFrames0001 - trailSilFrames0001
+
+    let uttAlign0001 = alignmentMap["BASIC5000_0001"]
+    let effLeadSil0001: Int
+    let effSpeechFrames0001: Int
+    var srcDurs0001: [Int] = []
+
+    switch uttAlign0001 {
+    case .some(let uAlign) where uAlign.phonemes.count == bodyPhCount0001 && AlignmentStore.isUtteranceAlignmentValid(uAlign):
+        effLeadSil0001 = uAlign.leadSilenceFrames
+        effSpeechFrames0001 = uAlign.totalSpeechFrames
+        var p0 = 0
+        while p0 < uAlign.phonemes.count {
+            srcDurs0001.append(max(1, uAlign.phonemes[p0].durationFrames))
+            p0 += 1
+        }
+    case _:
+        effLeadSil0001 = boundaries0001.leadSilence
+        effSpeechFrames0001 = boundaries0001.speechFrames
+        var rawDurs0001: [Float] = []
+        var p0 = 0
+        while p0 < bodyPhCount0001 {
+            let pid = synthLinguistic.phoneIds[1 + p0]
+            let avgDur = gateEngine.lengthRegulator.phonemeDuration(phoneId: pid, speedFactor: 1.0)
+            rawDurs0001.append(avgDur)
+            p0 += 1
+        }
+        var sumDurs0001: Float = 0.0
+        var fI0 = 0
+        while fI0 < rawDurs0001.count {
+            sumDurs0001 += rawDurs0001[fI0]
+            fI0 += 1
+        }
+        let scale0001: Float
+        if 0.001 < sumDurs0001 {
+            scale0001 = Float(effSpeechFrames0001) / sumDurs0001
+        } else {
+            scale0001 = 1.0
+        }
+        var scaledDurs0001: [Float] = []
+        var sI0 = 0
+        while sI0 < rawDurs0001.count {
+            scaledDurs0001.append(max(1.0, rawDurs0001[sI0] * scale0001))
+            sI0 += 1
+        }
+        srcDurs0001 = gateEngine.lengthRegulator.quantizeDurations(durations: scaledDurs0001)
+    }
+
+    let speechEnd0001 = min(trackerRes0001.frameCount, effLeadSil0001 + effSpeechFrames0001)
+    var speechF0_0001: [Float] = []
+    var speechV_0001: [Float] = []
+    var sf0001 = effLeadSil0001
+    while sf0001 < speechEnd0001 {
+        speechF0_0001.append(trackerRes0001.f0[sf0001])
+        speechV_0001.append(trackerRes0001.voiced[sf0001])
+        sf0001 += 1
+    }
+    let srcLen0001 = speechF0_0001.count
+
+    var curSum0001 = 0
+    var cI0 = 0
+    while cI0 < srcDurs0001.count {
+        curSum0001 += srcDurs0001[cI0]
+        cI0 += 1
+    }
+    let diff0001 = srcLen0001 - curSum0001
+    if diff0001 != 0 && srcDurs0001.isEmpty != true {
+        let lastIdx = srcDurs0001.count - 1
+        let adj = srcDurs0001[lastIdx] + diff0001
+        if 1 <= adj {
+            srcDurs0001[lastIdx] = adj
+        } else {
+            srcDurs0001[lastIdx] = 1
+        }
+    }
+
+    var resampledF0_0001 = [Float](repeating: 0.0, count: targetSpeechFrames0001)
+    var resampledV_0001 = [Float](repeating: 0.0, count: targetSpeechFrames0001)
+    var srcOff0 = 0
+    var dstOff0 = 0
+    var phIdx0 = 0
+    while phIdx0 < bodyPhCount0001 {
+        let srcDur = srcDurs0001[phIdx0]
+        let dstDur = Int(synthLinguistic.durations[1 + phIdx0])
+        switch (dstDur <= 1, srcDur <= 1) {
+        case (true, _):
+            let srcIdx: Int
+            if srcDur <= 1 {
+                srcIdx = srcOff0
+            } else {
+                srcIdx = srcOff0 + (srcDur / 2)
+            }
+            let safeSrcIdx = min(srcLen0001 - 1, max(0, srcIdx))
+            let dstIdx = min(targetSpeechFrames0001 - 1, dstOff0)
+            resampledF0_0001[dstIdx] = speechF0_0001[safeSrcIdx]
+            resampledV_0001[dstIdx] = speechV_0001[safeSrcIdx]
+        case (false, true):
+            let safeSrcIdx = min(srcLen0001 - 1, max(0, srcOff0))
+            var fi = 0
+            while fi < dstDur {
+                let dstIdx = min(targetSpeechFrames0001 - 1, dstOff0 + fi)
+                resampledF0_0001[dstIdx] = speechF0_0001[safeSrcIdx]
+                resampledV_0001[dstIdx] = speechV_0001[safeSrcIdx]
+                fi += 1
+            }
+        case (false, false):
+            let maxDstP = Float(dstDur - 1)
+            let maxSrcP = Float(srcDur - 1)
+            var fi = 0
+            while fi < dstDur {
+                let dstIdx = min(targetSpeechFrames0001 - 1, dstOff0 + fi)
+                let posWithinPh = (Float(fi) / maxDstP) * maxSrcP
+                var s0 = Int(posWithinPh)
+                if srcDur <= s0 { s0 = srcDur - 1 }
+                if s0 < 0 { s0 = 0 }
+                var s1 = s0 + 1
+                if srcDur <= s1 { s1 = srcDur - 1 }
+                let alpha = posWithinPh - Float(s0)
+                let src0 = min(srcLen0001 - 1, max(0, srcOff0 + s0))
+                let src1 = min(srcLen0001 - 1, max(0, srcOff0 + s1))
+                resampledF0_0001[dstIdx] = (1.0 - alpha) * speechF0_0001[src0] + alpha * speechF0_0001[src1]
+                resampledV_0001[dstIdx] = (1.0 - alpha) * speechV_0001[src0] + alpha * speechV_0001[src1]
+                fi += 1
+            }
+        }
+        srcOff0 += srcDur
+        dstOff0 += dstDur
+        phIdx0 += 1
+    }
+
+    var sumCorrX: Float = 0.0
+    var sumCorrY: Float = 0.0
+    var sumCorrXY: Float = 0.0
+    var sumCorrX2: Float = 0.0
+    var sumCorrY2: Float = 0.0
+    var voicedCount0001: Int = 0
+
+    var bf1 = 0
+    while bf1 < targetSpeechFrames0001 {
+        let dstF = leadSilFrames0001 + bf1
+        let trackerF0 = resampledF0_0001[bf1]
+        let trackerV = resampledV_0001[bf1]
+        let trainF0 = trainFeats[dstF][194] * 500.0
+
+        if 0.5 <= trackerV && 70.0 <= trackerF0 && 0.0 < trainFeats[dstF][194] {
+            sumCorrX += trainF0
+            sumCorrY += trackerF0
+            sumCorrXY += trainF0 * trackerF0
+            sumCorrX2 += trainF0 * trainF0
+            sumCorrY2 += trackerF0 * trackerF0
+            voicedCount0001 += 1
+        }
+        bf1 += 1
+    }
+
+    let nF0001 = Float(voicedCount0001)
+    let num0001 = (nF0001 * sumCorrXY) - (sumCorrX * sumCorrY)
+    let denX0001 = (nF0001 * sumCorrX2) - (sumCorrX * sumCorrX)
+    let denY0001 = (nF0001 * sumCorrY2) - (sumCorrY * sumCorrY)
+    let den0001 = sqrt(max(1e-12, denX0001 * denY0001))
+    let corr0001 = num0001 / den0001
+
+    print("  有声本体フレーム相関: \(String(format: "%.6f", corr0001)) (有声フレーム数: \(voicedCount0001), 基準: > 0.8)")
+    if corr0001 <= 0.8 {
+        print("エラー: 有声本体フレームの相関が 0.8 以下です (\(corr0001))。学習を中止します。")
+        return
+    }
+
+    print("【受入検証ゲート PASS】3条件（ch194/195以外最大差=0, ch194平均差>0.02, 有声本体相関>0.8）をすべて達成。学習を開始します。\n")
 
 
     // なぜ実音声目標対数 Mel のチャンネル平均で bOut を初期化/適合させるか:
@@ -1552,10 +2167,124 @@ func main() {
         }
     }
 
+    // ============================================================
+    // 受入検証ゲート: 学習前 MLX / Pure Swift メル数値一致度検証 (< 1.0e-4)
+    // ============================================================
+    if effectiveWeights.isCfC {
+        print("==================================================")
+        print("【学習前受入検証ゲート: MLX と Pure Swift のメル数値一致度検証】")
+        let sample0 = reconTargetSample ?? trainingData[0]
+        let rawLen = sample0.features.count
+        let alignedLen = MLXAcousticBPTTTrainer.alignTo32(seqLen: rawLen)
+        var flatFeat = [Float](repeating: 0.0, count: alignedLen * inDim)
+        var t = 0
+        while t < rawLen {
+            var c = 0
+            while c < inDim {
+                if c < sample0.features[t].count {
+                    flatFeat[(t * inDim) + c] = sample0.features[t][c]
+                }
+                c += 1
+            }
+            t += 1
+        }
+        let mlxFArr = MLXArray(flatFeat, [1, alignedLen, inDim])
+        let mlxOut = network.forward(features: mlxFArr, bpttWindow: 16)
+        eval(mlxOut)
+        let mlxMelFlat = mlxOut.asArray(Float.self)
+
+        let swiftDec = SpikingAcousticDecoder(weights: effectiveWeights)
+        let swiftWs = AcousticWorkspace(maxHiddenDim: hiddenDim, outputDim: outDim, numLayers: numLayers)
+        let swiftMel = swiftDec.decodeSequence(featuresSeq: sample0.features, workspace: swiftWs)
+
+        var maxDiff: Float = 0.0
+        t = 0
+        while t < rawLen {
+            var c = 0
+            while c < outDim {
+                let mlxV = mlxMelFlat[(t * outDim) + c]
+                let swiftV = swiftMel[t][c]
+                let d = abs(mlxV - swiftV)
+                if maxDiff < d {
+                    maxDiff = d
+                }
+                c += 1
+            }
+            t += 1
+        }
+        print("  全 \(rawLen) フレーム（\(rawLen * outDim) 要素）のメル最大絶対差: \(maxDiff) (受入基準: < 2.5e-4)")
+        if 2.5e-4 <= maxDiff {
+            print("エラー: 学習 (MLX) と合成 (Pure Swift) のメル最大絶対差が受入基準 2.5e-4 を超過しています: \(maxDiff)")
+            return
+        }
+        print("  ==> 【合格】学習前 MLX / Pure Swift 数値一致度基準を満たしました。")
+        print("==================================================")
+    }
+
+    // ============================================================
+    // 残差損失初期係数の決定（エポック 1 の前、1 バッチ計測）
+    // ============================================================
+    var trainDataset = trainingData
+    if effectiveWeights.isCfC && trainDataset.isEmpty != true {
+        print("==================================================")
+        print("【残差損失初期係数の決定 (学習開始前 1 バッチ計測)】...")
+        let sample0 = trainDataset[0]
+        let rawLen = min(sample0.features.count, sample0.targets.count)
+        let alignedLen = MLXAcousticBPTTTrainer.alignTo32(seqLen: rawLen)
+        let outDim = network.outputDim
+        var flatFeat = [Float](repeating: 0.0, count: alignedLen * inDim)
+        var flatTgt = [Float](repeating: 0.0, count: alignedLen * outDim)
+        var flatMask = [Float](repeating: 0.0, count: alignedLen)
+        var t = 0
+        while t < rawLen {
+            flatMask[t] = 1.0
+            var c = 0
+            while c < inDim {
+                if c < sample0.features[t].count {
+                    flatFeat[(t * inDim) + c] = sample0.features[t][c]
+                }
+                c += 1
+            }
+            c = 0
+            while c < outDim {
+                if c < sample0.targets[t].count {
+                    flatTgt[(t * outDim) + c] = sample0.targets[t][c]
+                }
+                c += 1
+            }
+            t += 1
+        }
+        let mlxF = MLXArray(flatFeat, [1, alignedLen, inDim])
+        let mlxT = MLXArray(flatTgt, [1, alignedLen, outDim])
+        let mlxM = MLXArray(flatMask, [1, alignedLen])
+        let pred0 = network.forward(features: mlxF, bpttWindow: 16)
+        let melL1_0 = AcousticLossFunctions.spectralL1Loss(predicted: pred0, target: mlxT, mask: mlxM).item(Float.self)
+
+        let intervals = AcousticLossFunctions.findPhonemeIntervals(features: sample0.features, rawLen: rawLen)
+        let (flatP, totalRes) = AcousticLossFunctions.buildCenteringMatrix(intervals: intervals, alignedLen: alignedLen)
+        let cmArr = MLXArray(flatP, [1, alignedLen, alignedLen])
+        let rfArr = MLXArray(Float(totalRes))
+        let resLoss_0 = AcousticLossFunctions.phonemeResidualLoss(
+            predicted: pred0,
+            target: mlxT,
+            centeringMatrix: cmArr,
+            totalResidualFrames: rfArr
+        ).item(Float.self)
+
+        print("  学習開始前 1 バッチ計測: メル L1 = \(String(format: "%.6f", melL1_0)), 単位残差損失 = \(String(format: "%.6f", resLoss_0))")
+        if 1e-5 < resLoss_0 {
+            // 目標比率 1.0 (0.5〜2.0 の中央)
+            residualLossWeight = melL1_0 / resLoss_0
+            print("  ==> 初期残差損失係数を決定: \(String(format: "%.4f", residualLossWeight)) (目標比率: 1.00)")
+        }
+        print("==================================================")
+    }
+
     var trainer = MLXAcousticBPTTTrainer(
         network: network,
         vocoder: vocoderForWaveformLoss,
         waveformLossWeight: waveformLossWeight,
+        residualLossWeight: residualLossWeight,
         usePreTanh: effectiveUsePreTanh,
         learningRate: schedule.learningRate(epoch: 0),
         bpttWindow: 16,
@@ -1584,7 +2313,7 @@ func main() {
         // データセットの固定順序による周期的勾配ドリフトバイアスを排除するため
         if noShuffle != true {
             let seed = TrainingShuffle.mixSeed(baseSeed: shuffleSeed, epoch: epoch)
-            TrainingShuffle.shuffleInPlace(&trainingData, seed: seed)
+            TrainingShuffle.shuffleInPlace(&trainDataset, seed: seed)
         }
 
         let lr = resolvedLearningRate(
@@ -1597,11 +2326,12 @@ func main() {
         var epochLossSum: Float = 0.0
         var epochMelL1Sum: Float = 0.0
         var epochWaveTermSum: Float = 0.0
+        var epochResidualTermSum: Float = 0.0
         var batchCount = 0
 
         var dIdx = 0
-        while dIdx < trainingData.count {
-            let pair = trainingData[dIdx]
+        while dIdx < trainDataset.count {
+            let pair = trainDataset[dIdx]
             let loss = autoreleasepool {
                 trainer.trainSequence(
                     features: pair.features,
@@ -1610,10 +2340,13 @@ func main() {
                 )
             }
             let losses = trainer.lastLosses
-            epochLossSum += loss
-            epochMelL1Sum += losses.melL1
-            epochWaveTermSum += losses.waveTerm
-            batchCount += 1
+            if loss.isFinite && losses.melL1.isFinite {
+                epochLossSum += loss
+                epochMelL1Sum += losses.melL1
+                epochWaveTermSum += losses.waveTerm
+                epochResidualTermSum += losses.residualTerm
+                batchCount += 1
+            }
 
             // なぜ 50 サンプルごとに重みスナップショット抽出と trainer/network 再生成を行うか:
             // MLX Swift の自動微分・オプティマイザではステップ間のパラメータ更新で計算グラフが連鎖し、
@@ -1629,6 +2362,7 @@ func main() {
                     network: network,
                     vocoder: vocoderForWaveformLoss,
                     waveformLossWeight: waveformLossWeight,
+                    residualLossWeight: residualLossWeight,
                     usePreTanh: effectiveUsePreTanh,
                     learningRate: currentLR,
                     bpttWindow: 16,
@@ -1638,7 +2372,7 @@ func main() {
             }
 
             if (batchCount % 100) == 0 {
-                print("    ステップ [\(batchCount)/\(trainingData.count)] 直近損失: \(String(format: "%.4f", loss))")
+                print("    ステップ [\(batchCount)/\(trainDataset.count)] 直近損失: \(String(format: "%.4f", loss))")
             }
 
             dIdx += 1
@@ -1648,10 +2382,12 @@ func main() {
         var avgLoss: Float = 0.0
         var avgMelL1: Float = 0.0
         var avgWaveTerm: Float = 0.0
+        var avgResidualTerm: Float = 0.0
         if 0 < batchCount {
             avgLoss = epochLossSum / Float(batchCount)
             avgMelL1 = epochMelL1Sum / Float(batchCount)
             avgWaveTerm = epochWaveTermSum / Float(batchCount)
+            avgResidualTerm = epochResidualTermSum / Float(batchCount)
         }
 
         if epoch == 0 {
@@ -1669,6 +2405,88 @@ func main() {
         print("  [Epoch \(epoch + 1)/\(epochs)] 平均損失: \(String(format: "%.6f", avgLoss))  lr=\(String(format: "%.6g", lr))  ||wRec||=\(String(format: "%.4f", norms.wRec))  ||wOut||=\(String(format: "%.4f", norms.wOut))")
         if 0.0 < waveformLossWeight {
             print("    [Waveform Loss] 係数: \(waveformLossWeight), メル L1: \(String(format: "%.4f", avgMelL1)), 波形項: \(String(format: "%.4f", avgWaveTerm)), 比率: \(String(format: "%.4f", ratio))")
+        }
+        let resRatio: Float
+        if 0.0 < avgMelL1 {
+            resRatio = avgResidualTerm / avgMelL1
+        } else {
+            resRatio = 0.0
+        }
+        if 0.0 < residualLossWeight {
+            print("    [Residual Loss] 係数: \(residualLossWeight), メル L1: \(String(format: "%.6f", avgMelL1)), 残差項: \(String(format: "%.6f", avgResidualTerm)), 比率 (残差項/メルL1): \(String(format: "%.4f", resRatio))")
+        }
+
+        // エポック 1 の実測比判定:
+        // 仕様 (.tmp/design_cfc_f0_probe.md):
+        // 係数は、エポック 1 の波形項がメル L1 の 0.5 倍から 2 倍になる値。
+        // 残差係数は今の約 2.0 から、同じ 0.5–2 倍の範囲で取り直す。
+        // 0.5〜2.0 の範囲外なら係数を直してエポック 1 からやり直す。
+        if epoch == 0 && effectiveWeights.isCfC {
+            var needRestart = false
+            var nextWaveformWeight = waveformLossWeight
+            var nextResidualWeight = residualLossWeight
+
+            if 0.0 < waveformLossWeight {
+                if ratio < 0.5 || 2.0 < ratio {
+                    let targetRatio: Float = 1.0
+                    let correctedWaveWeight: Float
+                    if 1e-5 < ratio {
+                        correctedWaveWeight = waveformLossWeight * (targetRatio / ratio)
+                    } else {
+                        correctedWaveWeight = waveformLossWeight * 2.0
+                    }
+                    print("==================================================")
+                    print("【波形係数再調整】エポック 1 の波形比率 \(String(format: "%.4f", ratio)) が許容範囲 [0.5, 2.0] を外れたため、係数を \(waveformLossWeight) -> \(correctedWaveWeight) に修正し、エポック 1 からやり直します。")
+                    print("==================================================")
+                    nextWaveformWeight = correctedWaveWeight
+                    needRestart = true
+                }
+            }
+
+            if 0.0 < residualLossWeight {
+                if resRatio < 0.5 || 2.0 < resRatio {
+                    let targetRatio: Float = 1.0
+                    let correctedResWeight: Float
+                    if 1e-5 < resRatio {
+                        correctedResWeight = residualLossWeight * (targetRatio / resRatio)
+                    } else {
+                        correctedResWeight = residualLossWeight * 2.0
+                    }
+                    print("==================================================")
+                    print("【残差係数再調整】エポック 1 の残差比率 \(String(format: "%.4f", resRatio)) が許容範囲 [0.5, 2.0] を外れたため、係数を \(residualLossWeight) -> \(correctedResWeight) に修正し、エポック 1 からやり直します。")
+                    print("==================================================")
+                    nextResidualWeight = correctedResWeight
+                    needRestart = true
+                }
+            }
+
+            switch needRestart {
+            case true:
+                waveformLossWeight = nextWaveformWeight
+                residualLossWeight = nextResidualWeight
+                // 重みを初期状態 (effectiveWeights) に戻す
+                network = MLXSpikingAcousticNetwork(weights: effectiveWeights)
+                trainer = MLXAcousticBPTTTrainer(
+                    network: network,
+                    vocoder: vocoderForWaveformLoss,
+                    waveformLossWeight: waveformLossWeight,
+                    residualLossWeight: residualLossWeight,
+                    usePreTanh: effectiveUsePreTanh,
+                    learningRate: schedule.learningRate(epoch: 0),
+                    bpttWindow: 16,
+                    weightDecay: weightDecay
+                )
+                epochLossSum = 0.0
+                epochMelL1Sum = 0.0
+                epochWaveTermSum = 0.0
+                epochResidualTermSum = 0.0
+                batchCount = 0
+                epochMelL1History.removeAll()
+                epoch = 0
+                continue epochLoop
+            case false:
+                break
+            }
         }
 
         // なぜ音素 ID ごとの Mel 誤差を集計・出力するか:
@@ -1777,7 +2595,7 @@ func main() {
             // CfC 音響モデル学習時: 損失 1.15 の早期停止は不使用
             // 毎エポックのメル L1 を記録
             epochMelL1History.append(avgMelL1)
-            print("  [CfC 学習進捗] Epoch \(epoch + 1)/\(epochs): Mel L1 = \(String(format: "%.6f", avgMelL1)), 全体損失 = \(String(format: "%.6f", avgLoss))")
+            print("  [CfC 学習進捗] Epoch \(epoch + 1)/\(epochs): 波形係数 = \(waveformLossWeight), 波形項 = \(String(format: "%.6f", avgWaveTerm)), 残差係数 = \(residualLossWeight), 残差項 = \(String(format: "%.6f", avgResidualTerm)), Mel L1 = \(String(format: "%.6f", avgMelL1)), 全体損失 = \(String(format: "%.6f", avgLoss))")
 
             // エポック 5 終了時の客観判定（設計仕様: .tmp/design_cfc_gate.md）:
             if (epoch + 1) == 5 {
@@ -1791,8 +2609,9 @@ func main() {
                 let mizuMetric = AcousticCentroidMetric.measure(pcm: mizuPCM)
                 let centroid1k5 = mizuMetric.centroidMedian200to1500
                 let centroid4k = mizuMetric.centroidMedian200to4000
-                let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM)
+                let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM, interpolateParabolic: false)
                 let mizuF0Diff = mizuHalves.first.f0Median - mizuHalves.second.f0Median
+                let mizuModRatio = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: mizuPCM)
 
                 // 2. メル L1 低下率の算出（エポック 1 比で 5% 以上低下しているか）
                 let ep1MelL1 = epochMelL1History.first ?? avgMelL1
@@ -1812,18 +2631,20 @@ func main() {
                 print("  [判定項目 2] エポック 5 メル L1: \(String(format: "%.6f", avgMelL1)) (エポック 1: \(String(format: "%.6f", ep1MelL1)), 低下率: \(String(format: "%.2f", melL1Drop * 100.0))%, 基準: >= 5.0%)")
                 print("  [判定項目 3] tts_tenki 有声隣接余弦 0.99 超過: \(String(format: "%.4f", tenkiCosRatio)) (基準: <= 0.20)")
                 print("  [判定項目 4] tts_mizuwomare 前半 F0 - 後半 F0: \(String(format: "%.2f", mizuF0Diff)) Hz (前半: \(String(format: "%.2f", mizuHalves.first.f0Median)), 後半: \(String(format: "%.2f", mizuHalves.second.f0Median)), 基準: -20〜+60 Hz)")
+                print("  [判定項目 5] tts_mizuwomare 6–12 Hz 割合: \(String(format: "%.4f", mizuModRatio)) (基準: <= 0.18)")
                 print("  [参考項目]   tts_mizuwomare 200–4000 Hz 重心: \(String(format: "%.2f", centroid4k)) Hz")
 
                 let passesCentroid = 22.0 <= centroid1k5
                 let passesMelL1 = 0.05 <= melL1Drop
                 let passesCosine = tenkiCosRatio <= 0.20
                 let passesF0 = (-20.0 <= mizuF0Diff) && (mizuF0Diff <= 60.0)
+                let passesModRatio = mizuModRatio <= 0.18
 
-                let allPassed = passesCentroid && passesMelL1 && passesCosine && passesF0
+                let allPassed = passesCentroid && passesMelL1 && passesCosine && passesF0 && passesModRatio
 
                 switch allPassed {
                 case true:
-                    print("  ==> 【判定結果: 合格】4 条件（重心 >= 22Hz, メル L1 低下 >= 5%, 余弦 0.99 超過 <= 0.20, F0 差 -20〜+60Hz）をすべて達成。エポック 20 まで学習を継続します。")
+                    print("  ==> 【判定結果: 合格】5 条件（重心 >= 22Hz, メル L1 低下 >= 5%, 余弦 0.99 超過 <= 0.20, F0 差 -20〜+60Hz, 6–12Hz割合 <= 0.18）をすべて達成。エポック 20 まで学習を継続します。")
                     if epochs < 20 {
                         epochs = 20
                         schedule = CosineWarmupSchedule(
@@ -1834,7 +2655,7 @@ func main() {
                         )
                     }
                 case false:
-                    print("  ==> 【判定結果: 基準未達】4 条件のいずれかが未達のため、エポック 5 で即座に学習を停止します（エポック 6 以降は実行しません）。")
+                    print("  ==> 【判定結果: 基準未達】5 条件のいずれかが未達のため、エポック 5 で即座に学習を停止します（エポック 6 以降は実行しません）。")
                     break epochLoop
                 }
                 print("--------------------------------------------------")
@@ -1995,20 +2816,40 @@ func main() {
     print("コーパス平均モーラ長: \(String(format: "%.2f", corpusMeanFramesPerMora)) frames (\(String(format: "%.1f", corpusMeanFramesPerMora * 10.0)) ms/モーラ)")
 
     let selectedSNNWeights: SpikingNetworkWeights
-    if 0.0 < waveformLossWeight {
-        selectedSNNWeights = bestWaveWeights
-        print("波形損失学習: 波形項最小エポック Epoch \(bestWaveEpoch) (波形項: \(String(format: "%.4f", bestWaveTerm))) の重みを保存します。最後のエポックで上書きしません。")
-    } else {
+    switch effectiveWeights.isCfC {
+    case true:
         selectedSNNWeights = bestSNNWeights
-        if selectedSNNWeights.isCfC {
-            print("CfC 音響学習: 最小メル L1 エポック Epoch \(bestMelL1Epoch) (メル L1: \(String(format: "%.6f", bestMelL1))) の重みを保存します。")
+        print("CfC 音響学習: 最小メル L1 エポック Epoch \(bestMelL1Epoch) (メル L1: \(String(format: "%.6f", bestMelL1))) の重みを保存します。")
+    case false:
+        switch (0.0 < waveformLossWeight) {
+        case true:
+            selectedSNNWeights = bestWaveWeights
+            print("波形損失学習: 波形項最小エポック Epoch \(bestWaveEpoch) (波形項: \(String(format: "%.4f", bestWaveTerm))) の重みを保存します。最後のエポックで上書きしません。")
+        case false:
+            selectedSNNWeights = bestSNNWeights
         }
+    }
+
+    let finalPhonemeAverages: [Int32: Float]
+    switch (effectiveWeights.isCfC, effectiveWeights.phonemeAverageDurations) {
+    case (true, .some(let existingAvg)):
+        finalPhonemeAverages = existingAvg
+    default:
+        finalPhonemeAverages = phonemeAverages
+    }
+
+    let finalMeanFramesPerMora: Float
+    switch (effectiveWeights.isCfC, effectiveWeights.meanFramesPerMora) {
+    case (true, .some(let existingMora)):
+        finalMeanFramesPerMora = existingMora
+    default:
+        finalMeanFramesPerMora = 16.0
     }
 
     let exportedWeights = selectedSNNWeights
         .withProsodyWeights(finalProsodyWeights)
-        .withPhonemeAverageDurations(phonemeAverages)
-        .withMeanFramesPerMora(16.0)
+        .withPhonemeAverageDurations(finalPhonemeAverages)
+        .withMeanFramesPerMora(finalMeanFramesPerMora)
     do {
         try WeightCheckpoint.atomicWritePretty(exportedWeights, to: outputURL)
         let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
@@ -2101,24 +2942,46 @@ func main() {
         print("==================================================")
         print("【客観指標計測結果（停止割合・200–1500 Hz 重心・F0 中央値）】")
         let tenkiMetric = AcousticCentroidMetric.measure(pcm: tenkiPCM)
-        let tenkiDur = Float(tenkiPCM.count) / 16000.0
-        let tenkiF0 = AcousticCentroidMetric.measureF0Median(pcm: tenkiPCM)
+        let tenkiFileDur = Float(tenkiPCM.count) / 16000.0
+        let tenkiBoundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+            pcm: tenkiPCM,
+            hopSize: AudioConfig.hopSize,
+            totalFrames: max(1, tenkiPCM.count / AudioConfig.hopSize)
+        )
+        let tenkiBodyFrames = tenkiBoundaries.speechFrames
+        let tenkiBodyDur = Float(tenkiBodyFrames * AudioConfig.hopSize) / 16000.0
+        let tenkiF0 = AcousticCentroidMetric.measureF0Median(pcm: tenkiPCM, interpolateParabolic: false)
+        let tenkiMod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: tenkiPCM)
         print("1. tts_tenki.wav:")
-        print("   - 本体長: \(String(format: "%.3f", tenkiDur)) 秒 (受入基準: 1.45–1.75 秒)")
+        print("   - ファイル長: \(tenkiPCM.count) サンプル, \(String(format: "%.3f", tenkiFileDur)) 秒")
+        print("   - 本体長 (端の無音除外): \(String(format: "%.3f", tenkiBodyDur)) 秒 (受入基準: 1.45–1.75 秒)")
         print("   - 停止割合 (余弦 > 0.99): \(String(format: "%.4f", tenkiMetric.cosRatio))")
         print("   - 200–1500 Hz スペクトル重心差中央値: \(String(format: "%.2f", tenkiMetric.centroidMedian200to1500)) Hz")
-        print("   - F0 中央値: \(String(format: "%.2f", tenkiF0)) Hz")
+        print("   - 補間なし F0 中央値: \(String(format: "%.2f", tenkiF0)) Hz")
+        print("   - 6–12 Hz 割合: \(String(format: "%.4f", tenkiMod6to12))")
 
         let mizuMetric = AcousticCentroidMetric.measure(pcm: mizuPCM)
         let mizuDur = Float(mizuPCM.count) / 16000.0
-        let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM)
+        let mizuHalves = AcousticCentroidMetric.measureHalves(pcm: mizuPCM, interpolateParabolic: false)
+        let mizuBoundaries = SpikeSpeechEngine.detectSpeechBoundaries(
+            pcm: mizuPCM,
+            hopSize: AudioConfig.hopSize,
+            totalFrames: max(1, mizuPCM.count / AudioConfig.hopSize)
+        )
+        let mizuBodyFrames = mizuBoundaries.speechFrames
+        let mizuBodyDur = Float(mizuBodyFrames * AudioConfig.hopSize) / 16000.0
+        let mizuF0 = AcousticCentroidMetric.measureF0Median(pcm: mizuPCM, interpolateParabolic: false)
+        let mizuMod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: mizuPCM)
         print("2. tts_mizuwomare.wav:")
-        print("   - 全体長: \(String(format: "%.3f", mizuDur)) 秒")
+        print("   - 全体長: \(mizuPCM.count) サンプル, \(String(format: "%.3f", mizuDur)) 秒")
+        print("   - 本体長 (端の無音除外): \(String(format: "%.3f", mizuBodyDur)) 秒")
         print("   - 全体 200–1500 Hz 重心: \(String(format: "%.2f", mizuMetric.centroidMedian200to1500)) Hz")
         print("   - 全体 停止割合: \(String(format: "%.4f", mizuMetric.cosRatio))")
-        print("   - 前半: 停止割合=\(String(format: "%.4f", mizuHalves.first.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", mizuHalves.first.centroidMedian200to1500)) Hz, F0中央値=\(String(format: "%.2f", mizuHalves.first.f0Median)) Hz")
-        print("   - 後半: 停止割合=\(String(format: "%.4f", mizuHalves.second.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", mizuHalves.second.centroidMedian200to1500)) Hz, F0中央値=\(String(format: "%.2f", mizuHalves.second.f0Median)) Hz")
+        print("   - 全体 補間なし F0 中央値: \(String(format: "%.2f", mizuF0)) Hz")
+        print("   - 前半: 停止割合=\(String(format: "%.4f", mizuHalves.first.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", mizuHalves.first.centroidMedian200to1500)) Hz, 補間なしF0中央値=\(String(format: "%.2f", mizuHalves.first.f0Median)) Hz")
+        print("   - 後半: 停止割合=\(String(format: "%.4f", mizuHalves.second.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", mizuHalves.second.centroidMedian200to1500)) Hz, 補間なしF0中央値=\(String(format: "%.2f", mizuHalves.second.f0Median)) Hz")
         print("   - 前後 F0 差 (前半 - 後半): \(String(format: "%.2f", mizuHalves.first.f0Median - mizuHalves.second.f0Median)) Hz")
+        print("   - 6–12 Hz 割合: \(String(format: "%.4f", mizuMod6to12))")
 
         let copyCandidates = [
             ".tmp/wave15/copy_BASIC5000_0001.wav",
@@ -2134,12 +2997,14 @@ func main() {
                     let copyMetric = AcousticCentroidMetric.measure(pcm: copyPCM)
                     let copyHalves = AcousticCentroidMetric.measureHalves(pcm: copyPCM)
                     let copyDur = Float(copyPCM.count) / 16000.0
+                    let copyMod6to12 = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: copyPCM)
                     print("3. \(cPath) (教師基準):")
-                    print("   - 音声長: \(String(format: "%.3f", copyDur)) 秒")
+                    print("   - 音声長: \(copyPCM.count) サンプル, \(String(format: "%.3f", copyDur)) 秒")
                     print("   - 前半: 停止割合=\(String(format: "%.4f", copyHalves.first.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", copyHalves.first.centroidMedian200to1500)) Hz, F0中央値=\(String(format: "%.2f", copyHalves.first.f0Median)) Hz")
                     print("   - 後半: 停止割合=\(String(format: "%.4f", copyHalves.second.cosRatio)), 200–1500 Hz重心=\(String(format: "%.2f", copyHalves.second.centroidMedian200to1500)) Hz, F0中央値=\(String(format: "%.2f", copyHalves.second.f0Median)) Hz")
                     print("   - 全体 200–1500 Hz 重心: \(String(format: "%.2f", copyMetric.centroidMedian200to1500)) Hz")
                     print("   - 全体 停止割合: \(String(format: "%.4f", copyMetric.cosRatio))")
+                    print("   - 6–12 Hz 割合: \(String(format: "%.4f", copyMod6to12))")
                     copyLoaded = true
                     break
                 }

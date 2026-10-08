@@ -691,5 +691,187 @@ final class PipelineTests: XCTestCase {
 
         print("[Weights Norm Check] vowelAvgNorm: \(vowelAvgNorm), phonePosNorm: \(phonePosNorm), pulseNorm: \(pulseNorm)")
     }
+
+    /// 受入基準検証: 音素の先頭フレームでは ch 200–239 が 0。最終フレームでは 200 + 直後ID の 1 本だけが 3.0 で、200–239 の残りは 0。ch 0–199 は変更前と同じ。
+    func testNextPhoneTrajectoryEncodingCh200to239() {
+        let engine = SpikeSpeechEngine()
+        let totalF = 12
+        // 音素列: <sil> (id 1, dur 3), a (id 5, dur 6), i (id 6, dur 3)
+        // a の直後は i (id 6)。したがって a の最終フレームでは ch 206 (200 + 6) が 3.0 になる。
+        // i の直後は文末 (<sil> id 1)。したがって i の最終フレームでは ch 201 (200 + 1) が 3.0 になる。
+        let ling = LinguisticFeatures(
+            phoneIds: [1, 5, 6],
+            durations: [3, 6, 3],
+            f0Contour: [Float](repeating: 200.0, count: totalF),
+            voicedFlags: [Float](repeating: 1.0, count: totalF),
+            energyContour: [Float](repeating: 0.5, count: totalF),
+            totalFrames: totalF
+        )
+        let encoded = engine.encodeLinguisticFeatures(features: ling)
+        XCTAssertEqual(encoded.count, totalF)
+
+        // 1. 音素 a の区間: frameIdx = 3 ..< 9 (duration = 6, 直後ID = 6)
+        // 先頭フレーム (frameIdx = 3): ch 200–239 はすべて 0
+        var ch = 200
+        while ch < 240 {
+            XCTAssertEqual(encoded[3][ch], 0.0, accuracy: 1e-5, "先頭フレームで ch \(ch) が 0 ではありません")
+            ch += 1
+        }
+        // 最終フレーム (frameIdx = 8): ch 206 のみ 3.0、他は 0
+        XCTAssertEqual(encoded[8][206], 3.0, accuracy: 1e-5, "最終フレームで ch 206 が 3.0 ではありません")
+        ch = 200
+        while ch < 240 {
+            if ch != 206 {
+                XCTAssertEqual(encoded[8][ch], 0.0, accuracy: 1e-5, "最終フレームで ch \(ch) が 0 ではありません")
+            }
+            ch += 1
+        }
+
+        // 2. 音素 i の区間: frameIdx = 9 ..< 12 (duration = 3, 直後ID = <sil> id 1)
+        // 先頭フレーム (frameIdx = 9): ch 200–239 はすべて 0
+        ch = 200
+        while ch < 240 {
+            XCTAssertEqual(encoded[9][ch], 0.0, accuracy: 1e-5, "音素 i の先頭フレームで ch \(ch) が 0 ではありません")
+            ch += 1
+        }
+        // 最終フレーム (frameIdx = 11): ch 201 のみ 3.0、他は 0
+        XCTAssertEqual(encoded[11][201], 3.0, accuracy: 1e-5, "文末音素の最終フレームで ch 201 (<sil>) が 3.0 ではありません")
+        ch = 200
+        while ch < 240 {
+            if ch != 201 {
+                XCTAssertEqual(encoded[11][ch], 0.0, accuracy: 1e-5, "文末音素の最終フレームで ch \(ch) が 0 ではありません")
+            }
+            ch += 1
+        }
+
+        // 3. ch 0–199 の健全性確認:
+        // 現在音素 one-hot (a id 5): encoded[3..8][5] == 3.0
+        var f = 3
+        while f < 9 {
+            XCTAssertEqual(encoded[f][5], 3.0, accuracy: 1e-5)
+            f += 1
+        }
+        // 直前音素 one-hot (sil id 1): encoded[3..8][64 + 1] == 3.0
+        f = 3
+        while f < 9 {
+            XCTAssertEqual(encoded[f][65], 3.0, accuracy: 1e-5)
+            f += 1
+        }
+        // 直後音素 one-hot (i id 6): encoded[3..8][128 + 6] == 3.0
+        f = 3
+        while f < 9 {
+            XCTAssertEqual(encoded[f][134], 3.0, accuracy: 1e-5)
+            f += 1
+        }
+        // ch 196 (phonePos) が 0.0 〜 3.0
+        XCTAssertEqual(encoded[3][196], 0.0, accuracy: 1e-5)
+        XCTAssertEqual(encoded[8][196], 3.0, accuracy: 1e-5)
+        // ch 199 (pulse) が先頭のみ 1.0
+        XCTAssertEqual(encoded[3][199], 1.0, accuracy: 1e-5)
+        XCTAssertEqual(encoded[4][199], 0.0, accuracy: 1e-5)
+    }
+
+    /// 受入基準検証: 出現 8 回以上のキーの μ はゼロベクトルではない。出現 1 回のキーは表に無く、その区間の μ は 0。
+    func testTripletAverageTableAcceptanceCriteria() {
+        let inDim = 256
+        let outDim = 64
+        let dur = 6
+
+        // ダミーデータ生成:
+        // キー A (prev: 1, curr: 5, next: 6) を 10 回出現させる (>= 8 回)
+        // キー B (prev: 1, curr: 7, next: 8) を 1 回出現させる (< 8 回)
+        var trainingData: [(features: [[Float]], targets: [[Float]])] = []
+
+        // キー A: 10 発話
+        var rep = 0
+        while rep < 10 {
+            var feat = [[Float]](repeating: [Float](repeating: 0.0, count: inDim), count: dur)
+            var tgt = [[Float]](repeating: [Float](repeating: 0.0, count: outDim), count: dur)
+            var t = 0
+            while t < dur {
+                feat[t][5] = 3.0        // curr: 5
+                feat[t][64 + 1] = 3.0   // prev: 1
+                feat[t][128 + 6] = 3.0  // next: 6
+                if t == 0 {
+                    feat[t][199] = 1.0  // pulse
+                }
+                var c = 0
+                while c < outDim {
+                    // 非自明な傾きパターンを与える
+                    tgt[t][c] = Float(t) * 0.5 + Float(c) * 0.01
+                    c += 1
+                }
+                t += 1
+            }
+            trainingData.append((features: feat, targets: tgt))
+            rep += 1
+        }
+
+        // キー B: 1 発話のみ
+        var featB = [[Float]](repeating: [Float](repeating: 0.0, count: inDim), count: dur)
+        var tgtB = [[Float]](repeating: [Float](repeating: 0.0, count: outDim), count: dur)
+        var tB = 0
+        while tB < dur {
+            featB[tB][7] = 3.0        // curr: 7
+            featB[tB][64 + 1] = 3.0   // prev: 1
+            featB[tB][128 + 8] = 3.0  // next: 8
+            if tB == 0 {
+                featB[tB][199] = 1.0  // pulse
+            }
+            var c = 0
+            while c < outDim {
+                tgtB[tB][c] = Float(tB) * 0.3
+                c += 1
+            }
+            tB += 1
+        }
+        trainingData.append((features: featB, targets: tgtB))
+
+        // テーブル構築 (minCount = 8)
+        let table = TripletAverageTable.build(trainingData: trainingData, minCount: 8)
+
+        let keyA = TripletKey(prevId: 1, currId: 5, nextId: 6)
+        let keyB = TripletKey(prevId: 1, currId: 7, nextId: 8)
+
+        // 1. 出現 1 回のキー B は表に無い
+        XCTAssertNil(table.table[keyB], "出現 1 回のキー B が表に存在しています")
+
+        // 2. 出現 10 回 (>= 8) のキー A は表に存在する
+        XCTAssertNotNil(table.table[keyA], "出現 8 回以上のキー A が表に存在しません")
+
+        // 3. キー A の μ 系列を生成したとき、ゼロベクトルではない
+        let muA = table.generateMuSequence(features: trainingData[0].features, rawLen: dur, alignedLen: dur)
+        var maxAbsMuA: Float = 0.0
+        var fA = 0
+        while fA < dur {
+            var c = 0
+            while c < outDim {
+                let v = abs(muA[fA][c])
+                if maxAbsMuA < v {
+                    maxAbsMuA = v
+                }
+                c += 1
+            }
+            fA += 1
+        }
+        XCTAssertTrue(0.001 < maxAbsMuA, "出現 8 回以上のキー A の μ がゼロベクトルです: maxAbs=\(maxAbsMuA)")
+
+        // 4. キー B の μ 系列を生成したとき、表が無いためその区間の μ は完全な 0
+        let muB = table.generateMuSequence(features: featB, rawLen: dur, alignedLen: dur)
+        var maxAbsMuB: Float = 0.0
+        var fB = 0
+        while fB < dur {
+            var c = 0
+            while c < outDim {
+                let v = abs(muB[fB][c])
+                if maxAbsMuB < v {
+                    maxAbsMuB = v
+                }
+                c += 1
+            }
+            fB += 1
+        }
+        XCTAssertEqual(maxAbsMuB, 0.0, accuracy: 1e-7, "出現 1 回のキー B の μ が 0 ではありません: maxAbs=\(maxAbsMuB)")
+    }
 }
 
