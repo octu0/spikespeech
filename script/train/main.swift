@@ -1530,6 +1530,7 @@ func main() {
             var epochF0MSE: Float = 0.0
             var epochEnergyMSE: Float = 0.0
             var epochDurMSE: Float = 0.0
+            var epochDeltaL1: Float = 0.0
             var sampleCount = 0
 
             var sIdx = 0
@@ -1552,6 +1553,7 @@ func main() {
                     epochF0MSE += losses.voicedF0MSE
                     epochEnergyMSE += losses.energyMSE
                     epochDurMSE += losses.durMSE
+                    epochDeltaL1 += losses.deltaMelL1
                     sampleCount += 1
                 }
 
@@ -1576,15 +1578,16 @@ func main() {
             let avgF0 = epochF0MSE / n
             let avgEng = epochEnergyMSE / n
             let avgDur = epochDurMSE / n
+            let avgDelta = epochDeltaL1 / n
 
-            print("  [Epoch \(epoch + 1)/\(epochs)] 学習損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)))  lr=\(String(format: "%.6g", lr))")
+            print("  [Epoch \(epoch + 1)/\(epochs)] 学習損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)), Delta: \(String(format: "%.4f", avgDelta)))  lr=\(String(format: "%.6g", lr))")
 
             // 検証損失（教師強制・勾配なし）
             let selectionLoss: Float
             switch validSet.isEmpty {
             case false:
                 let v = averageLosses(validSet)
-                print("    検証損失: \(String(format: "%.4f", v.totalLoss)) (Dec: \(String(format: "%.4f", v.decMelL1)), Post: \(String(format: "%.4f", v.postMelL1)), F0: \(String(format: "%.4f", v.voicedF0MSE)), Eng: \(String(format: "%.4f", v.energyMSE)), Dur: \(String(format: "%.4f", v.durMSE)))")
+                print("    検証損失: \(String(format: "%.4f", v.totalLoss)) (Dec: \(String(format: "%.4f", v.decMelL1)), Post: \(String(format: "%.4f", v.postMelL1)), F0: \(String(format: "%.4f", v.voicedF0MSE)), Eng: \(String(format: "%.4f", v.energyMSE)), Dur: \(String(format: "%.4f", v.durMSE)), Delta: \(String(format: "%.4f", v.deltaMelL1)))")
                 selectionLoss = v.totalLoss
             case true:
                 selectionLoss = avgTotal

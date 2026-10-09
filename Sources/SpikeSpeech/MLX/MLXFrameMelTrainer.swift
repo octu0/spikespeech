@@ -43,16 +43,35 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     public let model: MLXFrameMelModel
     public let optimizer: Adam
     public var deltaLossWeight: Float
+    /// 全フレームの PostNet 後メルフレーム差 L1 に掛ける係数
+    /// なぜ母音内部だけでなく全フレームのフレーム差を学習するか:
+    /// メル L1 回帰は時間方向に平滑化しやすく、合成音では隣接フレームの包絡がほぼ同一になる割合が
+    /// 教師音声の 2〜3 倍（0.55〜0.77 対 0.25）に達していた。音素境界を含む全フレームで
+    /// 時間変化そのものを教師に合わせ、フォルマント遷移の鈍りを抑えるため。
+    public var allFrameDeltaWeight: Float
+    /// デコーダ条件付けに教師 F0/エネルギーではなく自モデルの予測値を用いる確率（scheduled sampling）
+    /// なぜ予測値で条件付けする学習を混ぜるか:
+    /// 学習時は教師の F0/エネルギー、推論時は予測器の出力（教師より滑らか）が入るため、
+    /// 推論時にデコーダが見たことのない滑らかな条件を受けてメルがさらに平滑化していた。
+    /// 予測値（勾配は遮断）でも教師メルを再現するよう学習させ、学習と推論の条件を近づける。
+    public var conditionSamplingProbability: Float
+    private var rngState: UInt64
     public private(set) var lastLosses: FrameMelLosses
 
     public init(
         model: MLXFrameMelModel = MLXFrameMelModel(),
         learningRate: Float = 0.001,
-        deltaLossWeight: Float = 1.0
+        deltaLossWeight: Float = 1.0,
+        allFrameDeltaWeight: Float = 1.0,
+        conditionSamplingProbability: Float = 0.5,
+        seed: UInt64 = 2026
     ) {
         self.model = model
         self.optimizer = Adam(learningRate: learningRate)
         self.deltaLossWeight = deltaLossWeight
+        self.allFrameDeltaWeight = allFrameDeltaWeight
+        self.conditionSamplingProbability = conditionSamplingProbability
+        self.rngState = seed | 1
         self.lastLosses = FrameMelLosses(
             totalLoss: 0.0,
             decMelL1: 0.0,
@@ -112,6 +131,16 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             targetEnergy: targetEnergy,
             update: false
         )
+    }
+
+    /// 決定論的な xorshift64 乱数（0.0 ..< 1.0）
+    private func nextUniform() -> Float {
+        var x = rngState
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        rngState = x
+        return Float(x >> 40) / Float(1 << 24)
     }
 
     private func runSample(
@@ -255,6 +284,13 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let deltaMaskArr = MLXArray(deltaMask, [1, totalFrames - 1, 1])
 
         let dWeight = self.deltaLossWeight
+        let allDeltaWeight = self.allFrameDeltaWeight
+        var useSampledCondition = false
+        if update && 0.0 < conditionSamplingProbability {
+            if nextUniform() < conditionSamplingProbability {
+                useSampledCondition = true
+            }
+        }
         let lossFn: (MLXFrameMelModel) -> [MLXArray] = { (m: MLXFrameMelModel) -> [MLXArray] in
             // 1. 音素エンコーダ
             let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr)
@@ -279,7 +315,26 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let energyLoss = mean(square(predEnergy - targetEnergyBatch))
 
             // 6. メルデコーダ + PostNet（260次元条件付け）
-            let condition = concatenated([hRep, targetF0Arr, deltaF0Arr, targetEnergyArr, posArr], axis: -1).expandedDimensions(axis: 0)
+            // 教師 F0/エネルギー、または自モデルの予測値（勾配遮断）で条件付けする
+            let condF0: MLXArray
+            let condDeltaF0: MLXArray
+            let condEnergy: MLXArray
+            switch useSampledCondition {
+            case true:
+                let sampledF0 = stopGradient(predF0.squeezed(axis: 0)) // [T, 1]
+                let sampledEnergy = stopGradient(predEnergy.squeezed(axis: 0)) // [T, 1]
+                let prevF0 = concatenated([MLXArray.zeros([1, 1]), sampledF0[0..<(totalFrames - 1), 0...]], axis: 0)
+                let bothVoiced = (sampledF0 .> MLXArray(Float(0.0))).asType(Float.self) * (prevF0 .> MLXArray(Float(0.0))).asType(Float.self)
+                let rawDelta = clip((sampledF0 - prevF0) / MLXArray(Float(0.1)), min: -1.0, max: 1.0)
+                condF0 = sampledF0
+                condDeltaF0 = rawDelta * bothVoiced
+                condEnergy = sampledEnergy
+            case false:
+                condF0 = targetF0Arr
+                condDeltaF0 = deltaF0Arr
+                condEnergy = targetEnergyArr
+            }
+            let condition = concatenated([hRep, condF0, condDeltaF0, condEnergy, posArr], axis: -1).expandedDimensions(axis: 0)
             let (decMel, postMel) = m.forwardDecoder(condition: condition)
 
             let decLoss = mean(abs(decMel - targetMelArr))
@@ -293,8 +348,11 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let maskSum = sum(deltaMaskArr)
             let deltaLoss = sum(maskedDelta) / maximum(maskSum * 64.0, MLXArray(1.0))
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight))
-            return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, deltaLoss]
+            // 8. 全フレームの PostNet 後メルフレーム差 L1（音素境界を含む時間変化の一致）
+            let allFrameDeltaLoss = mean(deltaDiff)
+
+            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight))
+            return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, allFrameDeltaLoss]
         }
 
         let lossVals: [MLXArray]
