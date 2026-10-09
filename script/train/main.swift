@@ -303,6 +303,7 @@ func main() {
     }
 
     guard let explicit = datasetPath, explicit.isEmpty != true else {
+        print("エラー: コーパスディレクトリが指定されていません。-d <corpus_dir> を指定してください。")
         printUsage()
         exit(1)
     }
@@ -310,8 +311,13 @@ func main() {
     if cleanDatasetPath.hasPrefix("@") {
         cleanDatasetPath = String(cleanDatasetPath.dropFirst())
     }
-    if FileManager.default.fileExists(atPath: cleanDatasetPath + "/transcript_utf8.txt") != true {
-        printUsage()
+    if cleanDatasetPath.hasPrefix("~") {
+        cleanDatasetPath = NSString(string: cleanDatasetPath).expandingTildeInPath
+    }
+    let transcriptCheckPath = cleanDatasetPath + "/transcript_utf8.txt"
+    if FileManager.default.fileExists(atPath: transcriptCheckPath) != true {
+        print("エラー: 転写ファイルが見つかりません: \(transcriptCheckPath)")
+        print("       -d には transcript_utf8.txt と wav/ を含むディレクトリを指定してください。")
         exit(1)
     }
 
