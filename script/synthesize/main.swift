@@ -15,6 +15,7 @@ func main() {
     var probeF0: Bool = false
     var copyInputPath: String? = nil
     var ablateInputPath: String? = nil
+    var vocoderPath: String? = nil
 
     var i = 1
     while i < args.count {
@@ -52,6 +53,12 @@ func main() {
                 weightsPath = args[nextIdx]
                 i += 1
             }
+        case "--vocoder":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                vocoderPath = args[nextIdx]
+                i += 1
+            }
         case "-v", "--voice":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -87,7 +94,7 @@ func main() {
         case "--benchmark":
             benchmark = true
         case "-h", "--help":
-            print("Usage: synthesize [-t <text> | --copy <input.wav> | --probe-f0] [-o <output.wav>] [-w <weights.json>] [-v <voice>] [--speed 1.0] [--pitch 1.0] [--benchmark]")
+            print("Usage: synthesize [-t <text> | --copy <input.wav> | --probe-f0] [-o <output.wav>] [-w <weights.json>] [--vocoder <vocoder_weights.json>] [-v <voice>] [--speed 1.0] [--pitch 1.0] [--benchmark]")
             return
         default:
             if text.isEmpty {
@@ -104,11 +111,22 @@ func main() {
     // 追加オプションなしで最高品位な肉声波形合成および Copy-synthesis を実行可能にするため。
     var vocWeights: NeuralVocoderWeights? = nil
     let defaultVocoderPath = "Models/vocoder_weights.json"
+    // 解決順: --vocoder 指定 > -w と同じディレクトリの vocoder_weights.json > Models/vocoder_weights.json
+    // なぜ -w と同じディレクトリを優先するか:
+    // train は音響重みと同じ出力ディレクトリへボコーダー重みを書くため、対になる重みを自動で組み合わせるため。
     var vocPath = defaultVocoderPath
     if let explicitWeights = weightsPath {
         if explicitWeights.contains("vocoder") {
             vocPath = explicitWeights
+        } else {
+            let sibling = URL(fileURLWithPath: explicitWeights).deletingLastPathComponent().appendingPathComponent("vocoder_weights.json").path
+            if FileManager.default.fileExists(atPath: sibling) {
+                vocPath = sibling
+            }
         }
+    }
+    if let explicitVocoder = vocoderPath {
+        vocPath = explicitVocoder
     }
     if FileManager.default.fileExists(atPath: vocPath) {
         if let data = try? Data(contentsOf: URL(fileURLWithPath: vocPath)) {
@@ -717,16 +735,39 @@ func main() {
         baseF0: voiceProfile.baseF0 * pitch,
         addBoundarySilence: true
     )
-    print("=== 音素別継続時間分析 (通常合成) ===")
+    // FrameMel モデルがある場合、継続時間はモデルが再予測するため、表示と区間分析には予測後の値を使う
+    var dbgDurations: [Int32] = dbgLinguistic.durations
+    var dbgTotalFrames: Int = dbgLinguistic.totalFrames
+    var dbgSource = "LengthRegulator"
+    if let fmm = engine.frameMelModel {
+        let moraRate: Float
+        switch voiceProfile.meanFramesPerMora {
+        case .some(let m):
+            moraRate = m / speed
+        case .none:
+            moraRate = engine.lengthRegulator.meanFramesPerMora / speed
+        }
+        let fmRes = fmm.synthesizeMelAndF0(
+            linguisticFeatures: dbgLinguistic,
+            meanFramesPerMora: moraRate,
+            f0Scale: (voiceProfile.baseF0 / 220.0) * pitch
+        )
+        if fmRes.durations.count == dbgLinguistic.phoneIds.count {
+            dbgDurations = fmRes.durations
+            dbgTotalFrames = fmRes.mel.count
+            dbgSource = "FrameMel 予測 (モーラ速度 \(String(format: "%.2f", moraRate)) frames/モーラ)"
+        }
+    }
+    print("=== 音素別継続時間分析 (\(dbgSource)) ===")
     var dbgP2 = 0
     while dbgP2 < dbgLinguistic.phoneIds.count {
         let pid = Int(dbgLinguistic.phoneIds[dbgP2])
-        let dur = dbgLinguistic.durations[dbgP2]
+        let dur = dbgDurations[dbgP2]
         let sym = engine.vocabulary.token(for: pid)
         print("[\(dbgP2)] ID:\(pid) (\(sym)): \(dur) frames (\(dur * 10) ms)")
         dbgP2 += 1
     }
-    print("合計フレーム数: \(dbgLinguistic.totalFrames) (\(dbgLinguistic.totalFrames * 10) ms)")
+    print("合計フレーム数: \(dbgTotalFrames) (\(dbgTotalFrames * 10) ms)")
     print("=====================================")
 
     let startTime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -781,7 +822,7 @@ func main() {
         var curPhIdx = 0
         while curPhIdx < dbgLinguistic.phoneIds.count {
             let pid = Int(dbgLinguistic.phoneIds[curPhIdx])
-            let durFrames = Int(dbgLinguistic.durations[curPhIdx])
+            let durFrames = Int(dbgDurations[curPhIdx])
             let phLenSamples = durFrames * 160
             let phEndSample = min(sCount, phStartSample + phLenSamples)
             let sym = engine.vocabulary.token(for: pid)

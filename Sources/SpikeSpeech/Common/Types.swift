@@ -250,11 +250,14 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
     }
 
     /// 標準的な女性声プロファイル（baseF0 220Hz, 実測モーラ長 16.0F = 160ms）
+    // なぜプリセットの meanFramesPerMora を nil にするか:
+    // 固定値 16 を持たせると、学習時にコーパスから実測して重みへ保存した発話速度が
+    // 推論で一切使われず、学習データより遅いテンポへ強制されるため。nil の場合は重みの値を用いる。
     public static let female = VoiceProfile(
         name: "female",
         baseF0: 220.0,
         energyScale: 1.00,
-        meanFramesPerMora: 16.0
+        meanFramesPerMora: nil
     )
 
     /// 成人男性声プロファイル（baseF0 120Hz）
@@ -262,7 +265,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "male",
         baseF0: 120.0,
         energyScale: 1.00,
-        meanFramesPerMora: 16.0
+        meanFramesPerMora: nil
     )
 
     /// 中性的な声プロファイル（baseF0 170Hz）
@@ -270,7 +273,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "neutral",
         baseF0: 170.0,
         energyScale: 1.00,
-        meanFramesPerMora: 16.0
+        meanFramesPerMora: nil
     )
 
     /// 子供・高音ボイスプロファイル（baseF0 300Hz）
@@ -278,7 +281,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "child",
         baseF0: 300.0,
         energyScale: 1.00,
-        meanFramesPerMora: 16.0
+        meanFramesPerMora: nil
     )
 
     /// 重低音男性ボイスプロファイル（超低域 baseF0 95Hz）
@@ -286,7 +289,7 @@ public struct VoiceProfile: Sendable, Codable, Equatable {
         name: "deepMale",
         baseF0: 95.0,
         energyScale: 1.00,
-        meanFramesPerMora: 16.0
+        meanFramesPerMora: nil
     )
 
     /// 既定プロファイル
