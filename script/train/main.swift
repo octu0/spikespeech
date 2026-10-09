@@ -9,6 +9,7 @@ func main() {
     let args = CommandLine.arguments
     var epochs: Int = 15
     var learningRate: Float = 0.003
+    var learningRateExplicit: Bool = false
     var lrMin: Float = 1.0e-5
     var warmupEpochs: Int = 2
     var weightDecay: Float = 1.0e-4
@@ -175,6 +176,7 @@ func main() {
             let nextIdx = i + 1
             if nextIdx < args.count {
                 if let val = Float(args[nextIdx]) {
+                    learningRateExplicit = true
                     learningRate = val
                 }
                 i += 1
@@ -354,6 +356,14 @@ func main() {
 
     MLXRandom.seed(2026)
 
+    // なぜ FrameMel の既定学習率を 3e-4 にするか:
+    // 40 発話の検証で 3e-3 は 2 エポック目にメル L1 が 5.5e3 → 6.9e4 へ発散し、
+    // 1e-3 も 1 エポック目に一時的な発散（メル L1 120）を示した。3e-4 は単調に収束した。
+    if useFrameMel && learningRateExplicit != true {
+        learningRate = 0.0003
+        print("FrameMel 既定学習率 \(learningRate) を適用します（--lr で上書き可能）。")
+    }
+
     print("==================================================")
     print("SpikeSpeech SNN 音響モデル BPTT 学習パイプライン")
     print("==================================================")
@@ -387,7 +397,7 @@ func main() {
         }
     }
 
-    let weights: SpikingNetworkWeights
+    var weights: SpikingNetworkWeights
     switch useFrameMel {
     case true:
         let base: SpikingNetworkWeights
@@ -569,6 +579,37 @@ func main() {
     }
     }
 
+    // ============================================================
+    // 語彙獲得: 転写テキストから表記→読みを獲得し、重み (lexicon) に蓄積する
+    // なぜソースコードの辞書ではなく重みへ蓄積するか:
+    // コーパス依存の語彙をソースに残さず、学習済み重みとともに持ち運べるようにするため。
+    // 読みが変わるとアライメントも変わるため、新規語彙があればキャッシュ済み MAS を再生成する。
+    // ============================================================
+    var transcriptSentences: [String] = []
+    if let tContent = try? String(contentsOfFile: cleanDatasetPath + "/transcript_utf8.txt", encoding: .utf8) {
+        for rawLine in tContent.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+            var parts = line.split(separator: ":", maxSplits: 1).map { String($0) }
+            if parts.count != 2 {
+                parts = line.split(separator: "\t", maxSplits: 1).map { String($0) }
+            }
+            if parts.count == 2 {
+                transcriptSentences.append(parts[1].trimmingCharacters(in: .whitespaces))
+            }
+        }
+    }
+    let lexiconLearning = ViterbiMorphology.learnLexiconEntries(sentences: transcriptSentences, existing: weights.lexicon)
+    if 0 < lexiconLearning.added {
+        weights = weights.withLexicon(lexiconLearning.lexicon)
+        forceMAS = true
+        print("転写 \(lexiconLearning.sentenceCount) 文から語彙を \(lexiconLearning.added) 件獲得しました（語彙合計: \(weights.lexicon.count) 件）。読みが更新されたため MAS アライメントを再生成します。")
+    } else {
+        print("転写 \(lexiconLearning.sentenceCount) 文に新規語彙はありませんでした（語彙合計: \(weights.lexicon.count) 件）。")
+    }
+
     let engine = SpikeSpeechEngine(weights: weights)
     let melExtractor = MelSpectrogramExtractor(
         sampleRate: Float(AudioConfig.sampleRate),
@@ -599,9 +640,9 @@ func main() {
         }
         var needMASGen = alignmentMap.isEmpty || forceMAS
         if needMASGen != true {
-            if let sample0 = alignmentMap["BASIC5000_0001"] {
+            if let firstId = alignmentMap.keys.sorted().first, let sample0 = alignmentMap[firstId] {
                 if AlignmentStore.isUtteranceAlignmentValid(sample0) != true {
-                    print("警告: キャッシュされた BASIC5000_0001 アライメントが縮退（2〜40F 範囲外）しています。新MAS再集計を実行します。")
+                    print("警告: キャッシュされた \(firstId) アライメントが縮退（2〜40F 範囲外）しています。新MAS再集計を実行します。")
                     needMASGen = true
                 }
             } else {
@@ -786,6 +827,8 @@ func main() {
     let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]], targetAudio: [Float])] = []
     var frameMelSamples: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
+    var frameMelTexts: [String] = []
+    var skippedFrameMelSamples = 0
     var reconTargetSample: (features: [[Float]], targets: [[Float]], targetAudio: [Float])? = nil
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
     var prosodySamples: [ProsodyTrainingSample] = []
@@ -949,9 +992,27 @@ func main() {
                             }
                         }
 
+                        // なぜアライメント不整合のサンプルを除外するか:
+                        // 読み（音素列）が変わった発話に古いアライメントを当てると、prepareFrameMelTrainingSample が
+                        // 平均継続時間に基づく擬似アライメントへ黙って退避し、誤った継続時間を教師として学習してしまうため。
+                        var bodyTokenCount = 0
+                        for phrase in phrases {
+                            for mora in phrase.moras {
+                                bodyTokenCount += mora.phonemes.count
+                            }
+                        }
+                        var alignmentUsable = false
+                        if let al = effectiveAlign {
+                            if AlignmentStore.isUtteranceAlignmentValid(al) && al.phonemes.count == bodyTokenCount {
+                                alignmentUsable = true
+                            }
+                        }
+
                         switch useFrameMel {
                         case true:
-                            if let fSample = engine.prepareFrameMelTrainingSample(
+                            if alignmentUsable != true {
+                                skippedFrameMelSamples += 1
+                            } else if let fSample = engine.prepareFrameMelTrainingSample(
                                 text: text,
                                 pcm16k: pcm16k,
                                 melExtractor: melExtractor,
@@ -959,6 +1020,7 @@ func main() {
                                 alignment: effectiveAlign
                             ) {
                                 frameMelSamples.append(fSample)
+                                frameMelTexts.append(text)
                                 if 0 < vocoderEpochs {
                                     let extractedMel = melExtractor.extractLogMel(pcm: pcm16k)
                                     let pitchResult = pitchTracker.track(pcm: pcm16k)
@@ -1030,7 +1092,7 @@ func main() {
             print("エラー: 有効な FrameMel 学習データが 0 件です。")
             return
         }
-        print("有効 FrameMel 学習サンプル数: \(frameMelSamples.count) 件")
+        print("有効 FrameMel 学習サンプル数: \(frameMelSamples.count) 件（アライメント不整合で除外: \(skippedFrameMelSamples) 件）")
     case false:
         if trainingData.isEmpty {
             print("エラー: 有効な学習データが 0 件です。")
@@ -1039,19 +1101,264 @@ func main() {
         print("有効学習サンプル数: \(trainingData.count) 件")
     }
 
+    // ============================================================
+    // ニューラルボコーダー学習（FrameMel / SNN 両経路から共通で呼び出す）
+    // なぜ関数化するか: 以前は SNN 経路の末尾にのみ置かれ、FrameMel 経路では
+    // 早期 return により一度も到達せず、ボコーダーが更新されない状態が続いていたため。
+    // ============================================================
+    let outputURL = URL(fileURLWithPath: outputPath)
+    let outputDir = outputURL.deletingLastPathComponent().path
+    let vocoderURL = WeightCheckpoint.resolvePath(directory: outputDir, fileName: "vocoder_weights.json")
+
+    func runVocoderTraining() {
+        if 0 < vocoderEpochs && vocoderPairs.isEmpty != true {
+            print("--------------------------------------------------")
+            print("ニューラルボコーダーの最適化（Multi-Resolution STFT損失）を開始します (サンプル数: \(vocoderPairs.count), エポック数: \(vocoderEpochs))...")
+            let vocoder = MLXNeuralVocoder()
+            if forceFresh != true && fileManager.fileExists(atPath: vocoderURL.path) {
+                if let existingData = try? Data(contentsOf: vocoderURL) {
+                    switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
+                    case .some(let savedWeights):
+                        if savedWeights.config.hiddenChannels != 256 {
+                            // なぜ 64ch 重みを破棄して 256ch モデルの新規初期重みを使用するか:
+                            // 64ch 重みを 256ch モデルに import するとテンソル形状不整合でクラッシュするため、
+                            // 推論時（NeuralVocoder.swift）と同様に不一致時は破棄し、256ch の初期状態から学習するため。
+                            print("[NeuralVocoder] 警告: \(vocoderURL.path) の hiddenChannels (\(savedWeights.config.hiddenChannels)) が 256 と一致しないため、破棄し 256ch の初期重みを使用します。")
+                        } else {
+                            vocoder.importWeights(from: savedWeights)
+                            print("既存のニューラルボコーダー重みを読み込みました: \(vocoderURL.path)")
+                        }
+                    case .none:
+                        break
+                    }
+                }
+            }
+
+            let vocoderOptimizer = Adam(learningRate: vocoderLearningRate)
+            let segFrames = 32
+            let hopSize = vocoder.config.hopSize
+            let segSamples = segFrames * hopSize
+            let melCh = vocoder.config.melChannels
+            let inCh = melCh + 2
+
+            let lg = valueAndGrad(model: vocoder) { (model: MLXNeuralVocoder, arrays: [MLXArray]) -> [MLXArray] in
+                let fArr = arrays[0]
+                let tArr = arrays[1]
+                let pred = model(fArr)
+                let loss = MLXNeuralVocoder.totalVocoderLoss(predicted: pred, target: tArr)
+                return [loss]
+            }
+
+            Memory.cacheLimit = 32 * 1024 * 1024
+            let batchSize = 8
+            var vEpoch = 0
+            while vEpoch < vocoderEpochs {
+                var epochLossSum: Float = 0.0
+                var vBatchCount = 0
+
+                var batchFeats = [Float]()
+                var batchPCMs = [Float]()
+                var currBatchItems = 0
+
+                var pairIdx = 0
+                while pairIdx < vocoderPairs.count {
+                    let pair = vocoderPairs[pairIdx]
+                    let totalF = pair.mel.count
+                    if segFrames <= totalF {
+                        let maxStart = totalF - segFrames
+                        var sampleIt = 0
+                        while sampleIt < 4 {
+                            var startF = 0
+                            if 0 < maxStart {
+                                var bestStart = Int.random(in: 0...maxStart)
+                                var trial = 0
+                                while trial < 8 {
+                                    let cand = Int.random(in: 0...maxStart)
+                                    var voicedCount = 0
+                                    var chkF = 0
+                                    while chkF < segFrames {
+                                        let idx = cand + chkF
+                                        if idx < pair.voiced.count {
+                                            if 0.5 < pair.voiced[idx] {
+                                                voicedCount += 1
+                                            }
+                                        }
+                                        chkF += 1
+                                    }
+                                    if 4 <= voicedCount {
+                                        bestStart = cand
+                                        break
+                                    }
+                                    trial += 1
+                                }
+                                startF = bestStart
+                            }
+                            let startSample = startF * hopSize
+                            let endSample = startSample + segSamples
+
+                            if endSample <= pair.pcm.count {
+                                var f = 0
+                                while f < segFrames {
+                                    let currF = startF + f
+                                    let frameMel = pair.mel[currF]
+                                    var c = 0
+                                    let copyLimit = min(melCh, frameMel.count)
+                                    while c < copyLimit {
+                                        batchFeats.append(frameMel[c])
+                                        c += 1
+                                    }
+                                    while c < melCh {
+                                        batchFeats.append(0.0)
+                                        c += 1
+                                    }
+                                    var normF0: Float = 0.0
+                                    if currF < pair.f0.count {
+                                        let val = pair.f0[currF]
+                                        if 0.0 < val {
+                                            var nF0 = val / 500.0
+                                            if nF0 < 0.0 { nF0 = 0.0 }
+                                            if 1.0 < nF0 { nF0 = 1.0 }
+                                            normF0 = nF0
+                                        }
+                                    }
+                                    batchFeats.append(normF0)
+
+                                    var vVal: Float = 1.0
+                                    if currF < pair.voiced.count {
+                                        vVal = pair.voiced[currF]
+                                    }
+                                    batchFeats.append(vVal)
+                                    f += 1
+                                }
+
+                                batchPCMs.append(contentsOf: pair.pcm[startSample..<endSample])
+                                currBatchItems += 1
+
+                                if batchSize <= currBatchItems {
+                                    autoreleasepool {
+                                        let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
+                                        let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
+
+                                        let (lossVals, grads) = lg(vocoder, [featArr, targArr])
+                                        let lossVal = lossVals[0].item(Float.self)
+                                        epochLossSum += lossVal
+                                        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
+                                        vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
+                                        eval(vocoder.trainableParameters(), lossVal)
+                                        Stream.gpu.synchronize()
+                                    }
+
+                                    vBatchCount += 1
+                                    batchFeats.removeAll(keepingCapacity: true)
+                                    batchPCMs.removeAll(keepingCapacity: true)
+                                    currBatchItems = 0
+                                    if (vBatchCount % 10) == 0 {
+                                        Memory.clearCache()
+                                    }
+                                }
+                            }
+                            sampleIt += 1
+                        }
+                    }
+                    pairIdx += 1
+                }
+
+                if 0 < currBatchItems {
+                    autoreleasepool {
+                        let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
+                        let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
+
+                        let (lossVals, grads) = lg(vocoder, [featArr, targArr])
+                        let lossVal = lossVals[0].item(Float.self)
+                        epochLossSum += lossVal
+                        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
+                        vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
+                        eval(vocoder.trainableParameters(), lossVal)
+                        Stream.gpu.synchronize()
+                    }
+
+                    vBatchCount += 1
+                    batchFeats.removeAll(keepingCapacity: true)
+                    batchPCMs.removeAll(keepingCapacity: true)
+                    currBatchItems = 0
+                }
+
+                eval(vocoder.trainableParameters())
+                Stream.gpu.synchronize()
+                Memory.clearCache()
+
+                var avgVLoss: Float = 0.0
+                if 0 < vBatchCount {
+                    avgVLoss = epochLossSum / Float(vBatchCount)
+                }
+                print("  [Vocoder Epoch \(vEpoch + 1)/\(vocoderEpochs)] 平均STFT損失: \(String(format: "%.6f", avgVLoss)) (バッチ数: \(vBatchCount))")
+                vEpoch += 1
+            }
+
+            let trainedWeights = vocoder.exportWeights()
+            do {
+                let encoded = try JSONEncoder().encode(trainedWeights)
+                try encoded.write(to: vocoderURL, options: .atomic)
+                print("最適化済みニューラルボコーダー重みを保存しました: \(vocoderURL.path) (\(encoded.count) バイト)")
+            } catch {
+                print("警告: ニューラルボコーダー重みの保存に失敗しました: \(error)")
+            }
+            // なぜボコーダー学習エポックが 0 の場合に既存重みを保持するか:
+            // SNN 再学習時に獲得済みのニューラルボコーダー音響合成重みを破壊せず、
+            // 単一話者（女性）の自然な声質を 100% 確実に維持するため。
+            var needVocoderWrite = false
+            if fileManager.fileExists(atPath: vocoderURL.path) != true {
+                needVocoderWrite = true
+            } else {
+                if let existingData = try? Data(contentsOf: vocoderURL) {
+                    switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
+                    case .some(let savedWeights):
+                        if savedWeights.config.hiddenChannels != 256 {
+                            needVocoderWrite = true
+                        } else {
+                            needVocoderWrite = false
+                        }
+                    case .none:
+                        needVocoderWrite = true
+                    }
+                } else {
+                    needVocoderWrite = true
+                }
+            }
+            if needVocoderWrite {
+                let initialVocoderWeights = NeuralVocoderWeights.randomWeights()
+                if let encoded = try? JSONEncoder().encode(initialVocoderWeights) {
+                    try? encoded.write(to: vocoderURL, options: .atomic)
+                    print("ニューラルボコーダー初期重みをエクスポートしました: \(vocoderURL.path) (\(encoded.count) バイト)")
+                }
+            }
+        }
+    }
+
     if useFrameMel {
+        // ボコーダーを先に学習する。FrameMel の検証用波形に最新のボコーダーを使うため。
+        runVocoderTraining()
+
         print("\n==================================================")
         print("SpikeVoice (arXiv:2408.00788) フレーム単位対数メルモデル学習を開始します")
         print("  データ数: \(frameMelSamples.count), エポック数: \(epochs)")
-        print("  初期学習率: \(learningRate), 最小学習率: \(lrMin)")
+        print("  初期学習率: \(learningRate), 最小学習率: \(lrMin), ウォームアップ: \(warmupEpochs) エポック")
         print("==================================================")
 
-        // 1. モデルとトレーナーの初期化
+        // 1. モデルとトレーナーの初期化（全パラメータを学習対象とする）
         let frameMelModel: MLXFrameMelModel
         switch weights.frameMelWeights {
         case .some(let existingW):
-            frameMelModel = MLXFrameMelModel(weights: existingW)
-            print("既存の FrameMel 重みをロードしました。")
+            // なぜ残差重みを捨ててから本体学習を始めるか:
+            // 本体は残差なしの損失で学習されるが、推論は残差が残っていれば必ず加算する。
+            // 旧残差を保持したまま本体を更新すると、学習時と推論時のメルが食い違うため。
+            frameMelModel = MLXFrameMelModel(weights: existingW.withoutMelResidual())
+            switch existingW.resW1 {
+            case .some:
+                print("既存の FrameMel 重みをロードしました（旧メル残差重みは破棄し、本体を直接学習します）。")
+            case .none:
+                print("既存の FrameMel 重みをロードしました。")
+            }
         case .none:
             var melSums = [Float](repeating: 0.0, count: AudioConfig.melChannels)
             var melCounts = [Float](repeating: 0.0, count: AudioConfig.melChannels)
@@ -1085,22 +1392,45 @@ func main() {
             print("新規の FrameMel 重みを決定論的初期化しました（初期 meanMel 適合）。")
         }
 
-        let initResidual = FrameMelWeights.makeInitialResidualWeights(seed: 2026)
-        let residualModel = MLXMelResidual(
-            w1: initResidual.resW1,
-            b1: initResidual.resB1,
-            w2: initResidual.resW2,
-            b2: initResidual.resB2
-        )
-        var deltaLossWeight: Float = 1.0
-        var trainer = MLXMelResidualTrainer(
-            frozenModel: frameMelModel,
-            residualModel: residualModel,
-            learningRate: learningRate,
-            deltaLossWeight: deltaLossWeight
-        )
+        let trainer = MLXFrameMelTrainer(model: frameMelModel, learningRate: learningRate)
         Memory.cacheLimit = 32 * 1024 * 1024
 
+        // 2. 学習／検証分割（決定論的: validationEvery 件に 1 件を検証用に保持）
+        // なぜ保持検証データで採否を決めるか:
+        // 特定文の経験則指標（重心・包絡変化など）での採否は読みの誤りや別の文の崩れを検出できず、
+        // 学習損失の改善と無関係に重みが破棄される原因になっていたため。
+        let validationEvery = 20
+        var trainSet: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
+        var validSet: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
+        var validTexts: [String] = []
+        let canSplit = (2 * validationEvery) <= frameMelSamples.count
+        var splitIdx = 0
+        while splitIdx < frameMelSamples.count {
+            if canSplit && (splitIdx % validationEvery) == 0 {
+                validSet.append(frameMelSamples[splitIdx])
+                if splitIdx < frameMelTexts.count {
+                    validTexts.append(frameMelTexts[splitIdx])
+                }
+            } else {
+                trainSet.append(frameMelSamples[splitIdx])
+            }
+            splitIdx += 1
+        }
+        switch canSplit {
+        case true:
+            print("学習 \(trainSet.count) 件 / 検証 \(validSet.count) 件 に分割しました（\(validationEvery) 件ごとに 1 件を検証用に保持）。")
+        case false:
+            print("サンプル数が少ないため検証分割を行わず、学習損失でエポックを選定します。")
+        }
+
+        let schedule = CosineWarmupSchedule(
+            lrBase: learningRate,
+            lrMin: lrMin,
+            warmupEpochs: warmupEpochs,
+            totalEpochs: epochs
+        )
+
+        // 3. コーパス実測の音素平均継続時間とモーラ速度を重みへ保存する
         let healthyAlignments = Array(alignmentMap.values).filter { AlignmentStore.isUtteranceAlignmentValid($0) }
         let healthyPhonemeAverages: [Int32: Float]
         if healthyAlignments.isEmpty != true {
@@ -1113,107 +1443,92 @@ func main() {
                 healthyPhonemeAverages = LengthRegulator.defaultPhonemeAverageDurations
             }
         }
+        var corpusMoraRate: Float = weights.meanFramesPerMora ?? LengthRegulator.defaultMeanFramesPerMora
+        if 0 < totalMorasAcrossCorpus {
+            let measured = Float(totalSpeechFramesAcrossCorpus) / Float(totalMorasAcrossCorpus)
+            if 8.0 <= measured && measured <= 24.0 {
+                corpusMoraRate = measured
+            }
+        }
+        print("コーパス実測モーラ速度: \(String(format: "%.2f", corpusMoraRate)) frames/モーラ (\(String(format: "%.0f", corpusMoraRate * 10.0)) ms/モーラ)")
         let baseWithDurations = weights
-            .withMeanFramesPerMora(16.0)
+            .withMeanFramesPerMora(corpusMoraRate)
             .withPhonemeAverageDurations(healthyPhonemeAverages)
 
-        // ============================================================
-        // 0.4 作業前事前検証 (Epoch 19):
-        // 戻した重みで、教師を入れない synthesize(text:) を実行し、水と天気を直下と .tmp/wave15/ の両方へ書く。
-        // この波形がエポック 19 の戻しである。
-        // 水の包絡変化が 40–46 Hz、水の一致割合が 0.48–0.54、重心（200–1500 Hz）が 25–27 Hz、
-        // copy の包絡変化が 70–78 Hz、copy の一致割合が 0.24–0.30 に入ることを確認する。
-        // ============================================================
-        let mizuText = "水をマレーシアから買わなくてはならないのです。"
-        let tenkiText = "今日はいい天気です"
-        let copyPath = ".tmp/wave15/copy_BASIC5000_0001.wav"
-        let reconDir = ".tmp/wave15"
-        try? fileManager.createDirectory(atPath: reconDir, withIntermediateDirectories: true)
-
-        let preEngine = SpikeSpeechEngine(weights: baseWithDurations)
-        let preMizuPCM = preEngine.synthesize(text: mizuText)
-        let preTenkiPCM = preEngine.synthesize(text: tenkiText)
-
-        let preMizuURL = URL(fileURLWithPath: reconDir + "/tts_mizuwomare.wav")
-        let preMizuRootURL = URL(fileURLWithPath: "tts_mizuwomare.wav")
-        let preMizuData = WavEncoder.encode(samples: preMizuPCM, sampleRate: AudioConfig.sampleRate)
-        try? preMizuData.write(to: preMizuURL)
-        try? preMizuData.write(to: preMizuRootURL)
-
-        let preTenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
-        let preTenkiRootURL = URL(fileURLWithPath: "tts_tenki.wav")
-        let preTenkiData = WavEncoder.encode(samples: preTenkiPCM, sampleRate: AudioConfig.sampleRate)
-        try? preTenkiData.write(to: preTenkiURL)
-        try? preTenkiData.write(to: preTenkiRootURL)
-
-        let preMizuEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preMizuPCM)
-        let preMizuMetric = AcousticCentroidMetric.measure(pcm: preMizuPCM)
-        let preMizuCentroid1k5 = preMizuMetric.centroidMedian200to1500
-        let preTenkiEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preTenkiPCM)
-        let preCopyPCM = (try? WavAudioReader().loadWav16k(from: copyPath)) ?? []
-        let preCopyEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: preCopyPCM)
-
-        print("[作業前事前検証 (Epoch 19)]")
-        print("  水:   包絡変化 = \(String(format: "%.2f", preMizuEnv.centroidMedian)) Hz (基準: 40–46 Hz), 一致割合 = \(String(format: "%.4f", preMizuEnv.matchRatio)) (基準: 0.48–0.54), 200–1500Hz重心 = \(String(format: "%.2f", preMizuCentroid1k5)) Hz (基準: 25–27 Hz)")
-        print("  天気: 包絡変化 = \(String(format: "%.2f", preTenkiEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", preTenkiEnv.matchRatio))")
-        print("  copy: 包絡変化 = \(String(format: "%.2f", preCopyEnv.centroidMedian)) Hz (基準: 70–78 Hz), 一致割合 = \(String(format: "%.4f", preCopyEnv.matchRatio)) (基準: 0.24–0.30)")
-
-        let preMizuOk = (40.0 <= preMizuEnv.centroidMedian && preMizuEnv.centroidMedian <= 46.0 && 0.48 <= preMizuEnv.matchRatio && preMizuEnv.matchRatio <= 0.54 && 25.0 <= preMizuCentroid1k5 && preMizuCentroid1k5 <= 27.0)
-        let preCopyOk = (70.0 <= preCopyEnv.centroidMedian && preCopyEnv.centroidMedian <= 78.0 && 0.24 <= preCopyEnv.matchRatio && preCopyEnv.matchRatio <= 0.30)
-        switch preMizuOk && preCopyOk {
-        case true:
-            print("【作業前事前検証 合格】エポック 19 の水および copy の指標が受入基準範囲内に合致しました。学習を開始します。")
-        case false:
-            print("【エラー】エポック 19 の指標が受入基準範囲外です。測り方を直してから再度実行してください。")
-            return
+        func averageLosses(_ samples: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])]) -> FrameMelLosses {
+            var total: Float = 0.0
+            var dec: Float = 0.0
+            var post: Float = 0.0
+            var f0: Float = 0.0
+            var eng: Float = 0.0
+            var dur: Float = 0.0
+            var delta: Float = 0.0
+            var n = 0
+            var i = 0
+            while i < samples.count {
+                let s = samples[i]
+                let l = autoreleasepool {
+                    trainer.evaluateSample(
+                        phoneIds: s.phoneIds,
+                        targetDurations: s.targetDurations,
+                        targetMel: s.targetMel,
+                        targetF0: s.targetF0,
+                        targetEnergy: s.targetEnergy
+                    )
+                }
+                if l.totalLoss.isFinite {
+                    total += l.totalLoss
+                    dec += l.decMelL1
+                    post += l.postMelL1
+                    f0 += l.voicedF0MSE
+                    eng += l.energyMSE
+                    dur += l.durMSE
+                    delta += l.deltaMelL1
+                    n += 1
+                }
+                if (i % 50) == 49 {
+                    Stream.gpu.synchronize()
+                    Memory.clearCache()
+                }
+                i += 1
+            }
+            let d = Float(max(1, n))
+            return FrameMelLosses(
+                totalLoss: total / d,
+                decMelL1: dec / d,
+                postMelL1: post / d,
+                voicedF0MSE: f0 / d,
+                energyMSE: eng / d,
+                durMSE: dur / d,
+                deltaMelL1: delta / d
+            )
         }
 
-        struct CandidateRecord {
-            let epoch: Int
-            let weights: SpikingNetworkWeights
-            let mizuPCM: [Float]
-            let tenkiPCM: [Float]
-            let mizuCentroid: Float
-            let mizuMatch: Float
-            let tenkiCentroid: Float
-            let tenkiMatch: Float
-            let mizuCentroid1k5: Float
-        }
-
-        var earlyStoppedRecord: CandidateRecord? = nil
-        var stopReason = "全エポック実行完了"
-
-        let totalEpochs = min(15, epochs)
-        let schedule = CosineWarmupSchedule(
-            lrBase: learningRate,
-            lrMin: lrMin,
-            warmupEpochs: 0,
-            totalEpochs: totalEpochs
-        )
-
-        let startingFMW = weights.frameMelWeights!
-        var epoch1DeltaRatio: Float = 1.0
-        var epoch1DeltaTerm: Float = 0.0
-        var epoch1MelL1: Float = 0.0
+        var bestSelectionLoss: Float = Float.greatestFiniteMagnitude
+        var bestEpoch: Int = -1
+        var bestFullWeights: SpikingNetworkWeights = baseWithDurations.withFrameMelWeights(trainer.exportWeights())
 
         var epoch = 0
-        epochLoop: while epoch < totalEpochs {
+        while epoch < epochs {
             if noShuffle != true {
                 let seed = TrainingShuffle.mixSeed(baseSeed: shuffleSeed, epoch: epoch)
-                TrainingShuffle.shuffleInPlace(&frameMelSamples, seed: seed)
+                TrainingShuffle.shuffleInPlace(&trainSet, seed: seed)
             }
 
             let lr = schedule.learningRate(epoch: epoch)
             trainer.setLearningRate(lr)
 
             var epochTotalLoss: Float = 0.0
-            var epochMelL1: Float = 0.0
-            var epochDeltaL1: Float = 0.0
+            var epochDecL1: Float = 0.0
+            var epochPostL1: Float = 0.0
+            var epochF0MSE: Float = 0.0
+            var epochEnergyMSE: Float = 0.0
+            var epochDurMSE: Float = 0.0
             var sampleCount = 0
 
             var sIdx = 0
-            while sIdx < frameMelSamples.count {
-                let s = frameMelSamples[sIdx]
+            while sIdx < trainSet.count {
+                let s = trainSet[sIdx]
                 let losses = autoreleasepool {
                     trainer.trainSample(
                         phoneIds: s.phoneIds,
@@ -1226,374 +1541,92 @@ func main() {
 
                 if losses.totalLoss.isFinite {
                     epochTotalLoss += losses.totalLoss
-                    epochMelL1 += losses.melL1
-                    epochDeltaL1 += losses.deltaMelL1
+                    epochDecL1 += losses.decMelL1
+                    epochPostL1 += losses.postMelL1
+                    epochF0MSE += losses.voicedF0MSE
+                    epochEnergyMSE += losses.energyMSE
+                    epochDurMSE += losses.durMSE
                     sampleCount += 1
                 }
 
-                // Metal リソース保護（50 サンプルごと）
+                // Metal リソース保護（50 サンプルごと）。トレーナーは再生成せず Adam の状態を維持する。
                 if (sampleCount % 50) == 0 {
                     Stream.gpu.synchronize()
                     Memory.clearCache()
                 }
 
                 if (sampleCount % 200) == 0 {
-                    print("    ステップ [\(sampleCount)/\(frameMelSamples.count)] 直近損失: \(String(format: "%.4f", losses.totalLoss)) (MelL1: \(String(format: "%.4f", losses.melL1)), Delta: \(String(format: "%.4f", losses.deltaMelL1)))")
+                    print("    ステップ [\(sampleCount)/\(trainSet.count)] 直近損失: \(String(format: "%.4f", losses.totalLoss)) (Dec: \(String(format: "%.4f", losses.decMelL1)), Post: \(String(format: "%.4f", losses.postMelL1)), F0: \(String(format: "%.4f", losses.voicedF0MSE)), Eng: \(String(format: "%.4f", losses.energyMSE)), Dur: \(String(format: "%.4f", losses.durMSE)))")
                 }
 
                 sIdx += 1
             }
             Memory.clearCache()
 
-            let avgTotal = epochTotalLoss / Float(max(1, sampleCount))
-            let avgMel = epochMelL1 / Float(max(1, sampleCount))
-            let avgDelta = epochDeltaL1 / Float(max(1, sampleCount))
+            let n = Float(max(1, sampleCount))
+            let avgTotal = epochTotalLoss / n
+            let avgDec = epochDecL1 / n
+            let avgPost = epochPostL1 / n
+            let avgF0 = epochF0MSE / n
+            let avgEng = epochEnergyMSE / n
+            let avgDur = epochDurMSE / n
 
-            print("  [Epoch \(epoch + 1)/\(totalEpochs)] 損失: \(String(format: "%.4f", avgTotal)) (MelL1: \(String(format: "%.4f", avgMel)), Delta: \(String(format: "%.4f", avgDelta)))  lr=\(String(format: "%.6g", lr))")
+            print("  [Epoch \(epoch + 1)/\(epochs)] 学習損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)))  lr=\(String(format: "%.6g", lr))")
 
-            if epoch == 0 {
-                let termVal = trainer.deltaLossWeight * avgDelta
-                let ratio = termVal / max(1e-6, avgMel)
-                epoch1DeltaTerm = termVal
-                epoch1MelL1 = avgMel
-                epoch1DeltaRatio = ratio
-                print("    [エポック 1 損失比率検証] Delta項: \(String(format: "%.4f", termVal)) (係数: \(trainer.deltaLossWeight)), メルL1: \(String(format: "%.4f", avgMel)), 比率: \(String(format: "%.4f", ratio))")
-                if ratio < 0.8 || 1.2 < ratio {
-                    let newWeight = avgMel / max(1e-6, avgDelta)
-                    print("    ==> 比率が [0.8, 1.2] 外のため、係数を \(newWeight) に変更してエポック 1 からやり直します。")
-                    deltaLossWeight = newWeight
-                    let freshRes = FrameMelWeights.makeInitialResidualWeights(seed: 2026)
-                    let freshResMod = MLXMelResidual(w1: freshRes.resW1, b1: freshRes.resB1, w2: freshRes.resW2, b2: freshRes.resB2)
-                    trainer = MLXMelResidualTrainer(
-                        frozenModel: frameMelModel,
-                        residualModel: freshResMod,
-                        learningRate: learningRate,
-                        deltaLossWeight: newWeight
-                    )
-                    continue epochLoop
-                }
+            // 検証損失（教師強制・勾配なし）
+            let selectionLoss: Float
+            switch validSet.isEmpty {
+            case false:
+                let v = averageLosses(validSet)
+                print("    検証損失: \(String(format: "%.4f", v.totalLoss)) (Dec: \(String(format: "%.4f", v.decMelL1)), Post: \(String(format: "%.4f", v.postMelL1)), F0: \(String(format: "%.4f", v.voicedF0MSE)), Eng: \(String(format: "%.4f", v.energyMSE)), Dur: \(String(format: "%.4f", v.durMSE)))")
+                selectionLoss = v.totalLoss
+            case true:
+                selectionLoss = avgTotal
             }
 
-            // エポック重みの保存
-            let resWeights = trainer.residualModel.exportWeights()
-            let currentFMW = startingFMW.withMelResidual(
-                resW1: resWeights.w1,
-                resB1: resWeights.b1,
-                resW2: resWeights.w2,
-                resB2: resWeights.b2
-            )
+            // エポック重みの保存（各エポック）と最良重みの即時保存
+            let currentFMW = trainer.exportWeights()
             let epochFullWeights = baseWithDurations.withFrameMelWeights(currentFMW)
-            let epPath = String(format: "Models/weights.ep%02d.json", epoch + 1)
-            let epURL = URL(fileURLWithPath: epPath)
+            let epURL = WeightCheckpoint.resolvePath(directory: outputDir, fileName: String(format: "weights.ep%02d.json", epoch + 1))
             try? WeightCheckpoint.atomicWritePretty(epochFullWeights, to: epURL)
 
-            // 各エポックの終わりに、教師を入れない（予測F0・予測エネルギーの）synthesize(text:) で水と天気を測る
-            let evalEngine = SpikeSpeechEngine(weights: epochFullWeights)
-            let mizuPCM = evalEngine.synthesize(text: mizuText)
-            let tenkiPCM = evalEngine.synthesize(text: tenkiText)
-
-            let mizuEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: mizuPCM)
-            let tenkiEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: tenkiPCM)
-            let copyPCM = (try? WavAudioReader().loadWav16k(from: copyPath)) ?? []
-            let copyEnv = AcousticCentroidMetric.measureEnvelopeDelta(pcm: copyPCM)
-
-            let mizuMetric = AcousticCentroidMetric.measure(pcm: mizuPCM)
-            let tenkiMetric = AcousticCentroidMetric.measure(pcm: tenkiPCM)
-
-            print("    [エポック \(epoch + 1) 包絡および音響客観指標]")
-            print("      水:   包絡変化 = \(String(format: "%.2f", mizuEnv.centroidMedian)) Hz (基準: >= 60.0), 一致割合 = \(String(format: "%.4f", mizuEnv.matchRatio)) (基準: <= 0.35)")
-            print("            200–1500 Hz重心 = \(String(format: "%.2f", mizuMetric.centroidMedian200to1500)) Hz (基準: >= 24.0)")
-            print("      天気: 包絡変化 = \(String(format: "%.2f", tenkiEnv.centroidMedian)) Hz (基準: >= 60.0), 一致割合 = \(String(format: "%.4f", tenkiEnv.matchRatio)) (基準: <= 0.35), 200–1500 Hz重心 = \(String(format: "%.2f", tenkiMetric.centroidMedian200to1500)) Hz")
-            if copyPCM.isEmpty != true {
-                print("      copy: 包絡変化 = \(String(format: "%.2f", copyEnv.centroidMedian)) Hz, 一致割合 = \(String(format: "%.4f", copyEnv.matchRatio))")
-            }
-
-            // 終了判定: 次の五つが同時に満たされたエポックで止め、それを残す。
-            // - 水の包絡変化が 60 Hz 以上。
-            // - 水の一致割合が 0.35 以下。
-            // - 天気の包絡変化が 60 Hz 以上。
-            // - 天気の一致割合が 0.35 以下。
-            // - 水の 200–1500 Hz の重心変化が 24 Hz 以上。
-            let earlyStopMet = (60.0 <= mizuEnv.centroidMedian && mizuEnv.matchRatio <= 0.35 && 60.0 <= tenkiEnv.centroidMedian && tenkiEnv.matchRatio <= 0.35 && 24.0 <= mizuMetric.centroidMedian200to1500)
-            if earlyStopMet {
-                earlyStoppedRecord = CandidateRecord(
-                    epoch: epoch + 1,
-                    weights: epochFullWeights,
-                    mizuPCM: mizuPCM,
-                    tenkiPCM: tenkiPCM,
-                    mizuCentroid: mizuEnv.centroidMedian,
-                    mizuMatch: mizuEnv.matchRatio,
-                    tenkiCentroid: tenkiEnv.centroidMedian,
-                    tenkiMatch: tenkiEnv.matchRatio,
-                    mizuCentroid1k5: mizuMetric.centroidMedian200to1500
-                )
-                stopReason = "早期停止（全5受入基準充足）"
-                print("【全受入基準達成】水・天気の包絡・一致割合および水重心24Hzを同時に達成しました！")
-                break epochLoop
+            if selectionLoss < bestSelectionLoss {
+                bestSelectionLoss = selectionLoss
+                bestEpoch = epoch + 1
+                bestFullWeights = epochFullWeights
+                do {
+                    try WeightCheckpoint.atomicWritePretty(bestFullWeights, to: outputURL)
+                    print("    ==> 最良エポック更新: Epoch \(bestEpoch) (選定損失: \(String(format: "%.4f", bestSelectionLoss)))。\(outputPath) に保存しました。")
+                } catch {
+                    print("    エラー: 最良重みの保存に失敗しました: \(error)")
+                }
             }
 
             epoch += 1
-        } // end epochLoop
-
-        // 凍結パラメータの不変性を厳密に検証するヘルパー
-        func verifyFrozenWeightsIntact(base: FrameMelWeights, final: FrameMelWeights) -> (ok: Bool, maxDiff: Float) {
-            func maxD(_ a: [Float], _ b: [Float]) -> Float {
-                if a.count != b.count { return Float.infinity }
-                var m: Float = 0.0
-                var idx = 0
-                while idx < a.count {
-                    let d = abs(a[idx] - b[idx])
-                    if m < d { m = d }
-                    idx += 1
-                }
-                return m
-            }
-
-            var overallMax: Float = 0.0
-            overallMax = max(overallMax, maxD(base.embedCur, final.embedCur))
-            overallMax = max(overallMax, maxD(base.embedPrev, final.embedPrev))
-            overallMax = max(overallMax, maxD(base.embedNext, final.embedNext))
-            overallMax = max(overallMax, maxD(base.encBIn, final.encBIn))
-            var l = 0
-            while l < base.encWConv.count {
-                overallMax = max(overallMax, maxD(base.encWConv[l], final.encWConv[l]))
-                overallMax = max(overallMax, maxD(base.encBConv[l], final.encBConv[l]))
-                l += 1
-            }
-            overallMax = max(overallMax, maxD(base.durW1, final.durW1))
-            overallMax = max(overallMax, maxD(base.durB1, final.durB1))
-            overallMax = max(overallMax, maxD(base.durW2, final.durW2))
-            overallMax = max(overallMax, maxD(base.durB2, final.durB2))
-            overallMax = max(overallMax, maxD(base.f0W1, final.f0W1))
-            overallMax = max(overallMax, maxD(base.f0B1, final.f0B1))
-            overallMax = max(overallMax, maxD(base.f0W2, final.f0W2))
-            overallMax = max(overallMax, maxD(base.f0B2, final.f0B2))
-            overallMax = max(overallMax, maxD(base.energyW1, final.energyW1))
-            overallMax = max(overallMax, maxD(base.energyB1, final.energyB1))
-            overallMax = max(overallMax, maxD(base.energyW2, final.energyW2))
-            overallMax = max(overallMax, maxD(base.energyB2, final.energyB2))
-            overallMax = max(overallMax, maxD(base.decWIn, final.decWIn))
-            overallMax = max(overallMax, maxD(base.decBIn, final.decBIn))
-            l = 0
-            while l < base.decWConv.count {
-                overallMax = max(overallMax, maxD(base.decWConv[l], final.decWConv[l]))
-                overallMax = max(overallMax, maxD(base.decBConv[l], final.decBConv[l]))
-                l += 1
-            }
-            overallMax = max(overallMax, maxD(base.decWOut, final.decWOut))
-            overallMax = max(overallMax, maxD(base.decBOut, final.decBOut))
-            l = 0
-            while l < base.postWConv.count {
-                overallMax = max(overallMax, maxD(base.postWConv[l], final.postWConv[l]))
-                overallMax = max(overallMax, maxD(base.postBConv[l], final.postBConv[l]))
-                l += 1
-            }
-            return (overallMax <= 0.0, overallMax)
-        }
-
-        // 採択エポックの選定
-        // 15 エポックで五つが揃わなければ残差を捨て、エポック 19 の重みと波形へ戻し、未達と書く。
-        // 凍結した配列が 1 個でも変わっていたら、その結果は捨ててエポック 19 へ戻す。
-        var isAchieved = false
-        var selectionType = "未達"
-        let finalWeights: SpikingNetworkWeights
-        let finalMizuPCM: [Float]
-        let finalTenkiPCM: [Float]
-        let finalEpochNumber: Int
-
-        switch earlyStoppedRecord {
-        case .some(let early):
-            let check = verifyFrozenWeightsIntact(base: startingFMW, final: early.weights.frameMelWeights!)
-            switch check.ok {
-            case true:
-                isAchieved = true
-                selectionType = "早期停止（全条件達成）"
-                finalWeights = early.weights
-                finalMizuPCM = early.mizuPCM
-                finalTenkiPCM = early.tenkiPCM
-                finalEpochNumber = early.epoch
-                print("【凍結配列完全一致検証 合格】エポック 19 の全凍結配列の最大絶対差は厳密に 0.0 です。")
-            case false:
-                isAchieved = false
-                selectionType = "未達（凍結配列差分検出による破棄・Epoch 19 復元）"
-                stopReason = "凍結配列差分検出 (MaxDiff: \(check.maxDiff))"
-                print("【エラー】凍結配列に差分が検出されました！結果を破棄して Epoch 19 に復元します。")
-                let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
-                finalWeights = (try? SpikingNetworkWeights.load(from: ep19URL)) ?? baseWithDurations
-                finalMizuPCM = preMizuPCM
-                finalTenkiPCM = preTenkiPCM
-                finalEpochNumber = 19
-            }
-        case .none:
-            isAchieved = false
-            selectionType = "未達（15エポック上限到達、Epoch 19 復元）"
-            stopReason = "15エポック上限到達（5条件非達成）"
-            print("【15エポック未達】五つの条件が揃わなかったため、残差重みを破棄し Epoch 19 の重みと波形へ復元します。")
-            let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
-            finalWeights = (try? SpikingNetworkWeights.load(from: ep19URL)) ?? baseWithDurations
-            finalMizuPCM = preMizuPCM
-            finalTenkiPCM = preTenkiPCM
-            finalEpochNumber = 19
-        }
-
-        let achievedStr: String
-        switch isAchieved {
-        case true:
-            achievedStr = "達成"
-        case false:
-            achievedStr = "未達"
         }
 
         print("\n==================================================")
-        print("学習ループ完了: 選定結果 = \(selectionType) (Epoch \(finalEpochNumber))")
-        print("  達成状況:           \(achievedStr)")
-        print("  停止理由:           \(stopReason)")
+        print("FrameMel 学習完了: 採択エポック = Epoch \(bestEpoch) (選定損失: \(String(format: "%.4f", bestSelectionLoss)))")
+        print("  保存先: \(outputPath)")
         print("==================================================")
 
-        // 最終モデル重みを Models/weights.json に保存
-        let outputURL = URL(fileURLWithPath: outputPath)
-        switch isAchieved {
-        case true:
-            do {
-                try WeightCheckpoint.atomicWritePretty(finalWeights, to: outputURL)
-                let dataCount = (try? Data(contentsOf: outputURL).count) ?? 0
-                print("最終モデル重みを保存しました: \(outputPath) (\(dataCount) バイト)")
-            } catch {
-                print("エラー: 最終モデル重みの保存に失敗しました: \(error)")
+        // 試聴用: 検証用発話の先頭 1 文を教師なし合成して .tmp に書き出す（テキストはコーパス由来、コードには持たない）
+        if let listenText = validTexts.first {
+            var vocWeights: NeuralVocoderWeights? = nil
+            if let vData = try? Data(contentsOf: vocoderURL) {
+                vocWeights = try? JSONDecoder().decode(NeuralVocoderWeights.self, from: vData)
             }
-        case false:
-            let ep19URL = URL(fileURLWithPath: "Models/weights.frame_mel_ep19.json")
-            if let ep19Data = try? Data(contentsOf: ep19URL) {
-                try? ep19Data.write(to: outputURL)
-                print("未達のため Models/weights.json を Models/weights.frame_mel_ep19.json の完全同一バイト列へ復元しました (\(ep19Data.count) バイト)")
-            }
+            let listenEngine = SpikeSpeechEngine(weights: bestFullWeights, vocoderWeights: vocWeights)
+            let pcm = listenEngine.synthesize(text: listenText)
+            let listenDir = ".tmp/frame_mel_eval"
+            try? fileManager.createDirectory(atPath: listenDir, withIntermediateDirectories: true)
+            let listenURL = URL(fileURLWithPath: listenDir + String(format: "/valid0_ep%02d.wav", bestEpoch))
+            let wav = WavEncoder.encode(samples: pcm, sampleRate: AudioConfig.sampleRate)
+            try? wav.write(to: listenURL)
+            print("試聴用波形を書き出しました: \(listenURL.path) (\(pcm.count) サンプル)")
         }
 
-        // 波形の保存（直下および .tmp/wave15/）
-        let mizuURL = URL(fileURLWithPath: reconDir + "/tts_mizuwomare.wav")
-        let mizuRootURL = URL(fileURLWithPath: "tts_mizuwomare.wav")
-        let mizuWavData = WavEncoder.encode(samples: finalMizuPCM, sampleRate: AudioConfig.sampleRate)
-        try? mizuWavData.write(to: mizuURL)
-        try? mizuWavData.write(to: mizuRootURL)
-
-        let tenkiURL = URL(fileURLWithPath: reconDir + "/tts_tenki.wav")
-        let tenkiRootURL = URL(fileURLWithPath: "tts_tenki.wav")
-        let tenkiWavData = WavEncoder.encode(samples: finalTenkiPCM, sampleRate: AudioConfig.sampleRate)
-        try? tenkiWavData.write(to: tenkiURL)
-        try? tenkiWavData.write(to: tenkiRootURL)
-
-        // 直下と .tmp/wave15/ の波形完全一致（同一 PCM）確認
-        let mizuRootData = try? Data(contentsOf: mizuRootURL)
-        let mizuTmpData = try? Data(contentsOf: mizuURL)
-        switch (mizuRootData != nil && mizuRootData == mizuTmpData) {
-        case true:
-            print("【受入検証】tts_mizuwomare.wav: 直下と .tmp/wave15/ の完全同一 PCM を確認")
-        case false:
-            print("警告: tts_mizuwomare.wav の直下と .tmp/wave15/ が一致しません！")
-        }
-
-        let tenkiRootData = try? Data(contentsOf: tenkiRootURL)
-        let tenkiTmpData = try? Data(contentsOf: tenkiURL)
-        switch (tenkiRootData != nil && tenkiRootData == tenkiTmpData) {
-        case true:
-            print("【受入検証】tts_tenki.wav: 直下と .tmp/wave15/ の完全同一 PCM を確認")
-        case false:
-            print("警告: tts_tenki.wav の直下と .tmp/wave15/ が一致しません！")
-        }
-
-        print("\n==================================================")
-        print("【受入基準・客観音響指標最終測定結果】")
-        print("--------------------------------------------------")
-
-        // 1. 水
-        let mizuEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: finalMizuPCM)
-        let mizuMetricFinal = AcousticCentroidMetric.measure(pcm: finalMizuPCM)
-        let mizuHalvesFinal = AcousticCentroidMetric.measureHalves(pcm: finalMizuPCM, interpolateParabolic: false)
-        let mizuMod6to12Final = AcousticCentroidMetric.measureModulation6to12Ratio(pcm: finalMizuPCM)
-        let mizuF0StdDevFinal = AcousticCentroidMetric.measureF0StdDev(pcm: finalMizuPCM, interpolateParabolic: false)
-        let mizuDipsFinal = AcousticCentroidMetric.measureDeepDips(pcm: finalMizuPCM)
-        let mizuDurSec = Float(finalMizuPCM.count) / 16000.0
-        let mizuF0Diff = mizuHalvesFinal.first.f0Median - mizuHalvesFinal.second.f0Median
-
-        print("1. 水 (tts_mizuwomare.wav):")
-        print("   - ファイル長:        \(finalMizuPCM.count) サンプル (\(String(format: "%.3f", mizuDurSec)) 秒)")
-        print("   - 包絡変化:          \(String(format: "%.2f", mizuEnvFinal.centroidMedian)) Hz")
-        print("   - 一致割合:          \(String(format: "%.4f", mizuEnvFinal.matchRatio))")
-        print("   - 200–1500 Hz重心:   \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz")
-        print("   - (参考) 停止割合:        \(String(format: "%.4f", mizuMetricFinal.cosRatio))")
-        print("   - 前半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.first.f0Median)) Hz")
-        print("   - 後半 F0 中央値:    \(String(format: "%.1f", mizuHalvesFinal.second.f0Median)) Hz")
-        print("   - 前後 F0 差:        \(String(format: "%+.1f", mizuF0Diff)) Hz")
-        print("   - 6–12 Hz 割合:      \(String(format: "%.4f", mizuMod6to12Final))")
-        print("   - 有声 F0 標準偏差:   \(String(format: "%.2f", mizuF0StdDevFinal)) Hz")
-        print("   - 深い落ち込み:      \(mizuDipsFinal.dips.count) 本, 最大長: \(mizuDipsFinal.maxDipLengthMs) ms")
-
-        // 2. 天気
-        let tenkiEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: finalTenkiPCM)
-        let tenkiMetricFinal = AcousticCentroidMetric.measure(pcm: finalTenkiPCM)
-        let tenkiDurSec = Float(finalTenkiPCM.count) / 16000.0
-        print("2. 天気 (tts_tenki.wav):")
-        print("   - ファイル長:        \(finalTenkiPCM.count) サンプル (\(String(format: "%.3f", tenkiDurSec)) 秒)")
-        print("   - 包絡変化:          \(String(format: "%.2f", tenkiEnvFinal.centroidMedian)) Hz")
-        print("   - 一致割合:          \(String(format: "%.4f", tenkiEnvFinal.matchRatio))")
-        print("   - 200–1500 Hz重心:   \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz")
-        print("   - (参考) 停止割合:        \(String(format: "%.4f", tenkiMetricFinal.cosRatio))")
-
-        // 3. 教師 copy
-        var copyEnvFinal = AcousticCentroidMetric.EnvelopeDeltaResult(centroidMedian: 0.0, matchRatio: 0.0, voicedPairs: 0)
-        var copyMetricFinal = AcousticCentroidMetric.Result(cosRatio: 0.0, centroidMedian200to4000: 0.0, centroidMedian200to1500: 0.0, voicedCount: 0)
-        if let copyPCM = try? WavAudioReader().loadWav16k(from: copyPath) {
-            copyEnvFinal = AcousticCentroidMetric.measureEnvelopeDelta(pcm: copyPCM)
-            copyMetricFinal = AcousticCentroidMetric.measure(pcm: copyPCM)
-            print("3. 教師 copy (\(copyPath)):")
-            print("   - 包絡変化:          \(String(format: "%.2f", copyEnvFinal.centroidMedian)) Hz")
-            print("   - 一致割合:          \(String(format: "%.4f", copyEnvFinal.matchRatio))")
-            print("   - 200–1500 Hz重心:   \(String(format: "%.2f", copyMetricFinal.centroidMedian200to1500)) Hz")
-            print("   - (参考) 停止割合:        \(String(format: "%.4f", copyMetricFinal.cosRatio))")
-        }
-        print("==================================================")
-
-        // 報告書 .tmp/implement_report_mel_residual.md の出力
-        // 注: 先頭を LISTEN: INTELLIGIBLE にしない
-        let reportURL = URL(fileURLWithPath: ".tmp/implement_report_mel_residual.md")
-        var rep = ""
-        rep += "# メルの残差学習 実装および検証報告書\n\n"
-        rep += "## 1. 概要と選定結果\n\n"
-        rep += "- 採択結果: \(selectionType) (Epoch \(finalEpochNumber))\n"
-        rep += "- 達成状況: \(achievedStr)\n"
-        rep += "- 停止理由: \(stopReason)\n\n"
-        rep += "## 2. 作業前事前検証 (Epoch 19 基準)\n\n"
-        rep += "- 水 (Epoch 19):\n"
-        rep += "  - 包絡変化: \(String(format: "%.2f", preMizuEnv.centroidMedian)) Hz (基準: 40–46 Hz)\n"
-        rep += "  - 一致割合: \(String(format: "%.4f", preMizuEnv.matchRatio)) (基準: 0.48–0.54)\n"
-        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", preMizuCentroid1k5)) Hz (基準: 25–27 Hz)\n"
-        rep += "- copy (教師):\n"
-        rep += "  - 包絡変化: \(String(format: "%.2f", preCopyEnv.centroidMedian)) Hz (基準: 70–78 Hz)\n"
-        rep += "  - 一致割合: \(String(format: "%.4f", preCopyEnv.matchRatio)) (基準: 0.24–0.30)\n\n"
-        rep += "## 3. エポック 1 損失比率検証\n\n"
-        rep += "- 係数: \(trainer.deltaLossWeight)\n"
-        rep += "- フレーム差の項 (Delta): \(String(format: "%.6f", epoch1DeltaTerm))\n"
-        rep += "- メル L1: \(String(format: "%.6f", epoch1MelL1))\n"
-        rep += "- 比率 (Delta項 / メルL1): \(String(format: "%.4f", epoch1DeltaRatio)) (基準: 0.8–1.2)\n\n"
-        rep += "## 4. 最終音響客観指標 (採択波形)\n\n"
-        rep += "- 水 (tts_mizuwomare.wav):\n"
-        rep += "  - 包絡変化: \(String(format: "%.2f", mizuEnvFinal.centroidMedian)) Hz (基準: >= 60.0)\n"
-        rep += "  - 一致割合: \(String(format: "%.4f", mizuEnvFinal.matchRatio)) (基準: <= 0.35)\n"
-        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", mizuMetricFinal.centroidMedian200to1500)) Hz (基準: >= 24.0)\n"
-        rep += "- 天気 (tts_tenki.wav):\n"
-        rep += "  - 包絡変化: \(String(format: "%.2f", tenkiEnvFinal.centroidMedian)) Hz (基準: >= 60.0)\n"
-        rep += "  - 一致割合: \(String(format: "%.4f", tenkiEnvFinal.matchRatio)) (基準: <= 0.35)\n"
-        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", tenkiMetricFinal.centroidMedian200to1500)) Hz\n"
-        rep += "- copy:\n"
-        rep += "  - 包絡変化: \(String(format: "%.2f", copyEnvFinal.centroidMedian)) Hz\n"
-        rep += "  - 一致割合: \(String(format: "%.4f", copyEnvFinal.matchRatio))\n"
-        rep += "  - 200–1500 Hz重心: \(String(format: "%.2f", copyMetricFinal.centroidMedian200to1500)) Hz\n\n"
-        rep += "## 5. 受入基準検証結果\n\n"
-        rep += "- 凍結配列最大絶対差: 0.0 (完全一致)\n"
-        rep += "- 直下と .tmp/wave15/ の波形一致: 完全一致 (同一 PCM)\n"
-        rep += "- meanFramesPerMora: 16\n"
-        try? rep.write(to: reportURL, atomically: true, encoding: .utf8)
-        print("報告書を書き出しました: \(reportURL.path)")
+        print("学習処理が正常に完了しました。")
         return
     }
 
@@ -2232,8 +2265,6 @@ func main() {
     }
 
 
-    let outputURL = URL(fileURLWithPath: outputPath)
-    let outputDir = outputURL.deletingLastPathComponent().path
 
     var network = MLXSpikingAcousticNetwork(weights: effectiveWeights)
 
@@ -3373,229 +3404,7 @@ func main() {
     // 再学習パイプラインにおいて SNN 音響モデル重み（weights.json）と
     // 現代的完全データ駆動型ニューラルボコーダー重み（vocoder_weights.json）を一元同期し、
     // 実音声波形に対する STFT 損失最小化により自然な日本語音声を直接生成するため。
-    let vocoderURL = WeightCheckpoint.resolvePath(directory: outputDir, fileName: "vocoder_weights.json")
-    if 0 < vocoderEpochs && vocoderPairs.isEmpty != true {
-        print("--------------------------------------------------")
-        print("ニューラルボコーダーの最適化（Multi-Resolution STFT損失）を開始します (サンプル数: \(vocoderPairs.count), エポック数: \(vocoderEpochs))...")
-        let vocoder = MLXNeuralVocoder()
-        if forceFresh != true && fileManager.fileExists(atPath: vocoderURL.path) {
-            if let existingData = try? Data(contentsOf: vocoderURL) {
-                switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
-                case .some(let savedWeights):
-                    if savedWeights.config.hiddenChannels != 256 {
-                        // なぜ 64ch 重みを破棄して 256ch モデルの新規初期重みを使用するか:
-                        // 64ch 重みを 256ch モデルに import するとテンソル形状不整合でクラッシュするため、
-                        // 推論時（NeuralVocoder.swift）と同様に不一致時は破棄し、256ch の初期状態から学習するため。
-                        print("[NeuralVocoder] 警告: \(vocoderURL.path) の hiddenChannels (\(savedWeights.config.hiddenChannels)) が 256 と一致しないため、破棄し 256ch の初期重みを使用します。")
-                    } else {
-                        vocoder.importWeights(from: savedWeights)
-                        print("既存のニューラルボコーダー重みを読み込みました: \(vocoderURL.path)")
-                    }
-                case .none:
-                    break
-                }
-            }
-        }
-
-        let vocoderOptimizer = Adam(learningRate: vocoderLearningRate)
-        let segFrames = 32
-        let hopSize = vocoder.config.hopSize
-        let segSamples = segFrames * hopSize
-        let melCh = vocoder.config.melChannels
-        let inCh = melCh + 2
-
-        let lg = valueAndGrad(model: vocoder) { (model: MLXNeuralVocoder, arrays: [MLXArray]) -> [MLXArray] in
-            let fArr = arrays[0]
-            let tArr = arrays[1]
-            let pred = model(fArr)
-            let loss = MLXNeuralVocoder.totalVocoderLoss(predicted: pred, target: tArr)
-            return [loss]
-        }
-
-        Memory.cacheLimit = 32 * 1024 * 1024
-        let batchSize = 8
-        var vEpoch = 0
-        while vEpoch < vocoderEpochs {
-            var epochLossSum: Float = 0.0
-            var vBatchCount = 0
-
-            var batchFeats = [Float]()
-            var batchPCMs = [Float]()
-            var currBatchItems = 0
-
-            var pairIdx = 0
-            while pairIdx < vocoderPairs.count {
-                let pair = vocoderPairs[pairIdx]
-                let totalF = pair.mel.count
-                if segFrames <= totalF {
-                    let maxStart = totalF - segFrames
-                    var sampleIt = 0
-                    while sampleIt < 4 {
-                        var startF = 0
-                        if 0 < maxStart {
-                            var bestStart = Int.random(in: 0...maxStart)
-                            var trial = 0
-                            while trial < 8 {
-                                let cand = Int.random(in: 0...maxStart)
-                                var voicedCount = 0
-                                var chkF = 0
-                                while chkF < segFrames {
-                                    let idx = cand + chkF
-                                    if idx < pair.voiced.count {
-                                        if 0.5 < pair.voiced[idx] {
-                                            voicedCount += 1
-                                        }
-                                    }
-                                    chkF += 1
-                                }
-                                if 4 <= voicedCount {
-                                    bestStart = cand
-                                    break
-                                }
-                                trial += 1
-                            }
-                            startF = bestStart
-                        }
-                        let startSample = startF * hopSize
-                        let endSample = startSample + segSamples
-
-                        if endSample <= pair.pcm.count {
-                            var f = 0
-                            while f < segFrames {
-                                let currF = startF + f
-                                let frameMel = pair.mel[currF]
-                                var c = 0
-                                let copyLimit = min(melCh, frameMel.count)
-                                while c < copyLimit {
-                                    batchFeats.append(frameMel[c])
-                                    c += 1
-                                }
-                                while c < melCh {
-                                    batchFeats.append(0.0)
-                                    c += 1
-                                }
-                                var normF0: Float = 0.0
-                                if currF < pair.f0.count {
-                                    let val = pair.f0[currF]
-                                    if 0.0 < val {
-                                        var nF0 = val / 500.0
-                                        if nF0 < 0.0 { nF0 = 0.0 }
-                                        if 1.0 < nF0 { nF0 = 1.0 }
-                                        normF0 = nF0
-                                    }
-                                }
-                                batchFeats.append(normF0)
-
-                                var vVal: Float = 1.0
-                                if currF < pair.voiced.count {
-                                    vVal = pair.voiced[currF]
-                                }
-                                batchFeats.append(vVal)
-                                f += 1
-                            }
-
-                            batchPCMs.append(contentsOf: pair.pcm[startSample..<endSample])
-                            currBatchItems += 1
-
-                            if batchSize <= currBatchItems {
-                                autoreleasepool {
-                                    let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
-                                    let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
-
-                                    let (lossVals, grads) = lg(vocoder, [featArr, targArr])
-                                    let lossVal = lossVals[0].item(Float.self)
-                                    epochLossSum += lossVal
-                                    let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
-                                    vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
-                                    eval(vocoder.trainableParameters(), lossVal)
-                                    Stream.gpu.synchronize()
-                                }
-
-                                vBatchCount += 1
-                                batchFeats.removeAll(keepingCapacity: true)
-                                batchPCMs.removeAll(keepingCapacity: true)
-                                currBatchItems = 0
-                                if (vBatchCount % 10) == 0 {
-                                    Memory.clearCache()
-                                }
-                            }
-                        }
-                        sampleIt += 1
-                    }
-                }
-                pairIdx += 1
-            }
-
-            if 0 < currBatchItems {
-                autoreleasepool {
-                    let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
-                    let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
-
-                    let (lossVals, grads) = lg(vocoder, [featArr, targArr])
-                    let lossVal = lossVals[0].item(Float.self)
-                    epochLossSum += lossVal
-                    let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
-                    vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
-                    eval(vocoder.trainableParameters(), lossVal)
-                    Stream.gpu.synchronize()
-                }
-
-                vBatchCount += 1
-                batchFeats.removeAll(keepingCapacity: true)
-                batchPCMs.removeAll(keepingCapacity: true)
-                currBatchItems = 0
-            }
-
-            eval(vocoder.trainableParameters())
-            Stream.gpu.synchronize()
-            Memory.clearCache()
-
-            var avgVLoss: Float = 0.0
-            if 0 < vBatchCount {
-                avgVLoss = epochLossSum / Float(vBatchCount)
-            }
-            print("  [Vocoder Epoch \(vEpoch + 1)/\(vocoderEpochs)] 平均STFT損失: \(String(format: "%.6f", avgVLoss)) (バッチ数: \(vBatchCount))")
-            vEpoch += 1
-        }
-
-        let trainedWeights = vocoder.exportWeights()
-        do {
-            let encoded = try JSONEncoder().encode(trainedWeights)
-            try encoded.write(to: vocoderURL, options: .atomic)
-            print("最適化済みニューラルボコーダー重みを保存しました: \(vocoderURL.path) (\(encoded.count) バイト)")
-        } catch {
-            print("警告: ニューラルボコーダー重みの保存に失敗しました: \(error)")
-        }
-        // なぜボコーダー学習エポックが 0 の場合に既存重みを保持するか:
-        // SNN 再学習時に獲得済みのニューラルボコーダー音響合成重みを破壊せず、
-        // 単一話者（女性）の自然な声質を 100% 確実に維持するため。
-        var needVocoderWrite = false
-        if fileManager.fileExists(atPath: vocoderURL.path) != true {
-            needVocoderWrite = true
-        } else {
-            if let existingData = try? Data(contentsOf: vocoderURL) {
-                switch try? JSONDecoder().decode(NeuralVocoderWeights.self, from: existingData) {
-                case .some(let savedWeights):
-                    if savedWeights.config.hiddenChannels != 256 {
-                        needVocoderWrite = true
-                    } else {
-                        needVocoderWrite = false
-                    }
-                case .none:
-                    needVocoderWrite = true
-                }
-            } else {
-                needVocoderWrite = true
-            }
-        }
-        if needVocoderWrite {
-            let initialVocoderWeights = NeuralVocoderWeights.randomWeights()
-            if let encoded = try? JSONEncoder().encode(initialVocoderWeights) {
-                try? encoded.write(to: vocoderURL, options: .atomic)
-                print("ニューラルボコーダー初期重みをエクスポートしました: \(vocoderURL.path) (\(encoded.count) バイト)")
-            }
-        }
-    }
+    runVocoderTraining()
 
     print("学習処理が正常に完了しました。")
 }

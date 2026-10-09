@@ -203,6 +203,213 @@ public final class ViterbiMorphology: Sendable {
         return Array(mergedMap.values)
     }
 
+    /// 語彙獲得結果
+    public struct LexiconLearningResult: Sendable {
+        /// 既存語彙に獲得語彙を統合した語彙リスト
+        public let lexicon: [LexiconEntry]
+        /// 新規に追加されたエントリ数
+        public let added: Int
+        /// 獲得元の文数
+        public let sentenceCount: Int
+    }
+
+    /// 獲得語彙に与えるコスト
+    /// なぜ手書き基本語彙（5〜10）より高く未知語熟語ノード（200×文字数）より低くするか:
+    /// 助詞・助動詞の手書き読み（は→わ 等）を獲得語彙で上書きせず、
+    /// 一方で文全体の文脈から推定した読みが単漢字フォールバックより常に優先されるようにするため。
+    public static let learnedLexiconCost: Int16 = 20
+
+    /// 文の集合から語彙（表記→読み）を獲得し、既存語彙へ統合する
+    ///
+    /// なぜコーパス文を文全体として音訳してから語彙化するか:
+    /// 漢字列だけを切り出して音訳すると送り仮名や文脈が失われ（溺れ→にれ、入れない→にゅーれない）、
+    /// 文全体を日本語ロケールの形態素音訳に掛けることで読みの精度が大きく向上するため。
+    /// 獲得した語彙はソースコードではなくモデル重み（SpikingNetworkWeights.lexicon）に永続化される。
+    ///
+    /// 規則:
+    /// - 漢字または「々」を含む語のみ獲得する（かな語は既存語彙と未知語処理に任せ、助詞の読みを保護する）
+    /// - 連続する漢字含有語の連結（複合語）も獲得し、Viterbi で最長一致が優先されるようにする
+    /// - 同一表記に複数の読みがある場合は出現頻度の高い読みを採用する
+    /// - 既存語彙および基本語彙に同一表記（同一品詞）がある場合は上書きしない
+    public static func learnLexiconEntries(
+        sentences: [String],
+        existing: [LexiconEntry]
+    ) -> LexiconLearningResult {
+        // 既存語彙が空の場合は基本語彙（助詞・助動詞など）を土台にする。
+        // 獲得語彙だけの語彙リストを作ると、は→わ などの手書き読みが失われるため。
+        var baseList = existing
+        if baseList.isEmpty {
+            baseList = buildFallbackLexicon()
+        }
+        var reserved = Set<String>()
+        for entry in baseList {
+            reserved.insert(entry.surface.precomposedStringWithCanonicalMapping)
+        }
+        for entry in buildFallbackLexicon() {
+            reserved.insert(entry.surface.precomposedStringWithCanonicalMapping)
+        }
+
+        var readingCounts: [String: [String: Int]] = [:]
+
+        func containsKanji(_ s: String) -> Bool {
+            for ch in s {
+                if isKanji(ch) || ch == "々" {
+                    return true
+                }
+            }
+            return false
+        }
+
+        func isHiraganaReading(_ s: String) -> Bool {
+            if s.isEmpty {
+                return false
+            }
+            for scalar in s.unicodeScalars {
+                let v = scalar.value
+                let isHira = (0x3041 <= v && v <= 0x3096)
+                let isProlonged = (v == 0x30FC)
+                if isHira != true && isProlonged != true {
+                    return false
+                }
+            }
+            return true
+        }
+
+        func record(surface: String, reading: String) {
+            let normSurface = surface.precomposedStringWithCanonicalMapping
+            let normReading = reading.precomposedStringWithCanonicalMapping
+            if reserved.contains(normSurface) {
+                return
+            }
+            if containsKanji(normSurface) != true {
+                return
+            }
+            if isHiraganaReading(normReading) != true {
+                return
+            }
+            var counts = readingCounts[normSurface] ?? [:]
+            counts[normReading] = (counts[normReading] ?? 0) + 1
+            readingCounts[normSurface] = counts
+        }
+
+        var sentenceCount = 0
+        for sentence in sentences {
+            let tokens = transcribeSentenceTokens(sentence)
+            if tokens.isEmpty {
+                continue
+            }
+            sentenceCount += 1
+
+            var runSurface = ""
+            var runReading = ""
+            var runLength = 0
+            var tIdx = 0
+            while tIdx < tokens.count {
+                let tok = tokens[tIdx]
+                if containsKanji(tok.surface) {
+                    record(surface: tok.surface, reading: tok.reading)
+                    // 直後のかな語（送り仮名・活用語尾）を連結した表記も獲得する。
+                    // なぜ連結するか: 悪/わる + さ、良/よ + い のように単漢字の読みが文脈で変わる場合に、
+                    // 表記「悪さ」「良い」を 1 語として持たせ、頻度多数決による誤読（悪→あく）を避けるため。
+                    // 助詞・助動詞・記号は連結しない（は→わ などの助詞発音規則を壊さないため）。
+                    if (tIdx + 1) < tokens.count {
+                        let nextTok = tokens[tIdx + 1]
+                        if containsKanji(nextTok.surface) != true && isHiraganaReading(nextTok.surface) {
+                            switch inferPartOfSpeech(for: nextTok.surface) {
+                            case .particle, .auxiliaryVerb, .symbol:
+                                break
+                            default:
+                                record(surface: tok.surface + nextTok.surface, reading: tok.reading + nextTok.reading)
+                            }
+                        }
+                    }
+                    runSurface += tok.surface
+                    runReading += tok.reading
+                    runLength += 1
+                } else {
+                    if 1 < runLength {
+                        record(surface: runSurface, reading: runReading)
+                    }
+                    runSurface = ""
+                    runReading = ""
+                    runLength = 0
+                }
+                tIdx += 1
+            }
+            if 1 < runLength {
+                record(surface: runSurface, reading: runReading)
+            }
+        }
+
+        var merged = baseList
+        var added = 0
+        let surfaces = readingCounts.keys.sorted()
+        for surface in surfaces {
+            guard let counts = readingCounts[surface] else {
+                continue
+            }
+            var bestReading = ""
+            var bestCount = 0
+            for (reading, count) in counts.sorted(by: { $0.key < $1.key }) {
+                if bestCount < count {
+                    bestCount = count
+                    bestReading = reading
+                }
+            }
+            if bestReading.isEmpty {
+                continue
+            }
+            merged.append(LexiconEntry(
+                surface: surface,
+                reading: bestReading,
+                pos: .noun,
+                accentKernel: 0,
+                cost: learnedLexiconCost
+            ))
+            added += 1
+        }
+
+        return LexiconLearningResult(lexicon: merged, added: added, sentenceCount: sentenceCount)
+    }
+
+    /// 文全体を日本語ロケールの単語単位で分かち書きし、各語の読み（ひらがな）を返す
+    /// 読みが取得できない語は表記をそのまま読みとして返す。
+    public static func transcribeSentenceTokens(_ sentence: String) -> [(surface: String, reading: String)] {
+        var tokens: [(surface: String, reading: String)] = []
+        #if canImport(CoreFoundation)
+        let locale = Locale(identifier: "ja_JP") as CFLocale
+        let nsText = sentence as NSString
+        let cfText = sentence as CFString
+        let tokenizer = CFStringTokenizerCreate(
+            kCFAllocatorDefault,
+            cfText,
+            CFRangeMake(0, nsText.length),
+            kCFStringTokenizerUnitWord,
+            locale
+        )
+        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        while tokenType.isEmpty != true {
+            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
+            let surface = nsText.substring(with: NSRange(location: range.location, length: range.length))
+            var reading = surface
+            switch CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) {
+            case .some(let attr):
+                if let latin = attr as? String {
+                    let mutable = NSMutableString(string: latin)
+                    if CFStringTransform(mutable as CFMutableString, nil, kCFStringTransformLatinHiragana, false) {
+                        reading = mutable as String
+                    }
+                }
+            case .none:
+                break
+            }
+            tokens.append((surface: surface, reading: reading))
+            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        }
+        #endif
+        return tokens
+    }
+
     /// 品詞間接続コストを取得する
     ///
     /// 名詞の後に助詞が続くような自然な結合に低コストを与え、

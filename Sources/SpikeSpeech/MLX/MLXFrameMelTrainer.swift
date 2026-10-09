@@ -84,6 +84,44 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         targetF0: [Float],
         targetEnergy: [Float]
     ) -> FrameMelLosses {
+        return runSample(
+            phoneIds: phoneIds,
+            targetDurations: targetDurations,
+            targetMel: targetMel,
+            targetF0: targetF0,
+            targetEnergy: targetEnergy,
+            update: true
+        )
+    }
+
+    /// 単一発話サンプルの損失のみを算出する（パラメータ更新なし・検証用）
+    /// なぜ学習と同じ損失関数で検証するか:
+    /// 保持検証データの損失でエポックを選定し、特定文の経験則指標に依存しない採否判定を行うため。
+    public func evaluateSample(
+        phoneIds: [Int32],
+        targetDurations: [Int],
+        targetMel: [[Float]],
+        targetF0: [Float],
+        targetEnergy: [Float]
+    ) -> FrameMelLosses {
+        return runSample(
+            phoneIds: phoneIds,
+            targetDurations: targetDurations,
+            targetMel: targetMel,
+            targetF0: targetF0,
+            targetEnergy: targetEnergy,
+            update: false
+        )
+    }
+
+    private func runSample(
+        phoneIds: [Int32],
+        targetDurations: [Int],
+        targetMel: [[Float]],
+        targetF0: [Float],
+        targetEnergy: [Float],
+        update: Bool
+    ) -> FrameMelLosses {
         let phoneCount = phoneIds.count
         let totalFrames = targetMel.count
         if phoneCount < 3 || totalFrames <= 1 {
@@ -217,7 +255,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let deltaMaskArr = MLXArray(deltaMask, [1, totalFrames - 1, 1])
 
         let dWeight = self.deltaLossWeight
-        let lg = valueAndGrad(model: model) { (m: MLXFrameMelModel, _) -> [MLXArray] in
+        let lossFn: (MLXFrameMelModel) -> [MLXArray] = { (m: MLXFrameMelModel) -> [MLXArray] in
             // 1. 音素エンコーダ
             let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr)
 
@@ -259,15 +297,31 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, deltaLoss]
         }
 
-        let (lossVals, grads) = lg(model, [])
-        eval(lossVals)
+        let lossVals: [MLXArray]
+        switch update {
+        case true:
+            let lg = valueAndGrad(model: model) { (m: MLXFrameMelModel, _) -> [MLXArray] in
+                return lossFn(m)
+            }
+            let (vals, grads) = lg(model, [])
+            eval(vals)
+            let totalL = vals[0].item(Float.self)
+            if totalL.isFinite != true {
+                return self.lastLosses
+            }
+            let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
+            optimizer.update(model: model, gradients: clippedGrads)
+            eval(model, optimizer)
+            lossVals = vals
+        case false:
+            let vals = lossFn(model)
+            eval(vals)
+            lossVals = vals
+        }
         let totalL = lossVals[0].item(Float.self)
         if totalL.isFinite != true {
             return self.lastLosses
         }
-        let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
-        optimizer.update(model: model, gradients: clippedGrads)
-        eval(model, optimizer)
 
         let losses = FrameMelLosses(
             totalLoss: totalL,
