@@ -1058,6 +1058,10 @@ extension SpikeSpeechEngine {
             t += 1
         }
 
+        // なぜエネルギー教師を線形比ではなく対数（dB）スケールにするか:
+        // 線形比では -20 dB 以下の区間がすべて 0.1 未満に潰れ、MSE が大音量フレームにしか効かず、
+        // 予測エネルギーの抑揚が平坦になる。発話内最大を 0 dB、-60 dB を 0 とする対数スケールで
+        // 小音量区間の差も同じ重みで学習させる。推論側は予測値をそのまま条件付けに使うため整合する。
         var targetEnergy = [Float](repeating: 0.0, count: totalFrames)
         let invMaxRms: Float
         if 0.0001 < maxRms {
@@ -1065,9 +1069,15 @@ extension SpikeSpeechEngine {
         } else {
             invMaxRms = 0.0
         }
+        let dynamicRangeDb: Float = 60.0
         t = 0
         while t < totalFrames {
-            let norm = frameRms[t] * invMaxRms
+            let ratio = frameRms[t] * invMaxRms
+            var norm: Float = 0.0
+            if 0.0 < ratio {
+                let db = 20.0 * log10f(ratio)
+                norm = (db + dynamicRangeDb) / dynamicRangeDb
+            }
             targetEnergy[t] = max(0.0, min(1.0, norm))
             t += 1
         }

@@ -55,6 +55,8 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     /// 推論時にデコーダが見たことのない滑らかな条件を受けてメルがさらに平滑化していた。
     /// 予測値（勾配は遮断）でも教師メルを再現するよう学習させ、学習と推論の条件を近づける。
     public var conditionSamplingProbability: Float
+    /// 大域分散（各メルチャネルの時間方向標準偏差）一致損失の係数
+    public var globalVarianceWeight: Float
     private var rngState: UInt64
     public private(set) var lastLosses: FrameMelLosses
 
@@ -64,6 +66,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         deltaLossWeight: Float = 1.0,
         allFrameDeltaWeight: Float = 1.0,
         conditionSamplingProbability: Float = 0.5,
+        globalVarianceWeight: Float = 1.0,
         seed: UInt64 = 2026
     ) {
         self.model = model
@@ -71,6 +74,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         self.deltaLossWeight = deltaLossWeight
         self.allFrameDeltaWeight = allFrameDeltaWeight
         self.conditionSamplingProbability = conditionSamplingProbability
+        self.globalVarianceWeight = globalVarianceWeight
         self.rngState = seed | 1
         self.lastLosses = FrameMelLosses(
             totalLoss: 0.0,
@@ -285,6 +289,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
 
         let dWeight = self.deltaLossWeight
         let allDeltaWeight = self.allFrameDeltaWeight
+        let gvWeight = self.globalVarianceWeight
         var useSampledCondition = false
         if update && 0.0 < conditionSamplingProbability {
             if nextUniform() < conditionSamplingProbability {
@@ -351,7 +356,17 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             // 8. 全フレームの PostNet 後メルフレーム差 L1（音素境界を含む時間変化の一致）
             let allFrameDeltaLoss = mean(deltaDiff)
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight))
+            // 9. 大域分散 (Global Variance) 損失: 各メルチャネルの時間方向標準偏差を教師に一致させる
+            // なぜ分散を直接合わせるか:
+            // L1 回帰は各フレームで中央値へ寄るため、発話全体で見るとチャネルごとの時間変動幅が縮み、
+            // 音量の抑揚が平坦で高域の細部が消えた「こもった・平板な」メルになる。
+            // 同一文の比較で合成音の RMS 変動幅は教師の約半分（10 dB 対 18 dB）だった。
+            // 標準偏差の一致はこの圧縮を直接罰し、GAN なしで平滑化を緩和する古典的手法（Toda & Tokuda 2007）。
+            let predStd = sqrt(variance(postMel, axis: 1) + MLXArray(Float(1e-4)))
+            let targStd = sqrt(variance(targetMelArr, axis: 1) + MLXArray(Float(1e-4)))
+            let gvLoss = mean(abs(predStd - targStd))
+
+            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + (gvLoss * MLXArray(gvWeight))
             return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, allFrameDeltaLoss]
         }
 
