@@ -59,6 +59,15 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     public var globalVarianceWeight: Float
     private var rngState: UInt64
     public private(set) var lastLosses: FrameMelLosses
+    /// 損失または勾配が非有限で更新を飛ばした回数（学習の停滞検出用）
+    public private(set) var skippedUpdates: Int = 0
+    /// 非有限の損失で前回値を返した回数
+    public private(set) var nonFiniteLosses: Int = 0
+
+    public func resetSkipCounters() {
+        skippedUpdates = 0
+        nonFiniteLosses = 0
+    }
 
     public init(
         model: MLXFrameMelModel = MLXFrameMelModel(),
@@ -198,13 +207,13 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         var gatherIndices = [Int32](repeating: 0, count: totalFrames)
         var pos = [Float](repeating: 0.0, count: totalFrames)
         var voicedFlags = [Float](repeating: 0.0, count: totalFrames)
+        let contextVoiced = PhonemeVocabulary.contextVoicedFlags(phoneIds: phoneIds)
         var curF = 0
         p = 0
         while p < phoneCount {
             let dur = targetDurations[p]
             let maxF = Float(max(1, dur - 1))
-            let pid = Int(phoneIds[p])
-            let isV = PhonemeVocabulary.isVoicedPhone(phoneId: pid)
+            let isV = contextVoiced[p]
             let vVal: Float
             switch isV {
             case true: vVal = 1.0
@@ -406,9 +415,20 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             eval(vals)
             let totalL = vals[0].item(Float.self)
             if totalL.isFinite != true {
+                nonFiniteLosses += 1
+                skippedUpdates += 1
                 return self.lastLosses
             }
-            let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
+            // なぜ勾配ノルムの有限性も検査するか:
+            // 損失が有限でも勾配が NaN/Inf になるとパラメータ全体が汚染され、以後の全サンプルで
+            // 損失が非有限となり「直前の有限値」が表示され続けて学習停滞に気付けないため。
+            let (clippedGrads, totalNorm) = clipGradNorm(gradients: grads, maxNorm: 1.0)
+            eval(totalNorm)
+            let normVal = totalNorm.item(Float.self)
+            if normVal.isFinite != true {
+                skippedUpdates += 1
+                return self.lastLosses
+            }
             optimizer.update(model: model, gradients: clippedGrads)
             eval(model, optimizer)
             lossVals = vals
@@ -419,6 +439,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         }
         let totalL = lossVals[0].item(Float.self)
         if totalL.isFinite != true {
+            nonFiniteLosses += 1
             return self.lastLosses
         }
 

@@ -95,6 +95,18 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
     public let convPostWeight: [Float]
     public let convPostBias: [Float]
 
+    /// 励振源（F0 正弦波 + 雑音）をサンプルレートで最終段へ注入する畳み込み [hiddenChannels * 7 * 1]
+    /// なぜ励振源を入力するか:
+    /// メル・F0・有声フラグからの決定論的な畳み込み写像だけでは、周期を入力 F0 に固定する手掛かりが無く、
+    /// 有声区間で周期倍化（F0/2 の副次周期）が生じて「人の声と機械音が二重になった」ように聞こえ、
+    /// 無声区間では疑似周期のブザー音になる。F0 に同期した正弦波と雑音を励振として与え、
+    /// 生成器にはその整形（声道フィルタ相当）を学習させる（NSF / 励振源付き HiFi-GAN と同じ考え方）。
+    /// nil（旧重み）の場合は寄与ゼロとして扱い、既存の重みと互換を保つ。
+    public let excWeight: [Float]?
+    public let excBias: [Float]?
+
+    public static let excitationKernel: Int = 7
+
     public init(
         config: NeuralVocoderConfig = NeuralVocoderConfig(),
         convPreWeight: [Float],
@@ -130,9 +142,13 @@ public struct NeuralVocoderWeights: Sendable, Codable, Equatable {
         res6Conv2Weight: [Float],
         res6Conv2Bias: [Float],
         convPostWeight: [Float],
-        convPostBias: [Float]
+        convPostBias: [Float],
+        excWeight: [Float]? = nil,
+        excBias: [Float]? = nil
     ) {
         self.config = config
+        self.excWeight = excWeight
+        self.excBias = excBias
         self.convPreWeight = convPreWeight
         self.convPreBias = convPreBias
         self.up1Weight = up1Weight
@@ -648,6 +664,81 @@ public final class NeuralVocoder: @unchecked Sendable {
         }
     }
 
+    /// F0 輪郭と有声フラグから励振信号（サンプルレート）を生成する
+    ///
+    /// 有声フレーム: 位相を連続に積算した正弦波（振幅 0.1）+ 微小雑音、無声フレーム: 雑音（振幅 0.03）。
+    /// F0 はフレーム間で線形補間し、位相はフレーム境界で連続させる。乱数は決定論的（seed）。
+    /// 学習（MLX）と推論（Pure Swift）で同じ関数を使い、生成器の入力分布を一致させる。
+    public static func makeExcitation(
+        f0Contour: [Float],
+        voicedFlags: [Float],
+        frameCount: Int,
+        hopSize: Int,
+        sampleRate: Float,
+        seed: UInt64 = 2026
+    ) -> [Float] {
+        let totalSamples = frameCount * hopSize
+        var exc = [Float](repeating: 0.0, count: totalSamples)
+        if totalSamples <= 0 {
+            return exc
+        }
+        var rng = seed | 1
+        func nextNoise() -> Float {
+            rng ^= rng << 13
+            rng ^= rng >> 7
+            rng ^= rng << 17
+            return (Float(rng >> 40) / Float(1 << 24)) * 2.0 - 1.0
+        }
+        func frameF0(_ f: Int) -> Float {
+            if f < 0 || frameCount <= f {
+                return 0.0
+            }
+            var v: Float = 0.0
+            if f < voicedFlags.count {
+                v = voicedFlags[f]
+            }
+            var hz: Float = 0.0
+            if f < f0Contour.count {
+                hz = f0Contour[f]
+            }
+            if v < 0.5 || hz <= 0.0 {
+                return 0.0
+            }
+            return hz
+        }
+        var phase: Float = 0.0
+        let twoPi = 2.0 * Float.pi
+        var f = 0
+        while f < frameCount {
+            let cur = frameF0(f)
+            let next = frameF0(f + 1)
+            var i = 0
+            while i < hopSize {
+                let idx = f * hopSize + i
+                var value: Float = 0.0
+                if 0.0 < cur {
+                    var hz = cur
+                    if 0.0 < next {
+                        let w = Float(i) / Float(hopSize)
+                        hz = cur * (1.0 - w) + next * w
+                    }
+                    phase += twoPi * hz / sampleRate
+                    if twoPi < phase {
+                        phase -= twoPi
+                    }
+                    value = 0.1 * sinf(phase) + 0.003 * nextNoise()
+                } else {
+                    phase = 0.0
+                    value = 0.03 * nextNoise()
+                }
+                exc[idx] = value
+                i += 1
+            }
+            f += 1
+        }
+        return exc
+    }
+
     /// Mel スペクトログラム系列および F0 輪郭から時間領域 16kHz PCM 波形を直接合成する
     @discardableResult
     public func synthesize(
@@ -660,6 +751,13 @@ public final class NeuralVocoder: @unchecked Sendable {
         if totalFrames <= 0 {
             return []
         }
+        let excitation = Self.makeExcitation(
+            f0Contour: f0Contour,
+            voicedFlags: voicedFlags,
+            frameCount: totalFrames,
+            hopSize: config.hopSize,
+            sampleRate: Float(config.sampleRate)
+        )
 
         // なぜ 250 フレーム単位でチャンク分割推論を行うか:
         // 超長文合成時に内部テンソルバッファの過大確保を抑制し、
@@ -670,7 +768,8 @@ public final class NeuralVocoder: @unchecked Sendable {
                 mel: mel,
                 f0Contour: f0Contour,
                 voicedFlags: voicedFlags,
-                speaker: speaker
+                speaker: speaker,
+                excitation: excitation
             )
         }
 
@@ -712,11 +811,13 @@ public final class NeuralVocoder: @unchecked Sendable {
                 f += 1
             }
 
+            let chunkExcitation = Array(excitation[(padLeft * hopSize)..<min(excitation.count, padRight * hopSize)])
             let chunkAudio = synthesizeChunk(
                 mel: chunkMel,
                 f0Contour: chunkF0,
                 voicedFlags: chunkVoiced,
-                speaker: speaker
+                speaker: speaker,
+                excitation: chunkExcitation
             )
 
             let trimStartSamples = (validStart - padLeft) * hopSize
@@ -744,7 +845,8 @@ public final class NeuralVocoder: @unchecked Sendable {
         mel: [[Float]],
         f0Contour: [Float] = [],
         voicedFlags: [Float] = [],
-        speaker: SpeakerConditioning = .zero
+        speaker: SpeakerConditioning = .zero,
+        excitation: [Float] = []
     ) -> [Float] {
         let totalFrames = mel.count
         if totalFrames <= 0 {
@@ -828,6 +930,7 @@ public final class NeuralVocoder: @unchecked Sendable {
         if bufMid3.count < lenUp3 { bufMid3 = [Float](repeating: 0.0, count: lenUp3) }
         if bufR5.count < lenUp3 { bufR5 = [Float](repeating: 0.0, count: lenUp3) }
         if bufR6.count < lenUp3 { bufR6 = [Float](repeating: 0.0, count: lenUp3) }
+        var excBuf = [Float](repeating: 0.0, count: lenUp3)
 
         inputFeats.withUnsafeBufferPointer { pIn in
             bufPre.withUnsafeMutableBufferPointer { pPre in
@@ -1091,6 +1194,36 @@ public final class NeuralVocoder: @unchecked Sendable {
                                                                                 bias: pBUp3.baseAddress!,
                                                                                 applyActivation: true
                                                                             )
+                                                                        }
+                                                                    }
+
+                                                                    // 4.1 励振源の注入（サンプルレート、kernel 7 の畳み込みで hCh チャネルへ写像し加算）
+                                                                    if let excW = w.excWeight, let excB = w.excBias, excW.count == hCh * NeuralVocoderWeights.excitationKernel, excB.count == hCh, excitation.count == T3 {
+                                                                        excitation.withUnsafeBufferPointer { pExcIn in
+                                                                            excBuf.withUnsafeMutableBufferPointer { pExcOut in
+                                                                                excW.withUnsafeBufferPointer { pWE in
+                                                                                    excB.withUnsafeBufferPointer { pBE in
+                                                                                        Self.conv1d(
+                                                                                            input: pExcIn.baseAddress!,
+                                                                                            output: pExcOut.baseAddress!,
+                                                                                            T: T3,
+                                                                                            inC: 1,
+                                                                                            outC: hCh,
+                                                                                            kernel: NeuralVocoderWeights.excitationKernel,
+                                                                                            padding: NeuralVocoderWeights.excitationKernel / 2,
+                                                                                            dilation: 1,
+                                                                                            weights: pWE.baseAddress!,
+                                                                                            bias: pBE.baseAddress!,
+                                                                                            applyActivation: false
+                                                                                        )
+                                                                                    }
+                                                                                }
+                                                                                var ei = 0
+                                                                                while ei < lenUp3 {
+                                                                                    pUp3[ei] = pUp3[ei] + pExcOut[ei]
+                                                                                    ei += 1
+                                                                                }
+                                                                            }
                                                                         }
                                                                     }
 

@@ -1010,24 +1010,25 @@ extension SpikeSpeechEngine {
         // 有声音素の中に 0 の教師が混ざり、予測 F0 が低く・平坦に引き寄せられていた
         // （100 発話で教師 236 ± 87 Hz に対し予測 204 ± 37 Hz）。
         // 有声音素区間では推定値を線形補間して常に正の教師を与え、無声音素区間は 0 とする。
-        // 推定器のオクターブ誤りを抑えるため、80〜450 Hz の範囲外は未推定として扱う。
+        // 推定器のオクターブ誤りと句末のきしみ声を教師から除くため、100〜450 Hz の範囲外は未推定として扱う。
         let pitchResult = pitchTracker.track(pcm: pcm16k)
         var rawF0 = [Float](repeating: 0.0, count: totalFrames)
         var t = 0
         while t < totalFrames {
             if t < pitchResult.frameCount {
-                if 0.5 <= pitchResult.voiced[t] && 80.0 <= pitchResult.f0[t] && pitchResult.f0[t] <= 450.0 {
+                if 0.5 <= pitchResult.voiced[t] && 100.0 <= pitchResult.f0[t] && pitchResult.f0[t] <= 450.0 {
                     rawF0[t] = pitchResult.f0[t]
                 }
             }
             t += 1
         }
         var voicedPhoneFrame = [Bool](repeating: false, count: totalFrames)
+        let contextVoiced = PhonemeVocabulary.contextVoicedFlags(phoneIds: phoneIds)
         var vfOffset = 0
         var vp = 0
         while vp < phoneCount {
             let dur = targetDurations[vp]
-            let isV = PhonemeVocabulary.isVoicedPhone(phoneId: Int(phoneIds[vp]))
+            let isV = contextVoiced[vp]
             var f = 0
             while f < dur {
                 let idx = vfOffset + f

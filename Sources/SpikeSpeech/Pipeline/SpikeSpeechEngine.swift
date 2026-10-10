@@ -17,6 +17,8 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
     public let weights: SpikingNetworkWeights
     public let sampleRate: Float
     public let frameMelModel: FrameMelModel?
+    /// 無声フレームをメル包絡整形雑音で生成するか（UnvoicedNoiseRenderer 参照）
+    public var useUnvoicedNoiseExcitation: Bool = true
 
     /// 初期化
     public init(
@@ -511,6 +513,28 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
             speaker: speaker
         )
 
+        // 4.1 無声フレームの雑音励振（ボコーダの疑似周期ブザーを、メル包絡で整形した雑音に置き換える）
+        if useUnvoicedNoiseExcitation {
+            let extractor = MelSpectrogramExtractor(
+                sampleRate: sampleRate,
+                melChannels: AudioConfig.melChannels
+            )
+            let rendered = UnvoicedNoiseRenderer.render(
+                mel: melSeq,
+                voicedFlags: vocoderVoiced,
+                extractor: extractor
+            )
+            let mixCount = min(rawSamples.count, min(rendered.noise.count, rendered.weight.count))
+            var s = 0
+            while s < mixCount {
+                let w = rendered.weight[s]
+                if 0.0 < w {
+                    rawSamples[s] = rawSamples[s] * (1.0 - w) + rendered.noise[s] * w
+                }
+                s += 1
+            }
+        }
+
         // 5. 無音・休止・促音区間および無声破裂音の閉鎖期における完全ゼロミュート
         let silenceMask = computeFrameSilenceMask(
             linguisticFeatures: effectiveLinguisticFeatures,
@@ -530,11 +554,16 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 let endSample = min(rawSamples.count, startSample + frameSize)
                 switch prevIsSilence {
                 case false:
-                    let invN = 1.0 / Float(frameSize)
-                    var s = startSample
+                    // なぜ無音直前の発話 2 フレームも含めた 30 ms のフェードにするか:
+                    // 無音境界で 10 ms だけ落とすと語尾が断ち切られ、人工的な「残響の後の遮断」に聞こえるため。
+                    let fadeFrames = 3
+                    let fadeStart = max(0, (fIdx - (fadeFrames - 1)) * frameSize)
+                    let fadeLen = max(1, endSample - fadeStart)
+                    let invN = 1.0 / Float(fadeLen)
+                    var s = fadeStart
                     while s < endSample {
-                        let sampleOffset = s - startSample
-                        let fade = 1.0 - (Float(sampleOffset) * invN)
+                        let x = Float(s - fadeStart) * invN
+                        let fade = 0.5 * (1.0 + cosf(Float.pi * x))
                         rawSamples[s] = rawSamples[s] * fade
                         s += 1
                     }
@@ -549,6 +578,37 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
                 break
             }
             fIdx += 1
+        }
+
+        // 5.1 発話末のリリース減衰
+        // なぜ発話末の有声区間に減衰を掛けるか:
+        // 教師音声は文末で 300 ms ほどかけて 15 dB 前後減衰しながら息に移るが、音響モデルは文末の有声区間を
+        // ほぼ一定音量のまま生成し、ボコーダはその低音量有声フレームで周期倍化したブザー音を出す。
+        // 最後の発話フレームから遡って releaseFrames の区間に余弦カーブの減衰（最終 releaseFloor 倍）を掛け、
+        // 文末の自然な消え方を補う。文中のポーズ境界には適用しない。
+        var lastSpeechFrame = -1
+        var scanIdx = totalFrames - 1
+        while 0 <= scanIdx {
+            if silenceMask[scanIdx] != true {
+                lastSpeechFrame = scanIdx
+                break
+            }
+            scanIdx -= 1
+        }
+        if 0 <= lastSpeechFrame {
+            let releaseFrames = 15
+            let releaseFloor: Float = 0.2
+            let releaseStart = max(0, lastSpeechFrame + 1 - releaseFrames) * frameSize
+            let releaseEnd = min(rawSamples.count, (lastSpeechFrame + 1) * frameSize)
+            let releaseLen = max(1, releaseEnd - releaseStart)
+            var s = releaseStart
+            while s < releaseEnd {
+                let x = Float(s - releaseStart) / Float(releaseLen)
+                let curve = 0.5 * (1.0 + cosf(Float.pi * x))
+                let gain = releaseFloor + (1.0 - releaseFloor) * curve
+                rawSamples[s] = rawSamples[s] * gain
+                s += 1
+            }
         }
 
         // 6. ヘッドルーム正規化（可聴音圧の確保と安全マージン）および話者エネルギースケーリング

@@ -438,6 +438,45 @@ public final class MelSpectrogramExtractor: @unchecked Sendable {
         }
     }
 
+    /// 対数メル 1 フレームから線形パワースペクトル（fftBins 本）を近似復元する（フィルタバンクの擬似逆）
+    ///
+    /// なぜ擬似逆で足りるか: 無声区間の雑音励振では帯域ごとの大まかなスペクトル包絡が再現できれば十分で、
+    /// 各 FFT ビンのパワーを、そのビンに掛かるメルフィルタ重みで加重平均したメル帯域パワーで置き換える。
+    public func melToLinearPower(logMel: [Float]) -> [Float] {
+        var power = [Float](repeating: 0.0, count: fftBins)
+        var melPower = [Float](repeating: 0.0, count: melChannels)
+        var ch = 0
+        while ch < melChannels {
+            var v: Float = 0.0
+            if ch < logMel.count {
+                v = expf(logMel[ch])
+            }
+            melPower[ch] = v
+            ch += 1
+        }
+        var b = 0
+        while b < fftBins {
+            var num: Float = 0.0
+            var den: Float = 0.0
+            ch = 0
+            while ch < melChannels {
+                let w = melFilterbankWeights[(b * melChannels) + ch]
+                if 0.0 < w {
+                    num += w * melPower[ch]
+                    den += w
+                }
+                ch += 1
+            }
+            if 0.0 < den {
+                power[b] = num / den
+            } else {
+                power[b] = 0.0
+            }
+            b += 1
+        }
+        return power
+    }
+
     /// 16kHz PCM 音声から 64 チャンネル対数 Mel スペクトログラムを抽出する
     public func extractLogMel(pcm: [Float]) -> [[Float]] {
         if pcm.isEmpty {

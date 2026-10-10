@@ -1150,7 +1150,8 @@ func main() {
             let lg = valueAndGrad(model: vocoder) { (model: MLXNeuralVocoder, arrays: [MLXArray]) -> [MLXArray] in
                 let fArr = arrays[0]
                 let tArr = arrays[1]
-                let pred = model(fArr)
+                let eArr = arrays[2]
+                let pred = model(fArr, excitation: eArr)
                 let loss = MLXNeuralVocoder.totalVocoderLoss(predicted: pred, target: tArr)
                 return [loss]
             }
@@ -1164,6 +1165,7 @@ func main() {
 
                 var batchFeats = [Float]()
                 var batchPCMs = [Float]()
+                var batchExc = [Float]()
                 var currBatchItems = 0
 
                 var pairIdx = 0
@@ -1238,14 +1240,26 @@ func main() {
                                 }
 
                                 batchPCMs.append(contentsOf: pair.pcm[startSample..<endSample])
+                                // 励振源（学習・推論で同じ生成関数）: 区間内の F0/有声から生成
+                                let segF0 = Array(pair.f0[min(pair.f0.count, startF)..<min(pair.f0.count, startF + segFrames)])
+                                let segVoiced = Array(pair.voiced[min(pair.voiced.count, startF)..<min(pair.voiced.count, startF + segFrames)])
+                                batchExc.append(contentsOf: NeuralVocoder.makeExcitation(
+                                    f0Contour: segF0,
+                                    voicedFlags: segVoiced,
+                                    frameCount: segFrames,
+                                    hopSize: hopSize,
+                                    sampleRate: Float(vocoder.config.sampleRate),
+                                    seed: UInt64(pairIdx * 131 + startF + vEpoch * 7919)
+                                ))
                                 currBatchItems += 1
 
                                 if batchSize <= currBatchItems {
                                     autoreleasepool {
                                         let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
                                         let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
+                                        let excArr = MLXArray(batchExc, [currBatchItems, segSamples, 1])
 
-                                        let (lossVals, grads) = lg(vocoder, [featArr, targArr])
+                                        let (lossVals, grads) = lg(vocoder, [featArr, targArr, excArr])
                                         let lossVal = lossVals[0].item(Float.self)
                                         epochLossSum += lossVal
                                         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
@@ -1257,6 +1271,7 @@ func main() {
                                     vBatchCount += 1
                                     batchFeats.removeAll(keepingCapacity: true)
                                     batchPCMs.removeAll(keepingCapacity: true)
+                                    batchExc.removeAll(keepingCapacity: true)
                                     currBatchItems = 0
                                     if (vBatchCount % 10) == 0 {
                                         Memory.clearCache()
@@ -1273,8 +1288,9 @@ func main() {
                     autoreleasepool {
                         let featArr = MLXArray(batchFeats, [currBatchItems, segFrames, inCh])
                         let targArr = MLXArray(batchPCMs, [currBatchItems, segSamples])
+                        let excArr = MLXArray(batchExc, [currBatchItems, segSamples, 1])
 
-                        let (lossVals, grads) = lg(vocoder, [featArr, targArr])
+                        let (lossVals, grads) = lg(vocoder, [featArr, targArr, excArr])
                         let lossVal = lossVals[0].item(Float.self)
                         epochLossSum += lossVal
                         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
@@ -1286,6 +1302,7 @@ func main() {
                     vBatchCount += 1
                     batchFeats.removeAll(keepingCapacity: true)
                     batchPCMs.removeAll(keepingCapacity: true)
+                    batchExc.removeAll(keepingCapacity: true)
                     currBatchItems = 0
                 }
 
@@ -1344,6 +1361,11 @@ func main() {
     if useFrameMel {
         // ボコーダーを先に学習する。FrameMel の検証用波形に最新のボコーダーを使うため。
         runVocoderTraining()
+        if epochs <= 0 {
+            print("FrameMel のエポック数が 0 のため、音響モデルの学習は行いません（ボコーダーのみ）。")
+            print("学習処理が正常に完了しました。")
+            return
+        }
 
         print("\n==================================================")
         print("SpikeVoice (arXiv:2408.00788) フレーム単位対数メルモデル学習を開始します")
@@ -1583,6 +1605,10 @@ func main() {
             let avgDelta = epochDeltaL1 / n
 
             print("  [Epoch \(epoch + 1)/\(epochs)] 学習損失: \(String(format: "%.4f", avgTotal)) (Dec: \(String(format: "%.4f", avgDec)), Post: \(String(format: "%.4f", avgPost)), F0: \(String(format: "%.4f", avgF0)), Eng: \(String(format: "%.4f", avgEng)), Dur: \(String(format: "%.4f", avgDur)), Delta: \(String(format: "%.4f", avgDelta)))  lr=\(String(format: "%.6g", lr))")
+            if 0 < trainer.skippedUpdates || 0 < trainer.nonFiniteLosses {
+                print("    警告: 非有限の損失 \(trainer.nonFiniteLosses) 件、更新を飛ばしたステップ \(trainer.skippedUpdates) 件（このエポック）。多発する場合は学習率を下げてください。")
+            }
+            trainer.resetSkipCounters()
 
             // 検証損失（教師強制・勾配なし）
             let selectionLoss: Float

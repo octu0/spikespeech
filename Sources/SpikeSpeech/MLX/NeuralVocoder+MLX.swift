@@ -51,6 +51,9 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
     /// 終段波形出力 1D 畳み込み層 (kernel 7, stride 1, padding 3)
     public var convPost: Conv1d
 
+    /// 励振源（F0 正弦波 + 雑音、サンプルレート）を最終段へ注入する畳み込み (1 -> hCh, kernel 7)
+    public var excConv: Conv1d
+
     public init(config: NeuralVocoderConfig = NeuralVocoderConfig()) {
         self.config = config
         let inCh = config.melChannels + 2 // Mel 64ch + F0 1ch + Voiced 1ch
@@ -209,6 +212,19 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
             padding: 3
         )
 
+        // 6. 励振源注入（ゼロ初期化: 旧重みからのウォームスタートで出力を変えない）
+        self.excConv = Conv1d(
+            inputChannels: 1,
+            outputChannels: hCh,
+            kernelSize: NeuralVocoderWeights.excitationKernel,
+            stride: 1,
+            padding: NeuralVocoderWeights.excitationKernel / 2
+        )
+        var pExc = ModuleParameters()
+        pExc[unwrapping: "weight"] = MLXArray.zeros([hCh, NeuralVocoderWeights.excitationKernel, 1])
+        pExc[unwrapping: "bias"] = MLXArray.zeros([hCh])
+        self.excConv.update(parameters: pExc)
+
         super.init()
     }
 
@@ -222,7 +238,7 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
     /// なぜ tanh 直前の値を出力可能にするか:
     /// 音響 SNN との結合学習において、大振幅波形による tanh の飽和（勾配消失）を回避し、
     /// STFT 損失の勾配を予測 Mel へ確実に届けるため（推論時は callAsFunction で tanh を維持する）。
-    public func forwardPreTanh(_ input: MLXArray) -> MLXArray {
+    public func forwardPreTanh(_ input: MLXArray, excitation: MLXArray? = nil) -> MLXArray {
         let lrelu = LeakyReLU(negativeSlope: 0.1)
 
         // 1. 初段畳み込み: [B, T, inCh] -> [B, T, hCh]
@@ -245,7 +261,11 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
         let mrf2 = h2 + (0.5 * (r3 + r4))
 
         // 4. Stage 3: up3 (stride 4) -> [B, T * 160, hCh]
-        let h3 = lrelu(up3(mrf2))
+        var h3 = lrelu(up3(mrf2))
+        // 4.1 励振源の注入 [B, T * 160, 1] -> [B, T * 160, hCh]
+        if let e = excitation {
+            h3 = h3 + excConv(e)
+        }
 
         // MRF 3 ResBlocks (dilation 1, 3)
         let r5 = res5Conv2(lrelu(res5Conv1(h3)))
@@ -260,8 +280,8 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
     /// なぜ古典正弦波音源や手書きパルスの加算を完全撤廃するか:
     /// 入力特徴量（Mel, F0, Voiced）から直接実音声 PCM 波形への写像をエンドツーエンドで学習し、
     /// 人工的な電子ビープ音やモデム音を根絶して人間の生々しい肉声を純粋に合成するため。
-    public func callAsFunction(_ input: MLXArray) -> MLXArray {
-        let sum = forwardPreTanh(input)
+    public func callAsFunction(_ input: MLXArray, excitation: MLXArray? = nil) -> MLXArray {
+        let sum = forwardPreTanh(input, excitation: excitation)
         return tanh(sum)
     }
 
@@ -359,7 +379,9 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
             res6Conv2Weight: r6c2W,
             res6Conv2Bias: r6c2B,
             convPostWeight: postW,
-            convPostBias: postB
+            convPostBias: postB,
+            excWeight: excConv.weight.asArray(Float.self),
+            excBias: extractBias(excConv.bias, count: hCh)
         )
     }
 
@@ -402,6 +424,15 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
         updateLayer(res6Conv1, weight: weights.res6Conv1Weight, weightShape: res6Conv1.weight.shape, bias: weights.res6Conv1Bias, biasShape: [hCh])
         updateLayer(res6Conv2, weight: weights.res6Conv2Weight, weightShape: res6Conv2.weight.shape, bias: weights.res6Conv2Bias, biasShape: [hCh])
         updateLayer(convPost, weight: weights.convPostWeight, weightShape: convPost.weight.shape, bias: weights.convPostBias, biasShape: [1])
+        switch (weights.excWeight, weights.excBias) {
+        case (.some(let ew), .some(let eb)) where ew.count == hCh * NeuralVocoderWeights.excitationKernel && eb.count == hCh:
+            updateLayer(excConv, weight: ew, weightShape: excConv.weight.shape, bias: eb, biasShape: [hCh])
+        default:
+            var pExc = ModuleParameters()
+            pExc[unwrapping: "weight"] = MLXArray.zeros([hCh, NeuralVocoderWeights.excitationKernel, 1])
+            pExc[unwrapping: "bias"] = MLXArray.zeros([hCh])
+            excConv.update(parameters: pExc)
+        }
 
         eval(trainableParameters())
     }

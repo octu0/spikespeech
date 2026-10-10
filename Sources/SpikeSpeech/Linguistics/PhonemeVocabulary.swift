@@ -240,6 +240,56 @@ public struct PhonemeVocabulary: Sendable {
         }
     }
 
+    /// 音素列全体を見て各音素の有声/無声を判定する（母音の無声化規則を含む）
+    ///
+    /// なぜ文脈依存の無声化を入れるか:
+    /// 日本語の /i/ /u/ は無声子音に挟まれた位置、または無声子音の後の句末（「です」「ます」の「す」）で
+    /// 無声化する。音素単位の規則では常に有声扱いとなり、F0 と有声フラグが与えられたボコーダが
+    /// 句末で低いブザー音を生成して「発話の後にロボットの残響が付く」ように聞こえていた。
+    /// 学習時（F0 損失マスク・教師 F0）と推論時（ボコーダ入力）で同じ関数を使い整合させる。
+    public static func contextVoicedFlags(phoneIds: [Int32]) -> [Bool] {
+        let n = phoneIds.count
+        var flags = [Bool](repeating: false, count: n)
+        func isBoundary(_ pid: Int) -> Bool {
+            return pid == silId || pid == pauId
+        }
+        func isVoicelessConsonant(_ pid: Int) -> Bool {
+            if isBoundary(pid) {
+                return false
+            }
+            if isVowelOrSpecialMora(phoneId: pid) {
+                return false
+            }
+            return isVoicedPhone(phoneId: pid) != true
+        }
+        var i = 0
+        while i < n {
+            let pid = Int(phoneIds[i])
+            var voiced = isVoicedPhone(phoneId: pid)
+            if pid == 6 || pid == 7 { // i, u
+                var prevVoiceless = false
+                if 0 < i {
+                    prevVoiceless = isVoicelessConsonant(Int(phoneIds[i - 1]))
+                }
+                var nextDevoicing = false
+                if (i + 1) < n {
+                    let next = Int(phoneIds[i + 1])
+                    if isBoundary(next) || isVoicelessConsonant(next) {
+                        nextDevoicing = true
+                    }
+                } else {
+                    nextDevoicing = true
+                }
+                if prevVoiceless && nextDevoicing {
+                    voiced = false
+                }
+            }
+            flags[i] = voiced
+            i += 1
+        }
+        return flags
+    }
+
     /// 音素 ID が母音または特殊拍（促音・撥音・長音）であるか判定する
     public static func isVowelOrSpecialMora(phoneId: Int) -> Bool {
         switch phoneId {

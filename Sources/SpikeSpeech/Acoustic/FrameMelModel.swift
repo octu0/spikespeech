@@ -173,6 +173,10 @@ public final class FrameMelModel: @unchecked Sendable {
         }
     }
 
+    /// 推論時にモデルへ与える境界無音の最小フレーム数（教師の先頭無音平均 17F・末尾 25F に合わせる）
+    public static let minimumLeadPadFrames: Int = 20
+    public static let minimumTrailPadFrames: Int = 25
+
     /// 音素 ID 列だけから決まる韻律位置特徴を算出する（音素ごとに prosodicFeatureCount 次元）
     ///
     /// 学習時と推論時で同じ入力（音素 ID 列）から同じ値が得られるため、追加のアノテーションを要しない。
@@ -770,8 +774,17 @@ public final class FrameMelModel: @unchecked Sendable {
         // 継続時間予測器は文脈（句末の伸び、短い発話のゆっくりさ）を学習しているが、
         // 固定のモーラ速度へ総和を強制すると比率しか残らず、学習した発話速度が捨てられるため。
         // 明示的にモーラ速度が与えられた場合のみ、その速度へ総和を合わせる。
-        let leadSil = Int(linguisticFeatures.durations[0])
-        let trailSil = Int(linguisticFeatures.durations[phoneCount - 1])
+        let requestedLeadSil = Int(linguisticFeatures.durations[0])
+        let requestedTrailSil = Int(linguisticFeatures.durations[phoneCount - 1])
+        // なぜモデルに与える境界無音を学習時の長さまで延長するか:
+        // 教師音声の先頭無音は平均 17 フレーム、末尾は 25 フレームあり、デコーダ（カーネル 17 × 4 層）は
+        // 「系列端から数十フレーム以内は無音」という分布で学習されている。推論時の境界無音 6/8 フレームでは
+        // 文頭・文末の音素が系列端のゼロ埋め受容野に入り、約 20 dB 弱く生成されていた（文頭の「あ」が消える）。
+        // 学習時相当の無音を付けて推論し、出力から余分な無音を切り落として要求どおりの境界長で返す。
+        let leadSil = max(requestedLeadSil, Self.minimumLeadPadFrames)
+        let trailSil = max(requestedTrailSil, Self.minimumTrailPadFrames)
+        let cutHead = leadSil - requestedLeadSil
+        let cutTail = trailSil - requestedTrailSil
         let bodyPhoneCount = phoneCount - 2
 
         var moraCount = 0
@@ -862,12 +875,12 @@ public final class FrameMelModel: @unchecked Sendable {
         var frameStates = [Float](repeating: 0.0, count: totalFrames * 257)
         var voicedFlags = [Float](repeating: 0.0, count: totalFrames)
 
+        let contextVoiced = PhonemeVocabulary.contextVoicedFlags(phoneIds: phoneIds)
         var curFrame = 0
         pIdx = 0
         while pIdx < phoneCount {
-            let pid = Int(phoneIds[pIdx])
             let dur = finalDurs[pIdx]
-            let isV = PhonemeVocabulary.isVoicedPhone(phoneId: pid)
+            let isV = contextVoiced[pIdx]
             let vVal: Float
             switch isV {
             case true: vVal = 1.0
@@ -895,11 +908,12 @@ public final class FrameMelModel: @unchecked Sendable {
         }
 
         // 5. F0 およびエネルギーの予測
-        let (rawPredF0Norm, predEnergy) = predictF0AndEnergy(
+        let (rawPredF0Norm, predEnergyRaw) = predictF0AndEnergy(
             frameStates: frameStates,
             totalFrames: totalFrames,
             voicedFlags: voicedFlags
         )
+        var predEnergy = predEnergyRaw
         var predF0Norm = rawPredF0Norm
         if f0Scale != 1.0 {
             var f = 0
@@ -967,6 +981,43 @@ public final class FrameMelModel: @unchecked Sendable {
                 f0Hz[t] = 0.0
             }
             t += 1
+        }
+        // 8.1 句末のきしみ声（creak）由来の極端に低い F0 の下限処理
+        // なぜ下限を設けるか: 教師音声の句末はきしみ声で基本周波数が 60〜100 Hz まで落ちており、
+        // 予測 F0 もそれを学習して句末で 70〜90 Hz を出す。ボコーダはその F0 で周期倍化した低いブザー音を
+        // 生成し、「発話の後にロボットの残響が付く」ように聞こえていた。発話内の中央値の 6 割を下限とし、
+        // それ未満の有声フレームは下限へ丸めて、きしみ声ではなく通常の声として生成させる。
+        var voicedHz: [Float] = []
+        t = 0
+        while t < totalFrames {
+            if 0.0 < f0Hz[t] {
+                voicedHz.append(f0Hz[t])
+            }
+            t += 1
+        }
+        if 8 <= voicedHz.count {
+            let sortedHz = voicedHz.sorted()
+            let medianHz = sortedHz[sortedHz.count / 2]
+            let floorHz = max(60.0, medianHz * 0.6)
+            t = 0
+            while t < totalFrames {
+                if 0.0 < f0Hz[t] && f0Hz[t] < floorHz {
+                    f0Hz[t] = floorHz
+                }
+                t += 1
+            }
+        }
+
+        // 9. 延長した境界無音の切り落とし（要求された境界長に戻す）
+        if 0 < cutHead || 0 < cutTail {
+            let keepEnd = max(cutHead, totalFrames - cutTail)
+            let keepRange = cutHead..<keepEnd
+            finalPostMel = Array(finalPostMel[keepRange])
+            f0Hz = Array(f0Hz[keepRange])
+            voicedFlags = Array(voicedFlags[keepRange])
+            predEnergy = Array(predEnergy[keepRange])
+            finalDurs[0] = requestedLeadSil
+            finalDurs[phoneCount - 1] = requestedTrailSil
         }
 
         return (mel: finalPostMel, f0Contour: f0Hz, voicedFlags: voicedFlags, energyContour: predEnergy, durations: finalDurs.map { Int32($0) })
