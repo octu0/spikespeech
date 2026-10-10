@@ -1010,19 +1010,75 @@ extension SpikeSpeechEngine {
         }
         targetDurations[phoneCount - 1] = finalTrail
 
+        // なぜ有声音素の区間内で F0 教師を連続化（補間）するか:
+        // 学習の F0 損失マスクは音素規則（有声音素の全フレーム）で、推論でも同じ規則で F0 を出力する。
+        // 一方で教師 F0 はピッチ推定器が無声と判定したフレーム（有声音素の立ち上がり・終わり・かすれ）で 0 になるため、
+        // 有声音素の中に 0 の教師が混ざり、予測 F0 が低く・平坦に引き寄せられていた
+        // （100 発話で教師 236 ± 87 Hz に対し予測 204 ± 37 Hz）。
+        // 有声音素区間では推定値を線形補間して常に正の教師を与え、無声音素区間は 0 とする。
+        // 推定器のオクターブ誤りを抑えるため、80〜450 Hz の範囲外は未推定として扱う。
         let pitchResult = pitchTracker.track(pcm: pcm16k)
-        var targetF0 = [Float](repeating: 0.0, count: totalFrames)
+        var rawF0 = [Float](repeating: 0.0, count: totalFrames)
         var t = 0
         while t < totalFrames {
             if t < pitchResult.frameCount {
-                if 0.5 <= pitchResult.voiced[t] && 70.0 <= pitchResult.f0[t] {
-                    let f0Hz = pitchResult.f0[t]
-                    let norm = f0Hz / 500.0
-                    targetF0[t] = max(0.0, min(1.0, norm))
-                } else {
-                    targetF0[t] = 0.0
+                if 0.5 <= pitchResult.voiced[t] && 80.0 <= pitchResult.f0[t] && pitchResult.f0[t] <= 450.0 {
+                    rawF0[t] = pitchResult.f0[t]
                 }
             }
+            t += 1
+        }
+        var voicedPhoneFrame = [Bool](repeating: false, count: totalFrames)
+        var vfOffset = 0
+        var vp = 0
+        while vp < phoneCount {
+            let dur = targetDurations[vp]
+            let isV = PhonemeVocabulary.isVoicedPhone(phoneId: Int(phoneIds[vp]))
+            var f = 0
+            while f < dur {
+                let idx = vfOffset + f
+                if idx < totalFrames {
+                    voicedPhoneFrame[idx] = isV
+                }
+                f += 1
+            }
+            vfOffset += dur
+            vp += 1
+        }
+        var targetF0 = [Float](repeating: 0.0, count: totalFrames)
+        t = 0
+        while t < totalFrames {
+            if voicedPhoneFrame[t] != true {
+                t += 1
+                continue
+            }
+            var hz = rawF0[t]
+            if hz <= 0.0 {
+                // 前後の推定値を探索して線形補間（片側しか無ければその値）
+                var prevIdx = t - 1
+                while 0 <= prevIdx && rawF0[prevIdx] <= 0.0 {
+                    prevIdx -= 1
+                }
+                var nextIdx = t + 1
+                while nextIdx < totalFrames && rawF0[nextIdx] <= 0.0 {
+                    nextIdx += 1
+                }
+                let hasPrev = 0 <= prevIdx
+                let hasNext = nextIdx < totalFrames
+                switch (hasPrev, hasNext) {
+                case (true, true):
+                    let span = Float(nextIdx - prevIdx)
+                    let w = Float(t - prevIdx) / span
+                    hz = rawF0[prevIdx] * (1.0 - w) + rawF0[nextIdx] * w
+                case (true, false):
+                    hz = rawF0[prevIdx]
+                case (false, true):
+                    hz = rawF0[nextIdx]
+                case (false, false):
+                    hz = 0.0
+                }
+            }
+            targetF0[t] = max(0.0, min(1.0, hz / 500.0))
             t += 1
         }
 

@@ -646,7 +646,8 @@ public final class FrameMelModel: @unchecked Sendable {
     public func synthesizeMelAndF0(
         linguisticFeatures: LinguisticFeatures,
         meanFramesPerMora: Float? = nil,
-        f0Scale: Float = 1.0
+        f0Scale: Float = 1.0,
+        durationScale: Float = 1.0
     ) -> (mel: [[Float]], f0Contour: [Float], voicedFlags: [Float], energyContour: [Float], durations: [Int32]) {
         let phoneIds = linguisticFeatures.phoneIds
         let phoneCount = phoneIds.count
@@ -660,8 +661,11 @@ public final class FrameMelModel: @unchecked Sendable {
         // 2. 継続時間予測
         let rawDurs = predictDurations(encStates: encStates)
 
-        // 3. 長さ調節（推論時: meanFramesPerMora 16 × モーラ数 + 境界無音）
-        let effectiveMoraRate = meanFramesPerMora ?? 16.0
+        // 3. 長さ調節
+        // なぜ meanFramesPerMora 未指定時は予測継続時間をそのまま使うか:
+        // 継続時間予測器は文脈（句末の伸び、短い発話のゆっくりさ）を学習しているが、
+        // 固定のモーラ速度へ総和を強制すると比率しか残らず、学習した発話速度が捨てられるため。
+        // 明示的にモーラ速度が与えられた場合のみ、その速度へ総和を合わせる。
         let leadSil = Int(linguisticFeatures.durations[0])
         let trailSil = Int(linguisticFeatures.durations[phoneCount - 1])
         let bodyPhoneCount = phoneCount - 2
@@ -679,15 +683,25 @@ public final class FrameMelModel: @unchecked Sendable {
             moraCount = max(1, bodyPhoneCount / 2)
         }
 
-        let targetSpeechFrames = max(bodyPhoneCount, Int(roundf(effectiveMoraRate * Float(moraCount))))
-
-        // 予測継続時間の比率を維持した拡大縮小
         var predBodySum: Float = 0.0
         var bI = 0
         while bI < bodyPhoneCount {
             predBodySum += rawDurs[1 + bI]
             bI += 1
         }
+        var safeDurationScale = durationScale
+        if safeDurationScale.isFinite != true || safeDurationScale <= 0.0 {
+            safeDurationScale = 1.0
+        }
+        let targetSpeechFrames: Int
+        switch meanFramesPerMora {
+        case .some(let rate):
+            targetSpeechFrames = max(bodyPhoneCount, Int(roundf(rate * Float(moraCount))))
+        case .none:
+            targetSpeechFrames = max(bodyPhoneCount, Int(roundf(predBodySum * safeDurationScale)))
+        }
+
+        // 予測継続時間の比率を維持した拡大縮小
         let scale: Float
         if 0.001 < predBodySum {
             scale = Float(targetSpeechFrames) / predBodySum

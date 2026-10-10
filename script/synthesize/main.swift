@@ -740,22 +740,25 @@ func main() {
     var dbgTotalFrames: Int = dbgLinguistic.totalFrames
     var dbgSource = "LengthRegulator"
     if let fmm = engine.frameMelModel {
-        let moraRate: Float
-        switch voiceProfile.meanFramesPerMora {
-        case .some(let m):
+        var moraRate: Float? = nil
+        if let m = voiceProfile.meanFramesPerMora {
             moraRate = m / speed
-        case .none:
-            moraRate = engine.lengthRegulator.meanFramesPerMora / speed
         }
         let fmRes = fmm.synthesizeMelAndF0(
             linguisticFeatures: dbgLinguistic,
             meanFramesPerMora: moraRate,
-            f0Scale: (voiceProfile.baseF0 / 220.0) * pitch
+            f0Scale: (voiceProfile.baseF0 / 220.0) * pitch,
+            durationScale: 1.0 / speed
         )
         if fmRes.durations.count == dbgLinguistic.phoneIds.count {
             dbgDurations = fmRes.durations
             dbgTotalFrames = fmRes.mel.count
-            dbgSource = "FrameMel 予測 (モーラ速度 \(String(format: "%.2f", moraRate)) frames/モーラ)"
+            switch moraRate {
+            case .some(let r):
+                dbgSource = "FrameMel 予測 (モーラ速度 \(String(format: "%.2f", r)) frames/モーラ に正規化)"
+            case .none:
+                dbgSource = "FrameMel 予測継続時間 (速度 \(String(format: "%.2f", speed)))"
+            }
         }
     }
     print("=== 音素別継続時間分析 (\(dbgSource)) ===")

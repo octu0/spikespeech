@@ -366,7 +366,20 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let targStd = sqrt(variance(targetMelArr, axis: 1) + MLXArray(Float(1e-4)))
             let gvLoss = mean(abs(predStd - targStd))
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + (gvLoss * MLXArray(gvWeight))
+            // 10. チャネル別時間平均の一致（スペクトル傾斜の偏り抑制）
+            // なぜ平均も合わせるか: 100 発話で予測メルは教師より低域が +0.7、高域が -0.7 偏り、
+            // こもった低い声に聞こえていた。L1 は各フレームの中央値へ寄るため帯域ごとの平均が系統的にずれる。
+            let channelMeanLoss = mean(abs(mean(postMel, axis: 1) - mean(targetMelArr, axis: 1)))
+
+            // 11. 有声フレームの F0 標準偏差一致（抑揚幅の圧縮抑制）
+            let voicedCount = maximum(sum(voicedArr), MLXArray(Float(1.0)))
+            let predF0Mean = sum(predF0 * voicedArr) / voicedCount
+            let targF0Mean = sum(targetF0Batch * voicedArr) / voicedCount
+            let predF0Std = sqrt(sum(square((predF0 - predF0Mean) * voicedArr)) / voicedCount + MLXArray(Float(1e-6)))
+            let targF0Std = sqrt(sum(square((targetF0Batch - targF0Mean) * voicedArr)) / voicedCount + MLXArray(Float(1e-6)))
+            let f0StdLoss = abs(predF0Std - targF0Std)
+
+            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + ((gvLoss + channelMeanLoss) * MLXArray(gvWeight)) + (f0StdLoss * MLXArray(Float(1.0)))
             return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, allFrameDeltaLoss]
         }
 

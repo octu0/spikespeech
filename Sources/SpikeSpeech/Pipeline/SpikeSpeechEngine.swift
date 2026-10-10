@@ -429,20 +429,16 @@ public final class SpikeSpeechEngine: @unchecked Sendable {
         switch self.frameMelModel {
         case .some(let fmm):
             let f0Scale = (voice.baseF0 / 220.0) * safePitch
-            // なぜ VoiceProfile 未指定時に学習済み重みのモーラ速度へフォールバックするか:
-            // 固定値 16 フレーム/モーラへ落ちると、コーパスから実測した発話速度（重みに保存）が
-            // 推論で一切使われず、学習データより遅いテンポに強制されるため。
-            let effectiveMoraRate: Float
-            switch voice.meanFramesPerMora {
-            case .some(let m):
+            // VoiceProfile にモーラ速度の指定が無ければ、学習済み継続時間予測をそのまま使い speed で伸縮する
+            var effectiveMoraRate: Float? = nil
+            if let m = voice.meanFramesPerMora {
                 effectiveMoraRate = m / safeSpeed
-            case .none:
-                effectiveMoraRate = lengthRegulator.meanFramesPerMora / safeSpeed
             }
             let res = fmm.synthesizeMelAndF0(
                 linguisticFeatures: linguisticFeatures,
                 meanFramesPerMora: effectiveMoraRate,
-                f0Scale: f0Scale
+                f0Scale: f0Scale,
+                durationScale: 1.0 / safeSpeed
             )
             melSeq = res.mel
             totalFrames = melSeq.count
