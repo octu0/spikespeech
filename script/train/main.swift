@@ -832,7 +832,7 @@ func main() {
     // コーパス読み込み
     let corpusDir = cleanDatasetPath
     var trainingData: [(features: [[Float]], targets: [[Float]], targetAudio: [Float])] = []
-    var frameMelSamples: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
+    var frameMelSamples: [FrameMelTrainingSample] = []
     var frameMelTexts: [String] = []
     var skippedFrameMelSamples = 0
     var reconTargetSample: (features: [[Float]], targets: [[Float]], targetAudio: [Float])? = nil
@@ -1406,8 +1406,8 @@ func main() {
         // 特定文の経験則指標（重心・包絡変化など）での採否は読みの誤りや別の文の崩れを検出できず、
         // 学習損失の改善と無関係に重みが破棄される原因になっていたため。
         let validationEvery = 20
-        var trainSet: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
-        var validSet: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])] = []
+        var trainSet: [FrameMelTrainingSample] = []
+        var validSet: [FrameMelTrainingSample] = []
         var validTexts: [String] = []
         let canSplit = (2 * validationEvery) <= frameMelSamples.count
         var splitIdx = 0
@@ -1461,7 +1461,7 @@ func main() {
             .withMeanFramesPerMora(corpusMoraRate)
             .withPhonemeAverageDurations(healthyPhonemeAverages)
 
-        func averageLosses(_ samples: [(phoneIds: [Int32], targetDurations: [Int], targetMel: [[Float]], targetF0: [Float], targetEnergy: [Float])]) -> FrameMelLosses {
+        func averageLosses(_ samples: [FrameMelTrainingSample]) -> FrameMelLosses {
             var total: Float = 0.0
             var dec: Float = 0.0
             var post: Float = 0.0
@@ -1479,7 +1479,8 @@ func main() {
                         targetDurations: s.targetDurations,
                         targetMel: s.targetMel,
                         targetF0: s.targetF0,
-                        targetEnergy: s.targetEnergy
+                        targetEnergy: s.targetEnergy,
+                        phoneAccent: s.phoneAccent
                     )
                 }
                 if l.totalLoss.isFinite {
@@ -1542,7 +1543,8 @@ func main() {
                         targetDurations: s.targetDurations,
                         targetMel: s.targetMel,
                         targetF0: s.targetF0,
-                        targetEnergy: s.targetEnergy
+                        targetEnergy: s.targetEnergy,
+                        phoneAccent: s.phoneAccent
                     )
                 }
 

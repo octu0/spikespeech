@@ -11,6 +11,8 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
     public var embedPrev: Embedding
     public var embedNext: Embedding
     public var encBIn: MLXArray
+    /// 韻律位置特徴（prosodicFeatureCount 次元）の線形射影（バイアスなし、ゼロ初期化）
+    public var encFeatProj: Linear
     public var encConv0: Conv1d
     public var encConv1: Conv1d
     public var encConv2: Conv1d
@@ -55,6 +57,7 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         self.embedPrev = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
         self.embedNext = Embedding(embeddingCount: vocabSize, dimensions: hiddenDim)
         self.encBIn = MLXArray.zeros([hiddenDim])
+        self.encFeatProj = Linear(weight: MLXArray.zeros([hiddenDim, FrameMelWeights.prosodicFeatureCount]), bias: nil)
         self.encConv0 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
         self.encConv1 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
         self.encConv2 = Conv1d(inputChannels: hiddenDim, outputChannels: hiddenDim, kernelSize: 3, stride: 1, padding: 1)
@@ -122,6 +125,16 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
         embedNext.update(parameters: pEmbNext)
 
         self.encBIn = MLXArray(weights.encBIn, [256])
+
+        let featCount = FrameMelWeights.prosodicFeatureCount
+        var pFeat = ModuleParameters()
+        switch weights.encWFeat {
+        case .some(let w) where w.count == 256 * featCount:
+            pFeat[unwrapping: "weight"] = MLXArray(w, [256, featCount])
+        default:
+            pFeat[unwrapping: "weight"] = MLXArray.zeros([256, featCount])
+        }
+        encFeatProj.update(parameters: pFeat)
 
         updateConv(encConv0, w: weights.encWConv[0], b: weights.encBConv[0], inC: 256, outC: 256, k: 3)
         updateConv(encConv1, w: weights.encWConv[1], b: weights.encBConv[1], inC: 256, outC: 256, k: 3)
@@ -259,14 +272,33 @@ public final class MLXFrameMelModel: Module, @unchecked Sendable {
             resW1: rw1,
             resB1: rb1,
             resW2: rw2,
-            resB2: rb2
+            resB2: rb2,
+            encWFeat: getArr(encFeatProj.weight)
         )
     }
 
     /// 音素エンコーダ順伝播: [1, P] -> [1, P, 256]
-    public func forwardEncoder(cur: MLXArray, prev: MLXArray, next: MLXArray) -> MLXArray {
+    /// - Parameter feat: 韻律位置特徴 [1, P, prosodicFeatureCount]（nil の場合は加算しない）
+    public func forwardEncoder(cur: MLXArray, prev: MLXArray, next: MLXArray, feat: MLXArray? = nil) -> MLXArray {
         let lrelu = LeakyReLU(negativeSlope: 0.1)
         var h = embedCur(cur) + embedPrev(prev) + embedNext(next) + encBIn.reshaped([1, 1, 256])
+        // 特徴が渡されない場合も音素 ID 列から算出して加算し、Pure Swift 推論（常に加算）と数値一致を保つ
+        let effectiveFeat: MLXArray
+        switch feat {
+        case .some(let f):
+            effectiveFeat = f
+        case .none:
+            let ids = cur.reshaped([-1]).asArray(Int32.self)
+            let featCount = FrameMelWeights.prosodicFeatureCount
+            let rows = FrameMelModel.prosodicFeatures(phoneIds: ids)
+            var flat = [Float]()
+            flat.reserveCapacity(ids.count * featCount)
+            for row in rows {
+                flat.append(contentsOf: row)
+            }
+            effectiveFeat = MLXArray(flat, [1, ids.count, featCount])
+        }
+        h = h + encFeatProj(effectiveFeat)
         h = h + lrelu(encConv0(h))
         h = h + lrelu(encConv1(h))
         h = h + lrelu(encConv2(h))

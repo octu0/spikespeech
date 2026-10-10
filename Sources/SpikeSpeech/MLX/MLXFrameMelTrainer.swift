@@ -105,7 +105,8 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         targetDurations: [Int],
         targetMel: [[Float]],
         targetF0: [Float],
-        targetEnergy: [Float]
+        targetEnergy: [Float],
+        phoneAccent: [[Float]] = []
     ) -> FrameMelLosses {
         return runSample(
             phoneIds: phoneIds,
@@ -113,6 +114,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             targetMel: targetMel,
             targetF0: targetF0,
             targetEnergy: targetEnergy,
+            phoneAccent: phoneAccent,
             update: true
         )
     }
@@ -125,7 +127,8 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         targetDurations: [Int],
         targetMel: [[Float]],
         targetF0: [Float],
-        targetEnergy: [Float]
+        targetEnergy: [Float],
+        phoneAccent: [[Float]] = []
     ) -> FrameMelLosses {
         return runSample(
             phoneIds: phoneIds,
@@ -133,6 +136,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             targetMel: targetMel,
             targetF0: targetF0,
             targetEnergy: targetEnergy,
+            phoneAccent: phoneAccent,
             update: false
         )
     }
@@ -153,6 +157,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         targetMel: [[Float]],
         targetF0: [Float],
         targetEnergy: [Float],
+        phoneAccent: [[Float]],
         update: Bool
     ) -> FrameMelLosses {
         let phoneCount = phoneIds.count
@@ -247,6 +252,14 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let curArr = MLXArray(curP, [1, phoneCount])
         let prevArr = MLXArray(prevP, [1, phoneCount])
         let nextArr = MLXArray(nextP, [1, phoneCount])
+        let featCount = FrameMelWeights.prosodicFeatureCount
+        let featRows = FrameMelModel.prosodicFeatures(phoneIds: phoneIds, accent: phoneAccent)
+        var featFlat = [Float]()
+        featFlat.reserveCapacity(phoneCount * featCount)
+        for row in featRows {
+            featFlat.append(contentsOf: row)
+        }
+        let featArr = MLXArray(featFlat, [1, phoneCount, featCount])
         let targetDurArr = MLXArray(targetDurations.map { Float($0) }, [1, phoneCount])
         let gatherArr = MLXArray(gatherIndices)
         let posArr = MLXArray(pos, [totalFrames, 1])
@@ -298,7 +311,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         }
         let lossFn: (MLXFrameMelModel) -> [MLXArray] = { (m: MLXFrameMelModel) -> [MLXArray] in
             // 1. 音素エンコーダ
-            let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr)
+            let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr, feat: featArr)
 
             // 2. 継続時間予測
             let predDur = m.forwardDuration(encStates: encStates)
@@ -379,7 +392,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let targF0Std = sqrt(sum(square((targetF0Batch - targF0Mean) * voicedArr)) / voicedCount + MLXArray(Float(1e-6)))
             let f0StdLoss = abs(predF0Std - targF0Std)
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + ((gvLoss + channelMeanLoss) * MLXArray(gvWeight)) + (f0StdLoss * MLXArray(Float(1.0)))
+            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + ((gvLoss + channelMeanLoss) * MLXArray(gvWeight)) + (f0StdLoss * MLXArray(Float(0.2)))
             return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, allFrameDeltaLoss]
         }
 

@@ -50,6 +50,18 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
     public let resW2: [Float]?         // [64 * 1 * 256]
     public let resB2: [Float]?         // [64]
 
+    // 6. 韻律位置特徴の射影 (Prosodic position features -> encoder)
+    // なぜ音素エンコーダに位置特徴を足すか:
+    // エンコーダは前後 4 音素の文脈しか見られず、文中の位置や句（ポーズ区切り）内の位置を知らないため、
+    // 文頭の高さ・句末の下降・文全体の自然下降（declination）を F0 予測器が学習できず、
+    // 予測 F0 が教師との相関 0.25・標準偏差 1/2 のほぼ定数になっていた。
+    // 音素 ID 列だけから決まる位置特徴（prosodicFeatureCount 次元）を線形射影して埋め込みに加える。
+    // nil（旧重み）の場合はゼロ射影として扱い、ウォームスタートを壊さない。
+    public let encWFeat: [Float]?      // [256 * prosodicFeatureCount]
+
+    /// 位置特徴 5 次元 + アクセント特徴 3 次元（モーラ高低、アクセント句内位置、アクセント核）
+    public static let prosodicFeatureCount: Int = 8
+
     public init(
         embedCur: [Float],
         embedPrev: [Float],
@@ -80,7 +92,8 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
         resW1: [Float]? = nil,
         resB1: [Float]? = nil,
         resW2: [Float]? = nil,
-        resB2: [Float]? = nil
+        resB2: [Float]? = nil,
+        encWFeat: [Float]? = nil
     ) {
         self.embedCur = embedCur
         self.embedPrev = embedPrev
@@ -112,6 +125,7 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
         self.resB1 = resB1
         self.resW2 = resW2
         self.resB2 = resB2
+        self.encWFeat = encWFeat
     }
 
     /// 残差重みを追加・更新した新しいインスタンスを生成
@@ -151,7 +165,8 @@ public struct FrameMelWeights: Sendable, Codable, Equatable {
             resW1: resW1,
             resB1: resB1,
             resW2: resW2,
-            resB2: resB2
+            resB2: resB2,
+            encWFeat: self.encWFeat
         )
     }
 

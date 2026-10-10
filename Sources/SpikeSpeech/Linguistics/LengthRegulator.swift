@@ -392,15 +392,23 @@ public final class LengthRegulator: Sendable {
         // 5. フラットな音素列と Duration 列の抽出（各音素平均の絶対長をそのまま反映）
         var phoneIds: [Int32] = []
         var durations: [Int32] = []
+        var phoneAccent: [[Float]] = []
 
         var pListIdx = 0
         while pListIdx < phrases.count {
             let phrase = phrases[pListIdx]
+            let moraCount = max(1, phrase.moras.count)
+            var moraIdx = 0
             for mora in phrase.moras {
+                let toneVal: Float = (mora.tone == .high) ? 1.0 : 0.0
+                let posVal: Float = Float(moraIdx) / Float(moraCount)
+                let kernelVal: Float = mora.isAccentKernel ? 1.0 : 0.0
                 for phoneme in mora.phonemes {
                     phoneIds.append(Int32(phoneme.id))
                     durations.append(Int32(phoneme.durationFrames))
+                    phoneAccent.append([toneVal, posVal, kernelVal])
                 }
+                moraIdx += 1
             }
             pListIdx += 1
         }
@@ -590,13 +598,18 @@ public final class LengthRegulator: Sendable {
             newEnergy.append(contentsOf: baseEnergyContour)
             newEnergy.append(contentsOf: [Float](repeating: 0.0, count: trailSil))
 
+            var newAccent: [[Float]] = [[0.0, 0.0, 0.0]]
+            newAccent.append(contentsOf: phoneAccent)
+            newAccent.append([0.0, 0.0, 0.0])
+
             return LinguisticFeatures(
                 phoneIds: newPhoneIds,
                 durations: newDurations,
                 f0Contour: newF0,
                 voicedFlags: newVoiced,
                 energyContour: newEnergy,
-                totalFrames: newTotalFrames
+                totalFrames: newTotalFrames,
+                phoneAccent: newAccent
             )
         }
 
@@ -606,7 +619,8 @@ public final class LengthRegulator: Sendable {
             f0Contour: f0Contour,
             voicedFlags: voicedFlags,
             energyContour: baseEnergyContour,
-            totalFrames: totalFrames
+            totalFrames: totalFrames,
+            phoneAccent: phoneAccent
         )
     }
 }

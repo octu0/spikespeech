@@ -173,14 +173,110 @@ public final class FrameMelModel: @unchecked Sendable {
         }
     }
 
+    /// 音素 ID 列だけから決まる韻律位置特徴を算出する（音素ごとに prosodicFeatureCount 次元）
+    ///
+    /// 学習時と推論時で同じ入力（音素 ID 列）から同じ値が得られるため、追加のアノテーションを要しない。
+    /// - 0: 発話内の音素位置 (0..1)
+    /// - 1: 発話内のモーラ位置 (0..1)
+    /// - 2: ポーズ区切り句内のモーラ位置 (0..1)
+    /// - 3: 句のモーラ数 / 20 (0..1 にクリップ)
+    /// - 4: 句の通し番号 / 句数 (0..1)
+    /// - 5: モーラ高低 (1=高) ※ accent が与えられた場合
+    /// - 6: アクセント句内のモーラ位置 (0..1) ※ accent が与えられた場合
+    /// - 7: アクセント核 (1=核) ※ accent が与えられた場合
+    public static func prosodicFeatures(phoneIds: [Int32], accent: [[Float]] = []) -> [[Float]] {
+        let featCount = FrameMelWeights.prosodicFeatureCount
+        let n = phoneIds.count
+        if n <= 0 {
+            return []
+        }
+        func isBoundary(_ pid: Int) -> Bool {
+            return pid == PhonemeVocabulary.silId || pid == PhonemeVocabulary.pauId
+        }
+        // 句分割（境界音素は直前の句に属させず、単独で前句終端として扱う）
+        var segmentIndex = [Int](repeating: 0, count: n)
+        var segmentCount = 0
+        var inSegment = false
+        var i = 0
+        while i < n {
+            let pid = Int(phoneIds[i])
+            if isBoundary(pid) {
+                if inSegment {
+                    segmentCount += 1
+                    inSegment = false
+                }
+                segmentIndex[i] = max(0, segmentCount - 1)
+            } else {
+                if inSegment != true {
+                    inSegment = true
+                }
+                segmentIndex[i] = segmentCount
+            }
+            i += 1
+        }
+        if inSegment {
+            segmentCount += 1
+        }
+        let totalSegments = max(1, segmentCount)
+        // モーラ数（発話全体・句ごと）
+        var totalMoras = 0
+        var segMoraCount = [Int](repeating: 0, count: totalSegments)
+        i = 0
+        while i < n {
+            let pid = Int(phoneIds[i])
+            if PhonemeVocabulary.isVowelOrSpecialMora(phoneId: pid) {
+                totalMoras += 1
+                let sIdx = min(totalSegments - 1, segmentIndex[i])
+                segMoraCount[sIdx] += 1
+            }
+            i += 1
+        }
+        var feats = [[Float]](repeating: [Float](repeating: 0.0, count: featCount), count: n)
+        var moraSoFar = 0
+        var segMoraSoFar = 0
+        var currentSeg = -1
+        i = 0
+        while i < n {
+            let pid = Int(phoneIds[i])
+            let sIdx = min(totalSegments - 1, segmentIndex[i])
+            if sIdx != currentSeg {
+                currentSeg = sIdx
+                segMoraSoFar = 0
+            }
+            let segMoras = max(1, segMoraCount[sIdx])
+            feats[i][0] = Float(i) / Float(max(1, n - 1))
+            feats[i][1] = Float(moraSoFar) / Float(max(1, totalMoras))
+            feats[i][2] = Float(segMoraSoFar) / Float(segMoras)
+            feats[i][3] = min(1.0, Float(segMoras) / 20.0)
+            feats[i][4] = Float(sIdx) / Float(max(1, totalSegments - 1 == 0 ? 1 : totalSegments - 1))
+            if accent.count == n && 3 <= accent[i].count {
+                feats[i][5] = accent[i][0]
+                feats[i][6] = accent[i][1]
+                feats[i][7] = accent[i][2]
+            }
+            if PhonemeVocabulary.isVowelOrSpecialMora(phoneId: pid) {
+                moraSoFar += 1
+                segMoraSoFar += 1
+            }
+            i += 1
+        }
+        return feats
+    }
+
     /// 音素系列からエンコーダ特徴量を生成する（音素単位、4層時間畳み込み）
-    public func encodePhonemes(phoneIds: [Int32]) -> [[Float]] {
+    public func encodePhonemes(phoneIds: [Int32], accent: [[Float]] = []) -> [[Float]] {
         let phoneCount = phoneIds.count
         if phoneCount <= 0 {
             return []
         }
         let hiddenDim = 256
         let vocabSize = 64
+        let featCount = FrameMelWeights.prosodicFeatureCount
+        let feats = Self.prosodicFeatures(phoneIds: phoneIds, accent: accent)
+        var featW: [Float]? = nil
+        if let w = weights.encWFeat, w.count == hiddenDim * featCount {
+            featW = w
+        }
 
         // 埋め込みベクトルの加算
         var encStates = [Float](repeating: 0.0, count: phoneCount * hiddenDim)
@@ -212,7 +308,15 @@ public final class FrameMelModel: @unchecked Sendable {
 
             var h = 0
             while h < hiddenDim {
-                let v = weights.embedCur[curRow + h] + weights.embedPrev[prevRow + h] + weights.embedNext[nextRow + h] + weights.encBIn[h]
+                var v = weights.embedCur[curRow + h] + weights.embedPrev[prevRow + h] + weights.embedNext[nextRow + h] + weights.encBIn[h]
+                if let fw = featW {
+                    let wRow = h * featCount
+                    var k = 0
+                    while k < featCount {
+                        v += fw[wRow + k] * feats[p][k]
+                        k += 1
+                    }
+                }
                 encStates[pRow + h] = v
                 h += 1
             }
@@ -655,8 +759,8 @@ public final class FrameMelModel: @unchecked Sendable {
             return ([], [], [], [], [])
         }
 
-        // 1. 音素エンコーダ
-        let encStates = encodePhonemes(phoneIds: phoneIds)
+        // 1. 音素エンコーダ（アクセント特徴付き）
+        let encStates = encodePhonemes(phoneIds: phoneIds, accent: linguisticFeatures.phoneAccent)
 
         // 2. 継続時間予測
         let rawDurs = predictDurations(encStates: encStates)

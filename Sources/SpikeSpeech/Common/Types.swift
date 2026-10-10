@@ -146,6 +146,10 @@ public struct LinguisticFeatures: Sendable, Equatable {
     public let voicedFlags: [Float]
     public let energyContour: [Float]
     public let totalFrames: Int
+    /// 音素ごとのアクセント特徴 [phoneCount][3]: モーラ高低 (1=高), アクセント句内モーラ位置 (0..1), アクセント核 (1=核)
+    /// なぜ音素列に添えるか: 形態素解析とアクセント句構築が持つ高低情報を音響モデルの入力へ渡し、
+    /// 位置特徴だけでは決まらない「どのモーラで上がり下がるか」を学習させるため。空配列は情報なしを表す。
+    public let phoneAccent: [[Float]]
 
     public init(
         phoneIds: [Int32],
@@ -153,7 +157,8 @@ public struct LinguisticFeatures: Sendable, Equatable {
         f0Contour: [Float],
         voicedFlags: [Float],
         energyContour: [Float] = [],
-        totalFrames: Int
+        totalFrames: Int,
+        phoneAccent: [[Float]] = []
     ) {
         self.phoneIds = phoneIds
         self.durations = durations
@@ -161,6 +166,7 @@ public struct LinguisticFeatures: Sendable, Equatable {
         self.voicedFlags = voicedFlags
         self.energyContour = energyContour
         self.totalFrames = totalFrames
+        self.phoneAccent = phoneAccent
     }
 }
 

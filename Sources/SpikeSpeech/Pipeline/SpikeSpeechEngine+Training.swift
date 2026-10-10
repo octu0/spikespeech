@@ -885,13 +885,7 @@ extension SpikeSpeechEngine {
         melExtractor: MelSpectrogramExtractor,
         pitchTracker: PitchTracker,
         alignment: UtteranceAlignment? = nil
-    ) -> (
-        phoneIds: [Int32],
-        targetDurations: [Int],
-        targetMel: [[Float]],
-        targetF0: [Float],
-        targetEnergy: [Float]
-    )? {
+    ) -> FrameMelTrainingSample? {
         if pcm16k.isEmpty {
             return nil
         }
@@ -1143,7 +1137,18 @@ extension SpikeSpeechEngine {
             targetDurations: targetDurations,
             targetMel: targetMel,
             targetF0: targetF0,
-            targetEnergy: targetEnergy
+            targetEnergy: targetEnergy,
+            phoneAccent: linguisticFeatures.phoneAccent
         )
     }
 }
+
+/// FrameMel 学習サンプル（教師強制用の音素列・継続時間・対数メル・F0・エネルギー・アクセント特徴）
+public typealias FrameMelTrainingSample = (
+    phoneIds: [Int32],
+    targetDurations: [Int],
+    targetMel: [[Float]],
+    targetF0: [Float],
+    targetEnergy: [Float],
+    phoneAccent: [[Float]]
+)
