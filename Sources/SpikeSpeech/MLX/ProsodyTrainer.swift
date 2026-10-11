@@ -259,7 +259,7 @@ public final class MLXProsodyTrainer {
         let lossVal = lossVals[0].item(Float.self)
         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
         durationOptimizer.update(model: durationModel, gradients: clippedGrads)
-        eval(durationModel.trainableParameters())
+        eval(durationModel, durationOptimizer)
 
         return lossVal
     }
@@ -315,7 +315,7 @@ public final class MLXProsodyTrainer {
         // F0 MAE の収束が著しく遅延するため、適切なステップ幅を確保するため。
         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 10.0)
         f0Optimizer.update(model: f0Model, gradients: clippedGrads)
-        eval(f0Model.trainableParameters())
+        eval(f0Model, f0Optimizer)
         eval(f0Model.wConv)
 
         // 評価指標として実測有声 F0 MAE (Hz) を計算して返却

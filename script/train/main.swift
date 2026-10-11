@@ -1264,7 +1264,9 @@ func main() {
                                         epochLossSum += lossVal
                                         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
                                         vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
-                                        eval(vocoder.trainableParameters(), lossVal)
+                                        // なぜ optimizer も評価するか: Adam の state.step は biasCorrection 無効時に更新式へ現れず、
+                                        // 評価されないまま毎バッチ lazy な加算ノードが連鎖し Metal リソース上限（499000）で落ちるため。
+                                        eval(vocoder, vocoderOptimizer)
                                         Stream.gpu.synchronize()
                                     }
 
@@ -1295,7 +1297,9 @@ func main() {
                         epochLossSum += lossVal
                         let (clippedGrads, _) = clipGradNorm(gradients: grads, maxNorm: 1.0)
                         vocoderOptimizer.update(model: vocoder, gradients: clippedGrads)
-                        eval(vocoder.trainableParameters(), lossVal)
+                        // なぜ optimizer も評価するか: Adam の state.step は biasCorrection 無効時に更新式へ現れず、
+                        // 評価されないまま毎バッチ lazy な加算ノードが連鎖し Metal リソース上限（499000）で落ちるため。
+                        eval(vocoder, vocoderOptimizer)
                         Stream.gpu.synchronize()
                     }
 
@@ -1306,7 +1310,7 @@ func main() {
                     currBatchItems = 0
                 }
 
-                eval(vocoder.trainableParameters())
+                eval(vocoder, vocoderOptimizer)
                 Stream.gpu.synchronize()
                 Memory.clearCache()
 
@@ -1316,6 +1320,17 @@ func main() {
                 }
                 print("  [Vocoder Epoch \(vEpoch + 1)/\(vocoderEpochs)] 平均STFT損失: \(String(format: "%.6f", avgVLoss)) (バッチ数: \(vBatchCount))")
                 vEpoch += 1
+
+                // エポックごとに保存（途中で落ちても直前エポックまでの学習結果を失わないため）
+                if vEpoch < vocoderEpochs {
+                    do {
+                        let encoded = try JSONEncoder().encode(vocoder.exportWeights())
+                        try encoded.write(to: vocoderURL, options: .atomic)
+                        print("  ニューラルボコーダー重みを途中保存しました: \(vocoderURL.path)")
+                    } catch {
+                        print("  警告: ニューラルボコーダー重みの途中保存に失敗しました: \(error)")
+                    }
+                }
             }
 
             let trainedWeights = vocoder.exportWeights()
