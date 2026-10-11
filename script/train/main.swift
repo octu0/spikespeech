@@ -33,6 +33,8 @@ func main() {
     var vocoderLearningRate: Float = 0.0003
     /// 励振経路の初期値（負なら自動: 既存の励振重みが未学習相当なら 0.5 を与える）
     var vocoderExcInit: Float = -1.0
+    /// 教師 F0 からのアクセント核学習（--no-accent-learning で無効化）
+    var accentLearningEnabled: Bool = true
     var waveformLossWeight: Float = 0.15
     var residualLossWeight: Float = 3.0
     var prosodyEpochs: Int = 15
@@ -150,6 +152,8 @@ func main() {
                 }
                 i += 1
             }
+        case "--no-accent-learning":
+            accentLearningEnabled = false
         case "--vocoder-exc-init":
             let nextIdx = i + 1
             if nextIdx < args.count {
@@ -1494,6 +1498,195 @@ func main() {
                     print("ニューラルボコーダー初期重みをエクスポートしました: \(vocoderURL.path) (\(encoded.count) バイト)")
                 }
             }
+        }
+    }
+
+    // アクセント核のデータ駆動学習:
+    // 獲得語彙は核 0（平板）で登録されるため、教師 F0 のモーラ別形状からアクセント句ごとの核を推定し、
+    // 句頭形態素（獲得語彙）の核へ投票で反映する。基本語彙（手作業）は変更せず一致率だけ報告する。
+    if accentLearningEnabled && useFrameMel && frameMelSamples.isEmpty != true && frameMelSamples.count == frameMelTexts.count {
+        var accentLearning = AccentLearning()
+        var accentPhrases = 0
+        var accentVotes = 0
+        var accentAbstain = 0
+        var accentMismatch = 0
+        func phraseInitialMorphemes(_ morphemes: [Morpheme]) -> [(surface: String, moraCount: Int)] {
+            // ProsodyModel.buildAccentPhrases と同じ句切り規則で、各句の句頭形態素を求める
+            var result: [(surface: String, moraCount: Int)] = []
+            var currentEmpty = true
+            var current: (surface: String, moraCount: Int)? = nil
+            for m in morphemes {
+                if m.pos == .symbol {
+                    if currentEmpty != true, let c = current {
+                        result.append(c)
+                    }
+                    currentEmpty = true
+                    current = nil
+                    continue
+                }
+                var startsNew = false
+                switch m.pos {
+                case .noun, .verb, .adjective, .conjunction, .interjection:
+                    if currentEmpty != true {
+                        startsNew = true
+                    }
+                default:
+                    break
+                }
+                if startsNew, let c = current {
+                    result.append(c)
+                    currentEmpty = true
+                    current = nil
+                }
+                let moraCount = engine.vocabulary.kanaToMoras(m.reading).count
+                if currentEmpty {
+                    current = (surface: m.surface, moraCount: moraCount)
+                }
+                if 0 < moraCount {
+                    currentEmpty = false
+                }
+            }
+            if currentEmpty != true, let c = current {
+                result.append(c)
+            }
+            return result
+        }
+        var sIdx = 0
+        while sIdx < frameMelSamples.count {
+            let smp = frameMelSamples[sIdx]
+            let text = frameMelTexts[sIdx]
+            let morphemes = engine.normalizer.normalize(text: text)
+            let phrases = engine.prosodyModel.buildAccentPhrases(morphemes: morphemes, vocabulary: engine.vocabulary)
+            let initials = phraseInitialMorphemes(morphemes)
+            var bodyIds: [Int32] = []
+            for ph in phrases {
+                for mora in ph.moras {
+                    for p in mora.phonemes {
+                        bodyIds.append(Int32(p.id))
+                    }
+                }
+            }
+            var consistent = (bodyIds.count + 2 == smp.phoneIds.count) && (initials.count == phrases.count) && (smp.targetDurations.count == smp.phoneIds.count)
+            if consistent {
+                var k = 0
+                while k < bodyIds.count {
+                    if bodyIds[k] != smp.phoneIds[k + 1] {
+                        consistent = false
+                        break
+                    }
+                    k += 1
+                }
+            }
+            if consistent != true {
+                accentMismatch += 1
+                sIdx += 1
+                continue
+            }
+            var frameCursor = smp.targetDurations[0]
+            var phCursor = 1
+            var pIdx = 0
+            while pIdx < phrases.count {
+                let phrase = phrases[pIdx]
+                var moraSamples: [AccentEstimator.MoraSample] = []
+                for mora in phrase.moras {
+                    // 母音部（モーラ最後の音素）の F0 中央値。子音部は直後の F0 を上げる等の微細変動が大きいので使わない。
+                    var vowelF0: [Float] = []
+                    var phIdxInMora = 0
+                    for _ in mora.phonemes {
+                        let dur = smp.targetDurations[phCursor]
+                        if phIdxInMora == mora.phonemes.count - 1 {
+                            var f = frameCursor
+                            while f < frameCursor + dur && f < smp.targetF0.count {
+                                if 0.0 < smp.targetF0[f] {
+                                    vowelF0.append(smp.targetF0[f])
+                                }
+                                f += 1
+                            }
+                        }
+                        frameCursor += dur
+                        phCursor += 1
+                        phIdxInMora += 1
+                    }
+                    if vowelF0.isEmpty {
+                        moraSamples.append(AccentEstimator.MoraSample(semitone: nil, voicedFrames: 0))
+                    } else {
+                        vowelF0.sort()
+                        moraSamples.append(AccentEstimator.MoraSample(semitone: 12.0 * log2(vowelF0[vowelF0.count / 2]), voicedFrames: vowelF0.count))
+                    }
+                }
+                accentPhrases += 1
+                let isFinal = phrase.pauseAfter || pIdx == phrases.count - 1
+                let verdict = AccentEstimator.estimateKernel(moras: moraSamples, excludeFinalMora: isFinal)
+                switch verdict {
+                case .kernel(let k, let conf):
+                    let initial = initials[pIdx]
+                    if k <= initial.moraCount && 0 < initial.moraCount {
+                        accentLearning.record(surface: initial.surface, kernel: k, confidence: conf)
+                        accentVotes += 1
+                    } else {
+                        accentAbstain += 1
+                    }
+                case .abstain:
+                    accentAbstain += 1
+                }
+                pIdx += 1
+            }
+            sIdx += 1
+        }
+        let applied = accentLearning.apply(to: weights.lexicon)
+        print("アクセント核の学習: 句 \(accentPhrases) 件、投票 \(accentVotes) 件、保留 \(accentAbstain) 件、音素列不一致で除外 \(accentMismatch) 文。語彙更新 \(applied.updated) 語（核が変化 \(applied.changed) 語）。")
+        for o in applied.overridden {
+            print("  既存の核を話者の実現形で上書き: \(o.surface) 核\(o.from) → 核\(o.to)（\(o.votes) 票）")
+        }
+        // 投票の一貫性（3 票以上の語で勝者票の割合）: ラベル品質の目安
+        var consistencySum: Float = 0.0
+        var consistencyCount = 0
+        for (_, tally) in accentLearning.tallies where 3 <= tally.votes {
+            if let w = tally.winner() {
+                consistencySum += w.share
+                consistencyCount += 1
+            }
+        }
+        if 0 < consistencyCount {
+            print(String(format: "  投票の一貫性: 3 票以上の語 %d 語で勝者票率の平均 %.2f", consistencyCount, consistencySum / Float(consistencyCount)))
+        }
+        let hist = AccentLearning.kernelHistogram(applied.lexicon)
+        print("  語彙の核分布: " + hist.keys.sorted().map { "核\($0)=\(hist[$0] ?? 0)" }.joined(separator: " "))
+        if 0 < applied.changed {
+            weights = weights.withLexicon(applied.lexicon)
+            let accentEngine = SpikeSpeechEngine(weights: weights)
+            var refreshed = 0
+            var refreshFailed = 0
+            var rIdx = 0
+            while rIdx < frameMelSamples.count {
+                let smp = frameMelSamples[rIdx]
+                let lf = accentEngine.lengthRegulator.processText(
+                    text: frameMelTexts[rIdx],
+                    normalizer: accentEngine.normalizer,
+                    prosodyModel: accentEngine.prosodyModel,
+                    vocabulary: accentEngine.vocabulary,
+                    prosodyPredictor: accentEngine.prosodyPredictor,
+                    speedFactor: 1.0,
+                    baseF0: VoiceProfile.default.baseF0,
+                    addBoundarySilence: true,
+                    meanFramesPerMora: VoiceProfile.default.meanFramesPerMora
+                )
+                if lf.phoneIds == smp.phoneIds && lf.phoneAccent.count == smp.phoneIds.count {
+                    frameMelSamples[rIdx] = (
+                        phoneIds: smp.phoneIds,
+                        targetDurations: smp.targetDurations,
+                        targetMel: smp.targetMel,
+                        targetF0: smp.targetF0,
+                        targetEnergy: smp.targetEnergy,
+                        phoneAccent: lf.phoneAccent
+                    )
+                    refreshed += 1
+                } else {
+                    refreshFailed += 1
+                }
+                rIdx += 1
+            }
+            print("  学習サンプルのアクセント特徴を再計算しました: \(refreshed) 件（音素列不一致 \(refreshFailed) 件は旧特徴のまま）。")
         }
     }
 

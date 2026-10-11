@@ -55,6 +55,9 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     /// 推論時にデコーダが見たことのない滑らかな条件を受けてメルがさらに平滑化していた。
     /// 予測値（勾配は遮断）でも教師メルを再現するよう学習させ、学習と推論の条件を近づける。
     public var conditionSamplingProbability: Float
+    /// F0 MSE の重み。なぜ重み付けするか: F0 は 1/500 で正規化されており、3 半音の誤差でも二乗値は 0.006 程度で
+    /// Mel L1（約 0.4）に埋もれて F0 予測が平均値へ退行する（アクセント形が出ない）ため。
+    public var f0LossWeight: Float
     /// 大域分散（各メルチャネルの時間方向標準偏差）一致損失の係数
     public var globalVarianceWeight: Float
     private var rngState: UInt64
@@ -76,9 +79,11 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         allFrameDeltaWeight: Float = 1.0,
         conditionSamplingProbability: Float = 0.5,
         globalVarianceWeight: Float = 1.0,
+        f0LossWeight: Float = 20.0,
         seed: UInt64 = 2026
     ) {
         self.model = model
+        self.f0LossWeight = f0LossWeight
         self.optimizer = Adam(learningRate: learningRate)
         self.deltaLossWeight = deltaLossWeight
         self.allFrameDeltaWeight = allFrameDeltaWeight
@@ -415,6 +420,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let dWeight = self.deltaLossWeight
         let allDeltaWeight = self.allFrameDeltaWeight
         let gvWeight = self.globalVarianceWeight
+        let f0Weight = self.f0LossWeight
         var useSampledCondition = false
         if update && 0.0 < conditionSamplingProbability {
             if nextUniform() < conditionSamplingProbability {
@@ -504,7 +510,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             let targF0Std = sqrt(sum(square((targetF0Batch - targF0Mean) * voicedArr)) / voicedCount + MLXArray(Float(1e-6)))
             let f0StdLoss = abs(predF0Std - targF0Std)
 
-            let totalLoss = decLoss + postLoss + f0Loss + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + ((gvLoss + channelMeanLoss) * MLXArray(gvWeight)) + (f0StdLoss * MLXArray(Float(0.2)))
+            let totalLoss = decLoss + postLoss + (f0Loss * MLXArray(f0Weight)) + energyLoss + durLoss + (deltaLoss * MLXArray(dWeight)) + (allFrameDeltaLoss * MLXArray(allDeltaWeight)) + ((gvLoss + channelMeanLoss) * MLXArray(gvWeight)) + (f0StdLoss * MLXArray(Float(0.2)))
             return [totalLoss, decLoss, postLoss, f0Loss, energyLoss, durLoss, allFrameDeltaLoss]
         }
 
