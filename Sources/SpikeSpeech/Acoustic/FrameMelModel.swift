@@ -922,6 +922,10 @@ public final class FrameMelModel: @unchecked Sendable {
                 f += 1
             }
         }
+        // 予測 F0 はフレーム独立の回帰値で、音素境界（特に子音と母音の間）で 2〜5 半音の段差を持つ。
+        // ボコーダが F0 入力に追従するようになったため、この段差が 10 ms 周期のピッチの震えとして聞こえる。
+        // 有声の連続区間内で中央値フィルタ＋三角窓平滑化（対数領域）を掛け、声帯の物理的な連続性に合わせる。
+        predF0Norm = Self.smoothF0Contour(predF0Norm, voicedFlags: voicedFlags)
 
         // 6. デコーダ条件付けベクトルの構築 (260 次元)
         // [H_frame (256), F0 (1), deltaF0 (1), Energy (1), pos (1)]
@@ -1026,6 +1030,69 @@ public final class FrameMelModel: @unchecked Sendable {
     /// 2層時間畳み込みによるメル残差の計算（Pure Swift 実装）
     /// 入力: decoderCondition [totalFrames * 260]
     /// 出力: flatResidual [totalFrames * 64]
+    /// 有声連続区間内で F0 系列を平滑化する（中央値フィルタ半径 2 → 対数領域の三角窓平滑化半径 3）
+    /// 無声・無音フレーム（voicedFlags < 0.5 または F0 <= 0）は 0 のまま保ち、区間をまたいで混ぜない。
+    public static func smoothF0Contour(_ f0: [Float], voicedFlags: [Float], medianRadius: Int = 2, triangleRadius: Int = 3) -> [Float] {
+        let n = f0.count
+        if n == 0 {
+            return f0
+        }
+        var out = f0
+        var start = 0
+        while start < n {
+            let isVoiced = 0.0 < f0[start] && (start < voicedFlags.count ? 0.5 <= voicedFlags[start] : true)
+            if isVoiced != true {
+                out[start] = 0.0
+                start += 1
+                continue
+            }
+            var end = start
+            while end < n && 0.0 < f0[end] && (end < voicedFlags.count ? 0.5 <= voicedFlags[end] : true) {
+                end += 1
+            }
+            let len = end - start
+            if 3 <= len {
+                var logF0 = [Float](repeating: 0.0, count: len)
+                var i = 0
+                while i < len {
+                    logF0[i] = log(f0[start + i])
+                    i += 1
+                }
+                var med = logF0
+                if 0 < medianRadius {
+                    i = 0
+                    while i < len {
+                        let lo = max(0, i - medianRadius)
+                        let hi = min(len - 1, i + medianRadius)
+                        var window = Array(logF0[lo...hi])
+                        window.sort()
+                        med[i] = window[window.count / 2]
+                        i += 1
+                    }
+                }
+                i = 0
+                while i < len {
+                    var acc: Float = 0.0
+                    var wsum: Float = 0.0
+                    var d = -triangleRadius
+                    while d <= triangleRadius {
+                        let k = i + d
+                        if 0 <= k && k < len {
+                            let w = Float(triangleRadius + 1 - abs(d))
+                            acc += med[k] * w
+                            wsum += w
+                        }
+                        d += 1
+                    }
+                    out[start + i] = exp(acc / max(wsum, 1.0))
+                    i += 1
+                }
+            }
+            start = end
+        }
+        return out
+    }
+
     public func computeMelResidual(condition: [Float], totalFrames: Int) -> [Float]? {
         let inDim = 260
         let hiddenDim = 256

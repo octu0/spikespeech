@@ -150,6 +150,109 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         )
     }
 
+    /// 教師の継続時間で音響モデルを推論し、予測 Mel（PostNet 出力）と予測 F0・有声フラグを返す（GTA 用）
+    /// なぜ教師継続時間で予測メルを作るか:
+    /// ボコーダを「音響モデルが実際に出す平滑な予測メル」で学習させる（Ground-Truth-Aligned 学習）には、
+    /// 予測メルと教師波形がフレーム単位で一致している必要があるため。F0・エネルギー条件は推論と同じく予測値を用いる。
+    public func predictMel(
+        phoneIds: [Int32],
+        targetDurations: [Int],
+        phoneAccent: [[Float]] = []
+    ) -> (mel: [[Float]], f0: [Float], voiced: [Float])? {
+        let phoneCount = phoneIds.count
+        var totalFrames = 0
+        for d in targetDurations { totalFrames += max(0, d) }
+        if phoneCount < 3 || totalFrames <= 1 || targetDurations.count != phoneCount {
+            return nil
+        }
+        var curP = [Int32](repeating: 0, count: phoneCount)
+        var prevP = [Int32](repeating: 0, count: phoneCount)
+        var nextP = [Int32](repeating: 0, count: phoneCount)
+        var p = 0
+        while p < phoneCount {
+            curP[p] = phoneIds[p]
+            prevP[p] = 0 < p ? phoneIds[p - 1] : Int32(PhonemeVocabulary.silId)
+            nextP[p] = (p + 1) < phoneCount ? phoneIds[p + 1] : Int32(PhonemeVocabulary.silId)
+            p += 1
+        }
+        var gatherIndices = [Int32](repeating: 0, count: totalFrames)
+        var pos = [Float](repeating: 0.0, count: totalFrames)
+        var voicedFlags = [Float](repeating: 0.0, count: totalFrames)
+        let contextVoiced = PhonemeVocabulary.contextVoicedFlags(phoneIds: phoneIds)
+        var curF = 0
+        p = 0
+        while p < phoneCount {
+            let dur = max(0, targetDurations[p])
+            let maxF = Float(max(1, dur - 1))
+            var f = 0
+            while f < dur {
+                let fIdx = curF + f
+                if fIdx < totalFrames {
+                    gatherIndices[fIdx] = Int32(p)
+                    pos[fIdx] = Float(f) / maxF
+                    voicedFlags[fIdx] = contextVoiced[p] ? 1.0 : 0.0
+                }
+                f += 1
+            }
+            curF += dur
+            p += 1
+        }
+        let curArr = MLXArray(curP, [1, phoneCount])
+        let prevArr = MLXArray(prevP, [1, phoneCount])
+        let nextArr = MLXArray(nextP, [1, phoneCount])
+        let featCount = FrameMelWeights.prosodicFeatureCount
+        let featRows = FrameMelModel.prosodicFeatures(phoneIds: phoneIds, accent: phoneAccent)
+        var featFlat = [Float]()
+        featFlat.reserveCapacity(phoneCount * featCount)
+        for row in featRows { featFlat.append(contentsOf: row) }
+        let featArr = MLXArray(featFlat, [1, phoneCount, featCount])
+        let gatherArr = MLXArray(gatherIndices)
+        let posArr = MLXArray(pos, [totalFrames, 1])
+        let voicedArr = MLXArray(voicedFlags, [1, totalFrames, 1])
+
+        let m = self.model
+        let encStates = m.forwardEncoder(cur: curArr, prev: prevArr, next: nextArr, feat: featArr)
+        let encSqueezed = encStates.squeezed(axis: 0)
+        let hRep = take(encSqueezed, gatherArr, axis: 0)
+        let frameStates = concatenated([hRep, posArr], axis: -1).expandedDimensions(axis: 0)
+        let predF0Raw = m.forwardF0(frameStates: frameStates, voicedMask: voicedArr).squeezed(axis: 0) // [T, 1]
+        eval(predF0Raw)
+        // 推論（FrameMelModel.synthesizeMelAndF0）と同じ F0 平滑化を掛け、GTA のメル条件を推論時と揃える
+        let rawF0Values = predF0Raw.asArray(Float.self)
+        let smoothedF0Values = FrameMelModel.smoothF0Contour(rawF0Values.map { max(0.0, $0) }, voicedFlags: voicedFlags)
+        let predF0 = MLXArray(smoothedF0Values, [totalFrames, 1])
+        let predEnergy = m.forwardEnergy(frameStates: frameStates).squeezed(axis: 0)
+        let prevF0 = concatenated([MLXArray.zeros([1, 1]), predF0[0..<(totalFrames - 1), 0...]], axis: 0)
+        let bothVoiced = (predF0 .> MLXArray(Float(0.0))).asType(Float.self) * (prevF0 .> MLXArray(Float(0.0))).asType(Float.self)
+        let deltaF0 = clip((predF0 - prevF0) / MLXArray(Float(0.1)), min: -1.0, max: 1.0) * bothVoiced
+        let condition = concatenated([hRep, predF0, deltaF0, predEnergy, posArr], axis: -1).expandedDimensions(axis: 0)
+        let (_, postMel) = m.forwardDecoder(condition: condition)
+        let melFlat = postMel.squeezed(axis: 0)
+        eval(melFlat, predF0)
+        let melValues = melFlat.asArray(Float.self)
+        let f0Values = predF0.asArray(Float.self)
+        let channels = melFlat.dim(1)
+        if melValues.count != totalFrames * channels || f0Values.count != totalFrames {
+            return nil
+        }
+        var mel = [[Float]](repeating: [Float](repeating: 0.0, count: channels), count: totalFrames)
+        var t = 0
+        while t < totalFrames {
+            let base = t * channels
+            mel[t] = Array(melValues[base..<(base + channels)])
+            t += 1
+        }
+        var f0Hz = [Float](repeating: 0.0, count: totalFrames)
+        t = 0
+        while t < totalFrames {
+            if 0.5 <= voicedFlags[t] {
+                f0Hz[t] = max(0.0, f0Values[t]) * 500.0
+            }
+            t += 1
+        }
+        return (mel: mel, f0: f0Hz, voiced: voicedFlags)
+    }
+
     /// 決定論的な xorshift64 乱数（0.0 ..< 1.0）
     private func nextUniform() -> Float {
         var x = rngState

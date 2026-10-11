@@ -726,7 +726,18 @@ public final class NeuralVocoder: @unchecked Sendable {
                     if twoPi < phase {
                         phase -= twoPi
                     }
-                    value = 0.1 * sinf(phase) + 0.003 * nextNoise()
+                    // なぜ単一正弦波ではなく帯域制限パルス列（鋸歯状波: 倍音振幅 1/k）にするか:
+                    // 注入点以降の畳み込み（受容野 約 2 ms）は 1 周期（200 Hz で 5 ms）を見渡せず、
+                    // 正弦波から倍音を自力で作れないため励振が使われずに終わる（F0 入力を変えても出力ピッチが不変）。
+                    // 倍音を最初から含む励振なら、終段は局所的な整形（フィルタ）だけで調波構造を出せる。
+                    let maxHarmonic = max(1, Int((sampleRate * 0.45) / hz))
+                    var harmonicSum: Float = 0.0
+                    var k = 1
+                    while k <= maxHarmonic {
+                        harmonicSum += sinf(Float(k) * phase) / Float(k)
+                        k += 1
+                    }
+                    value = 0.25 * harmonicSum + 0.003 * nextNoise()
                 } else {
                     phase = 0.0
                     value = 0.03 * nextNoise()

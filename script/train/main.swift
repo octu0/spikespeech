@@ -31,6 +31,8 @@ func main() {
     var forceInitBOut: Bool = false
     var vocoderEpochs: Int = 5
     var vocoderLearningRate: Float = 0.0003
+    /// 励振経路の初期値（負なら自動: 既存の励振重みが未学習相当なら 0.5 を与える）
+    var vocoderExcInit: Float = -1.0
     var waveformLossWeight: Float = 0.15
     var residualLossWeight: Float = 3.0
     var prosodyEpochs: Int = 15
@@ -145,6 +147,14 @@ func main() {
             if nextIdx < args.count {
                 if let val = Float(args[nextIdx]) {
                     vocoderLearningRate = val
+                }
+                i += 1
+            }
+        case "--vocoder-exc-init":
+            let nextIdx = i + 1
+            if nextIdx < args.count {
+                if let val = Float(args[nextIdx]) {
+                    vocoderExcInit = val
                 }
                 i += 1
             }
@@ -837,6 +847,9 @@ func main() {
     var skippedFrameMelSamples = 0
     var reconTargetSample: (features: [[Float]], targets: [[Float]], targetAudio: [Float])? = nil
     var vocoderPairs: [(mel: [[Float]], f0: [Float], voiced: [Float], pcm: [Float])] = []
+    // GTA（Ground-Truth-Aligned）用: vocoderPairs[i] に対応する音響モデルの予測 Mel（FrameMel 経路のみ）
+    var gtaMels: [[[Float]]?] = []
+    let vocoderGTAProbability: Float = 0.5
     var prosodySamples: [ProsodyTrainingSample] = []
 
     print("コーパスパス: \(corpusDir)")
@@ -1116,6 +1129,69 @@ func main() {
     let outputDir = outputURL.deletingLastPathComponent().path
     let vocoderURL = WeightCheckpoint.resolvePath(directory: outputDir, fileName: "vocoder_weights.json")
 
+    /// ボコーダ学習用のメル平滑化オーグメンテーション（周波数方向 0〜4 bin、時間方向 0〜3 フレームの移動平均）
+    let vocoderMelSmoothProbability: Float = 0.7
+    func smoothMelForAugmentation(_ mel: [[Float]], probability: Float) -> [[Float]] {
+        if mel.isEmpty || probability <= Float.random(in: 0.0..<1.0) {
+            return mel
+        }
+        var freqRadius = Int.random(in: 0...4)
+        var timeRadius = Int.random(in: 0...3)
+        if freqRadius == 0 && timeRadius == 0 {
+            if Bool.random() { freqRadius = Int.random(in: 1...4) } else { timeRadius = Int.random(in: 1...3) }
+        }
+        let frames = mel.count
+        let channels = mel[0].count
+        var out = mel
+        if 0 < freqRadius {
+            var t = 0
+            while t < frames {
+                let row = out[t]
+                var c = 0
+                while c < channels {
+                    var sum: Float = 0.0
+                    var n: Float = 0.0
+                    var d = -freqRadius
+                    while d <= freqRadius {
+                        let k = c + d
+                        if 0 <= k && k < channels {
+                            sum += row[k]
+                            n += 1.0
+                        }
+                        d += 1
+                    }
+                    out[t][c] = sum / n
+                    c += 1
+                }
+                t += 1
+            }
+        }
+        if 0 < timeRadius {
+            let src = out
+            var t = 0
+            while t < frames {
+                var c = 0
+                while c < channels {
+                    var sum: Float = 0.0
+                    var n: Float = 0.0
+                    var d = -timeRadius
+                    while d <= timeRadius {
+                        let k = t + d
+                        if 0 <= k && k < frames {
+                            sum += src[k][c]
+                            n += 1.0
+                        }
+                        d += 1
+                    }
+                    out[t][c] = sum / n
+                    c += 1
+                }
+                t += 1
+            }
+        }
+        return out
+    }
+
     func runVocoderTraining() {
         if 0 < vocoderEpochs && vocoderPairs.isEmpty != true {
             print("--------------------------------------------------")
@@ -1140,6 +1216,24 @@ func main() {
                 }
             }
 
+            // 励振経路の初期化: 未学習相当（absmax < 0.05）なら中心タップ 0.5 で励振を通す
+            do {
+                let currentAbsMax = vocoder.excitationWeightAbsMax()
+                var seedValue: Float = 0.0
+                if vocoderExcInit < 0.0 {
+                    if currentAbsMax < 0.05 {
+                        seedValue = 0.5
+                    }
+                } else {
+                    seedValue = vocoderExcInit
+                }
+                if 0.0 < seedValue {
+                    vocoder.seedExcitationPath(centerTap: seedValue)
+                    print("励振経路を初期化しました（中心タップ \(seedValue)、従来の励振重み absmax \(String(format: "%.4f", currentAbsMax))）。")
+                } else {
+                    print("励振経路の重みは既存値を使用します（absmax \(String(format: "%.4f", currentAbsMax))）。")
+                }
+            }
             let vocoderOptimizer = Adam(learningRate: vocoderLearningRate)
             let segFrames = 32
             let hopSize = vocoder.config.hopSize
@@ -1205,20 +1299,50 @@ func main() {
                             let endSample = startSample + segSamples
 
                             if endSample <= pair.pcm.count {
+                                // 区間メルを取り出し、確率的に平滑化する。
+                                // なぜ平滑化するか: 教師メルには倍音の起伏（ピッチの手がかり）が残っており、
+                                // ボコーダはそれだけでピッチを復元できてしまい F0・励振入力を無視する
+                                // （F0 入力を 1.3 倍しても出力ピッチが不変、excWeight が 0.01 未満のまま）。
+                                // 音響モデルの予測メルは平滑でこの手がかりが無く、ボコーダはフレーム周期（100 Hz）の
+                                // パルス列を出してロボット声が二重に乗る。学習時に起伏を消した入力を混ぜることで、
+                                // 唯一一貫したピッチ源である励振を使うよう学習させる。
+                                var segMel = [[Float]](repeating: [Float](repeating: 0.0, count: melCh), count: segFrames)
+                                var sf = 0
+                                while sf < segFrames {
+                                    let frameMel = pair.mel[startF + sf]
+                                    let copyLimit = min(melCh, frameMel.count)
+                                    var c = 0
+                                    while c < copyLimit {
+                                        segMel[sf][c] = frameMel[c]
+                                        c += 1
+                                    }
+                                    sf += 1
+                                }
+                                var usedGTA = false
+                                if pairIdx < gtaMels.count, let gta = gtaMels[pairIdx], startF + segFrames <= gta.count {
+                                    if Float.random(in: 0.0..<1.0) < vocoderGTAProbability {
+                                        var gf = 0
+                                        while gf < segFrames {
+                                            let row = gta[startF + gf]
+                                            let copyLimit = min(melCh, row.count)
+                                            var c = 0
+                                            while c < copyLimit {
+                                                segMel[gf][c] = row[c]
+                                                c += 1
+                                            }
+                                            gf += 1
+                                        }
+                                        usedGTA = true
+                                    }
+                                }
+                                if usedGTA != true {
+                                    segMel = smoothMelForAugmentation(segMel, probability: vocoderMelSmoothProbability)
+                                }
+
                                 var f = 0
                                 while f < segFrames {
                                     let currF = startF + f
-                                    let frameMel = pair.mel[currF]
-                                    var c = 0
-                                    let copyLimit = min(melCh, frameMel.count)
-                                    while c < copyLimit {
-                                        batchFeats.append(frameMel[c])
-                                        c += 1
-                                    }
-                                    while c < melCh {
-                                        batchFeats.append(0.0)
-                                        c += 1
-                                    }
+                                    batchFeats.append(contentsOf: segMel[f])
                                     var normF0: Float = 0.0
                                     if currF < pair.f0.count {
                                         let val = pair.f0[currF]
@@ -1374,6 +1498,32 @@ func main() {
     }
 
     if useFrameMel {
+        // GTA: 学習済み音響モデルがあれば、教師継続時間で予測 Mel を作り、ボコーダ学習入力に混ぜる。
+        // なぜ必要か: 推論時のボコーダ入力は予測 Mel であり、教師 Mel だけで学習したボコーダは
+        // 平滑な予測 Mel に対してフレーム周期（100 Hz）のブザーを出す（ロボット声の二重化）ため。
+        if 0 < vocoderEpochs, let fmw = weights.frameMelWeights, frameMelSamples.count == vocoderPairs.count, vocoderPairs.isEmpty != true {
+            let gtaModel = MLXFrameMelModel(weights: fmw)
+            let gtaTrainer = MLXFrameMelTrainer(model: gtaModel, learningRate: 1e-4)
+            gtaMels = [[[Float]]?](repeating: nil, count: vocoderPairs.count)
+            var gtaCount = 0
+            var gIdx = 0
+            while gIdx < frameMelSamples.count {
+                let smp = frameMelSamples[gIdx]
+                autoreleasepool {
+                    if let pred = gtaTrainer.predictMel(phoneIds: smp.phoneIds, targetDurations: smp.targetDurations, phoneAccent: smp.phoneAccent) {
+                        if pred.mel.count == vocoderPairs[gIdx].mel.count {
+                            gtaMels[gIdx] = pred.mel
+                            gtaCount += 1
+                        }
+                    }
+                }
+                if (gIdx % 200) == 199 {
+                    Memory.clearCache()
+                }
+                gIdx += 1
+            }
+            print("GTA 予測 Mel を生成しました: \(gtaCount)/\(vocoderPairs.count) 発話（ボコーダ学習で確率 \(vocoderGTAProbability) で使用）")
+        }
         // ボコーダーを先に学習する。FrameMel の検証用波形に最新のボコーダーを使うため。
         runVocoderTraining()
         if epochs <= 0 {

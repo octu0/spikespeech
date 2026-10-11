@@ -228,6 +228,36 @@ public final class MLXNeuralVocoder: Module, @unchecked Sendable {
         super.init()
     }
 
+    /// 励振経路の重みを「励振を全チャネルへそのまま通す」初期値（中心タップ = centerTap、他 0、バイアス 0）に設定する
+    /// なぜゼロ初期化のままにしないか:
+    /// ゼロ初期化では励振が無視された解（Mel の倍音起伏からピッチを推定し、手がかりが無いとフレーム周期ブザーを出す解）が
+    /// 局所解として安定し、長時間学習しても励振重みが 0.02 未満から動かないことを実測したため。
+    /// 初めから励振を強く通しておけば、損失は励振の周期成分を整形して使う方向へ素直に働く。
+    public func seedExcitationPath(centerTap: Float) {
+        let hCh = config.hiddenChannels
+        let k = NeuralVocoderWeights.excitationKernel
+        var w = [Float](repeating: 0.0, count: hCh * k)
+        var c = 0
+        while c < hCh {
+            w[c * k + (k / 2)] = centerTap
+            c += 1
+        }
+        var pExc = ModuleParameters()
+        pExc[unwrapping: "weight"] = MLXArray(w, [hCh, k, 1])
+        pExc[unwrapping: "bias"] = MLXArray.zeros([hCh])
+        excConv.update(parameters: pExc)
+        eval(trainableParameters())
+    }
+
+    /// 現在の励振重みの絶対値最大（励振経路がどの程度使われているかの目安）
+    public func excitationWeightAbsMax() -> Float {
+        eval(excConv.weight)
+        let vals = excConv.weight.asArray(Float.self)
+        var m: Float = 0.0
+        for v in vals { m = max(m, abs(v)) }
+        return m
+    }
+
     /// 純粋重み構造体からの初期化
     public convenience init(weights: NeuralVocoderWeights) {
         self.init(config: weights.config)
