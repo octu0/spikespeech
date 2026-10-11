@@ -58,6 +58,13 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
     /// F0 MSE の重み。なぜ重み付けするか: F0 は 1/500 で正規化されており、3 半音の誤差でも二乗値は 0.006 程度で
     /// Mel L1（約 0.4）に埋もれて F0 予測が平均値へ退行する（アクセント形が出ない）ため。
     public var f0LossWeight: Float
+    /// 対数領域の継続時間損失の重み
+    ///
+    /// なぜ対数領域か: フレーム数の二乗誤差は長いポーズ（数十フレーム）の誤差に支配され、
+    /// 1 モーラ 8〜13 フレームの母音・撥音の 3 フレーム程度の誤差（文頭の「こん」で母音が短く撥音が長くなる）が
+    /// ほとんど学習信号にならなかった。対数誤差は相対誤差なので短い音素も同じ重みで学習される。
+    /// 重み 100 は、典型的な音素（10 フレーム、誤差 25%）での勾配の大きさを従来の線形二乗誤差と揃えるための値。
+    public var durationLossWeight: Float
     /// 大域分散（各メルチャネルの時間方向標準偏差）一致損失の係数
     public var globalVarianceWeight: Float
     private var rngState: UInt64
@@ -80,10 +87,12 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         conditionSamplingProbability: Float = 0.5,
         globalVarianceWeight: Float = 1.0,
         f0LossWeight: Float = 20.0,
+        durationLossWeight: Float = 100.0,
         seed: UInt64 = 2026
     ) {
         self.model = model
         self.f0LossWeight = f0LossWeight
+        self.durationLossWeight = durationLossWeight
         self.optimizer = Adam(learningRate: learningRate)
         self.deltaLossWeight = deltaLossWeight
         self.allFrameDeltaWeight = allFrameDeltaWeight
@@ -377,7 +386,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
             featFlat.append(contentsOf: row)
         }
         let featArr = MLXArray(featFlat, [1, phoneCount, featCount])
-        let targetDurArr = MLXArray(targetDurations.map { Float($0) }, [1, phoneCount])
+        let targetDurArr = MLXArray(targetDurations.map { Float(max(1, $0)) }, [1, phoneCount])
         let gatherArr = MLXArray(gatherIndices)
         let posArr = MLXArray(pos, [totalFrames, 1])
         let voicedArr = MLXArray(voicedFlags, [1, totalFrames, 1])
@@ -421,6 +430,7 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
         let allDeltaWeight = self.allFrameDeltaWeight
         let gvWeight = self.globalVarianceWeight
         let f0Weight = self.f0LossWeight
+        let durWeight = self.durationLossWeight
         var useSampledCondition = false
         if update && 0.0 < conditionSamplingProbability {
             if nextUniform() < conditionSamplingProbability {
@@ -433,7 +443,8 @@ public final class MLXFrameMelTrainer: @unchecked Sendable {
 
             // 2. 継続時間予測
             let predDur = m.forwardDuration(encStates: encStates)
-            let durLoss = mean(square(predDur - targetDurArr))
+            // 対数領域の二乗誤差（predDur は softplus + 1 で常に 1 以上、目標も 1 以上に丸めてある）
+            let durLoss = mean(square(log(predDur) - log(targetDurArr))) * MLXArray(durWeight)
 
             // 3. 長さ調節器（音素隠れ状態のフレーム展開）
             let encSqueezed = encStates.squeezed(axis: 0)

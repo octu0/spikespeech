@@ -157,4 +157,69 @@ final class PitchTrackerTests: XCTestCase {
         let diff = abs(medianF0 - 220.0)
         XCTAssertTrue(diff <= 2.0, "調波複合音で基音 220Hz が検出されていません: median=\(medianF0)")
     }
+    /// 有声区間末尾の倍音誤検出（約 2 倍）と半周期誤検出（約 1/2 倍）が局所中央値で置き換えられ、
+    /// 自然な緩やかな下降（1 フレーム 1 半音未満）はそのまま残ることを検証する
+    func testSuppressF0Jumps() {
+        var f0: [Float] = []
+        var voiced: [Float] = []
+        var i = 0
+        while i < 20 {
+            f0.append(160.0 - Float(i) * 1.5)
+            voiced.append(1.0)
+            i += 1
+        }
+        // 末尾 4 フレーム: 倍音誤検出 3 フレーム、半周期 1 フレーム（JSUT BASIC5000_0001 の実測パターン）
+        f0.append(391.0); voiced.append(1.0)
+        f0.append(443.0); voiced.append(1.0)
+        f0.append(443.0); voiced.append(1.0)
+        f0.append(86.0); voiced.append(1.0)
+        // 無声
+        f0.append(0.0); voiced.append(0.0)
+        let cleaned = PitchTracker.suppressF0Jumps(f0: f0, voiced: voiced)
+        XCTAssertEqual(cleaned.count, f0.count)
+        var j = 0
+        while j < 20 {
+            XCTAssertEqual(cleaned[j], f0[j], accuracy: 0.001, "緩やかな下降が改変されています: \(j)")
+            j += 1
+        }
+        j = 20
+        while j < 24 {
+            XCTAssertTrue(cleaned[j] < 160.0 && 120.0 < cleaned[j], "区間末尾の誤検出が除去されていません: \(j) = \(cleaned[j])")
+            j += 1
+        }
+        XCTAssertEqual(cleaned[24], 0.0)
+    }
+    /// 長い有声区間の後に続く、文脈と不連続な短い有声島（倍音・半周期の誤検出）が無声化され、
+    /// 文脈と連続する短い島は残ることを検証する
+    func testSuppressVoicedIslands() {
+        var f0: [Float] = []
+        var voiced: [Float] = []
+        var i = 0
+        while i < 20 { f0.append(160.0); voiced.append(1.0); i += 1 }
+        i = 0
+        while i < 3 { f0.append(0.0); voiced.append(0.0); i += 1 }
+        // 文脈と連続する島（残す）
+        f0.append(158.0); voiced.append(1.0)
+        f0.append(156.0); voiced.append(1.0)
+        i = 0
+        while i < 4 { f0.append(0.0); voiced.append(0.0); i += 1 }
+        // 倍音誤検出の島（消す）
+        f0.append(459.0); voiced.append(1.0)
+        f0.append(458.0); voiced.append(1.0)
+        f0.append(359.0); voiced.append(1.0)
+        i = 0
+        while i < 5 { f0.append(0.0); voiced.append(0.0); i += 1 }
+        // 半周期誤検出の島（消す）
+        f0.append(84.0); voiced.append(1.0)
+        f0.append(81.0); voiced.append(1.0)
+        f0.append(84.0); voiced.append(1.0)
+        let cleaned = PitchTracker.suppressVoicedIslands(f0: f0, voiced: voiced)
+        XCTAssertEqual(cleaned.voiced[23], 1.0, "文脈と連続する島が消されています")
+        XCTAssertEqual(cleaned.f0[24], 156.0, accuracy: 0.001)
+        XCTAssertEqual(cleaned.voiced[29], 0.0, "倍音誤検出の島が残っています")
+        XCTAssertEqual(cleaned.f0[30], 0.0)
+        XCTAssertEqual(cleaned.voiced[37], 0.0, "半周期誤検出の島が残っています")
+        XCTAssertEqual(cleaned.voiced[0], 1.0)
+        XCTAssertEqual(cleaned.f0[19], 160.0, accuracy: 0.001)
+    }
 }

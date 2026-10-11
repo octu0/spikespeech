@@ -89,7 +89,8 @@ public final class PitchTracker: @unchecked Sendable {
     }
 
     /// 16kHz PCM 波形全体からフレームごとの実測 F0・有声度・エネルギーを抽出する
-    public func track(pcm: [Float]) -> PitchTrackResult {
+    /// 追跡結果を返す。`cleanup` を false にすると跳躍除去・短い有声島の無声化を行わない生の追跡結果を返す（診断用）
+    public func track(pcm: [Float], cleanup: Bool = true) -> PitchTrackResult {
         if pcm.isEmpty {
             return PitchTrackResult(f0: [], voiced: [], energy: [], frameCount: 0)
         }
@@ -157,12 +158,180 @@ public final class PitchTracker: @unchecked Sendable {
             }
         }
 
+        if cleanup != true {
+            return PitchTrackResult(f0: smoothF0, voiced: voicedList, energy: energyList, frameCount: frameCount)
+        }
+
+        // 有声区間内の局所中央値から大きく外れた F0 跳躍の除去
+        let jumpFreeF0 = Self.suppressF0Jumps(f0: smoothF0, voiced: voicedList)
+        // 句末のきしみ声などで生じる、文脈と不連続な短い有声島の無声化
+        let cleaned = Self.suppressVoicedIslands(f0: jumpFreeF0, voiced: voicedList)
+
         return PitchTrackResult(
-            f0: smoothF0,
-            voiced: voicedList,
+            f0: cleaned.f0,
+            voiced: cleaned.voiced,
             energy: energyList,
             frameCount: frameCount
         )
+    }
+
+    /// `maxIslandFrames` 以下の短い有声島のうち、前後 `searchFrames` 以内にある長い有声区間（`minRunFrames` 以上）の端の F0 から
+    /// `thresholdSemitones` 半音以上離れているもの、または参照できる長い区間が無いものを無声化する
+    ///
+    /// なぜ必要か:
+    /// JSUT の句末では声がきしみ声に移行し、追跡器が 3〜4 フレームの島として 450 Hz 前後（倍音）や 60〜85 Hz（半周期）を
+    /// 断続的に拾う。`suppressF0Jumps` は区間内の跳躍しか扱えず、島全体が外れている場合は残ってしまう。
+    /// 島は 30〜40 ms しかなく、周期励振で鳴らすとピッチの飛んだ短い「ピッ」になり、語尾が二重・機械的に聞こえる。
+    /// 無声化すれば雑音励振に切り替わり、低エネルギーの Mel と合わせて息の抜けた語尾として自然に収まる。
+    /// 文脈と連続する短い島（有声破裂音の前後など）は残す。
+    public static func suppressVoicedIslands(
+        f0: [Float],
+        voiced: [Float],
+        maxIslandFrames: Int = 4,
+        minRunFrames: Int = 5,
+        searchFrames: Int = 30,
+        thresholdSemitones: Float = 5.0
+    ) -> (f0: [Float], voiced: [Float]) {
+        let n = min(f0.count, voiced.count)
+        var outF0 = f0
+        var outVoiced = voiced
+        // 有声区間の列挙
+        var runs: [(start: Int, end: Int)] = []
+        var start = 0
+        while start < n {
+            if voiced[start] < 0.5 || f0[start] <= 0.0 {
+                start += 1
+                continue
+            }
+            var end = start
+            while end < n && 0.5 <= voiced[end] && 0.0 < f0[end] {
+                end += 1
+            }
+            runs.append((start, end))
+            start = end
+        }
+        func edgeMedian(_ run: (start: Int, end: Int), fromEnd: Bool) -> Float {
+            let count = min(minRunFrames, run.end - run.start)
+            var vals: [Float] = []
+            if fromEnd {
+                vals = Array(f0[(run.end - count)..<run.end])
+            } else {
+                vals = Array(f0[run.start..<(run.start + count)])
+            }
+            vals.sort()
+            return vals[vals.count / 2]
+        }
+        var r = 0
+        while r < runs.count {
+            let run = runs[r]
+            let length = run.end - run.start
+            if length <= maxIslandFrames {
+                var islandVals = Array(f0[run.start..<run.end])
+                islandVals.sort()
+                let islandMedian = islandVals[islandVals.count / 2]
+                var reference: Float = 0.0
+                // 直前の長い区間を優先し、無ければ直後の長い区間を参照する
+                var q = r - 1
+                while 0 <= q {
+                    if minRunFrames <= (runs[q].end - runs[q].start) {
+                        if (run.start - runs[q].end) <= searchFrames {
+                            reference = edgeMedian(runs[q], fromEnd: true)
+                        }
+                        break
+                    }
+                    q -= 1
+                }
+                if reference <= 0.0 {
+                    q = r + 1
+                    while q < runs.count {
+                        if minRunFrames <= (runs[q].end - runs[q].start) {
+                            if (runs[q].start - run.end) <= searchFrames {
+                                reference = edgeMedian(runs[q], fromEnd: false)
+                            }
+                            break
+                        }
+                        q += 1
+                    }
+                }
+                var drop = false
+                if reference <= 0.0 {
+                    drop = true
+                } else if thresholdSemitones <= abs(12.0 * log2(islandMedian / reference)) {
+                    drop = true
+                }
+                if drop {
+                    var t = run.start
+                    while t < run.end {
+                        outF0[t] = 0.0
+                        outVoiced[t] = 0.0
+                        t += 1
+                    }
+                }
+            }
+            r += 1
+        }
+        return (outF0, outVoiced)
+    }
+
+    /// 有声区間内で、前後 `radius` フレームの局所中央値から `thresholdSemitones` 半音以上離れた F0 を局所中央値で置き換える
+    ///
+    /// なぜ必要か:
+    /// 句末のきしみ声や語頭の立ち上がりで、追跡器が第 2 倍音（約 2 倍）や半周期（約 1/2 倍）を 1〜3 フレーム拾う。
+    /// 3 点メディアンは 1 フレームの孤立スパイクしか除けず、JSUT では有声区間の約半数が末尾に 5 半音以上の跳躍を残していた。
+    /// この跳躍は (1) ボコーダ学習の励振パルス列のピッチ跳び（語尾が二重に聞こえる）、(2) F0 予測器の句末上昇、
+    /// (3) アクセント核推定の誤票、の三つにそのまま現れるため、追跡器の出力段で除く。
+    /// 置き換え（無声化ではなく）にする理由: きしみ声区間も声道応答は有声のままなので、
+    /// 周囲と連続する周期励振を与えるほうが雑音励振に切り替えるより聴感が自然なため。
+    public static func suppressF0Jumps(
+        f0: [Float],
+        voiced: [Float],
+        radius: Int = 5,
+        thresholdSemitones: Float = 5.0
+    ) -> [Float] {
+        let n = min(f0.count, voiced.count)
+        var out = f0
+        var start = 0
+        while start < n {
+            if voiced[start] < 0.5 || f0[start] <= 0.0 {
+                start += 1
+                continue
+            }
+            var end = start
+            while end < n && 0.5 <= voiced[end] && 0.0 < f0[end] {
+                end += 1
+            }
+            if 3 <= (end - start) {
+                var t = start
+                while t < end {
+                    // 過去側は置き換え済みの値（out）、未来側は元の値（f0）を参照する。
+                    // なぜ: 区間末尾では窓が片側だけになり、誤検出が 3 フレーム続くと元の値だけでは誤検出側が中央値になって
+                    // 最後の正しいフレームを誤って置き換えてしまう（391, 443, 443, 86 → 86 が 391 に置き換わる）。
+                    var window: [Float] = []
+                    var k = max(start, t - radius)
+                    while k < min(end, t + radius + 1) {
+                        if k < t {
+                            window.append(out[k])
+                        } else if t < k {
+                            window.append(f0[k])
+                        }
+                        k += 1
+                    }
+                    if 2 <= window.count {
+                        window.sort()
+                        let median = window[window.count / 2]
+                        if 0.0 < median {
+                            let deviation = abs(12.0 * log2(f0[t] / median))
+                            if thresholdSemitones <= deviation {
+                                out[t] = median
+                            }
+                        }
+                    }
+                    t += 1
+                }
+            }
+            start = end
+        }
+        return out
     }
 
     /// 単一フレーム（400サンプル）のピッチおよびエネルギー解析
